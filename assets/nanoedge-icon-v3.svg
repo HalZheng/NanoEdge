@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="88" height="88" viewBox="0 0 88 88" role="img">
+<title>NanoEdge icon v3</title>
+<defs>
+  <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0" stop-color="#1B1038"/>
+    <stop offset="0.3" stop-color="#5A1E62"/>
+    <stop offset="0.55" stop-color="#A82C74"/>
+    <stop offset="0.78" stop-color="#E3554A"/>
+    <stop offset="1" stop-color="#F59A3C"/>
+  </linearGradient>
+  <linearGradient id="letterFill" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0" stop-color="#4F6FD8"/>
+    <stop offset="0.33" stop-color="#8B57D6"/>
+    <stop offset="0.66" stop-color="#DB5396"/>
+    <stop offset="1" stop-color="#E38F4A"/>
+  </linearGradient>
+</defs>
+<rect x="0" y="0" width="88" height="88" rx="20" fill="url(#sky)"/>
+<rect x="0" y="0" width="88" height="88" rx="20" fill="none" stroke="#000000" stroke-opacity="0.3" stroke-width="0.5"/>
+<circle cx="44" cy="64" r="23" fill="#FFC978" opacity="0.28"/>
+<line x1="24" y1="63" x2="64" y2="63" stroke="#1B1038" stroke-opacity="0.45" stroke-width="2"/>
+<line x1="24" y1="70" x2="64" y2="70" stroke="#1B1038" stroke-opacity="0.45" stroke-width="3"/>
+<line x1="24" y1="78" x2="64" y2="78" stroke="#1B1038" stroke-opacity="0.45" stroke-width="4"/>
+<g transform="translate(44,44)">
+  <path d="M-19,-22 L-5,-22 L5,8 L5,-22 L19,-22 L19,22 L5,22 L-5,-8 L-5,22 L-19,22 Z" fill="#0C0A14" stroke="#0C0A14" stroke-width="14" stroke-linejoin="bevel"/>
+  <path d="M-19,-22 L-5,-22 L5,8 L5,-22 L19,-22 L19,22 L5,22 L-5,-8 L-5,22 L-19,22 Z" fill="#FFFFFF" stroke="#FFFFFF" stroke-width="6" stroke-linejoin="bevel"/>
+  <path d="M-19,-22 L-5,-22 L5,8 L5,-22 L19,-22 L19,22 L5,22 L-5,-8 L-5,22 L-19,22 Z" fill="url(#letterFill)"/>
+</g>
+</svg>

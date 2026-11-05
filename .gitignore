@@ -1,0 +1,29 @@
+# 构建产物
+bin/
+obj/
+*.pdb
+FodyWeavers.xsd
+
+# 本机测试与发布产物
+out/
+dist/
+.screenshots/
+phase0/
+
+# 第三方参考源码（不随本仓库发布）
+_ref/
+
+# 内部协作记忆、交接与对照讨论文档
+.workbuddy/
+docs/HANDOFF-*.md
+docs/COMPARE-*.md
+
+# IDE / 操作系统
+.vs/
+.idea/
+.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.log

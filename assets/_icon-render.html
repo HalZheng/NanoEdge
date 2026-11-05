@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>NanoEdge icon render</title>
+<style>
+  html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
+  /* 图标固定在左上角、按 ?s= 指定像素渲染；headless 的窗口有最小宽度，
+     所以小尺寸时截图只取左上角 N×N，正好是图标本身。 */
+  img { display: block; position: absolute; left: 0; top: 0; }
+</style>
+</head>
+<body>
+  <img id="icon" src="nanoedge-icon-v4.svg" alt="">
+  <script>
+    var size = parseInt(new URLSearchParams(location.search).get('s') || '256', 10);
+    if (!(size > 0)) size = 256;
+    var icon = document.getElementById('icon');
+    icon.style.width = size + 'px';
+    icon.style.height = size + 'px';
+  </script>
+</body>
+</html>
