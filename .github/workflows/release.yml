@@ -23,14 +23,8 @@ jobs:
       - name: Build
         run: dotnet build src/NanoEdge/NanoEdge.csproj -c Release
 
-      - name: Package
-        shell: pwsh
-        run: |
-          $dir = "src/NanoEdge/bin/Release/net48"
-          Compress-Archive -Path "$dir/NanoEdge.exe","$dir/NanoEdge.exe.config" -DestinationPath NanoEdge-${{ github.ref_name }}.zip
-
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: NanoEdge-*.zip
+          files: src/NanoEdge/bin/Release/net48/NanoEdge.exe
           generate_release_notes: true
