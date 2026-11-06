@@ -15,16 +15,34 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Resolve version from tag
+        id: version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = $tag -replace '^v', ''
+          if ($version -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') {
+            throw "Tag '$tag' must look like v1.2.3 (or v1.2.3.4)."
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "NanoEdge-v$version.exe" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 8.0.x
 
       - name: Build
-        run: dotnet build src/NanoEdge/NanoEdge.csproj -c Release
+        run: dotnet build src/NanoEdge/NanoEdge.csproj -c Release -p:Version=${{ steps.version.outputs.version }}
+
+      - name: Stage release asset
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item src/NanoEdge/bin/Release/net48/NanoEdge.exe "dist/NanoEdge-v${{ steps.version.outputs.version }}.exe"
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: src/NanoEdge/bin/Release/net48/NanoEdge.exe
+          files: dist/NanoEdge-v${{ steps.version.outputs.version }}.exe
           generate_release_notes: true

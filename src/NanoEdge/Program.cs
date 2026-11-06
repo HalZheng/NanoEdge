@@ -1,4 +1,5 @@
 using System;
+using System.Reflection;
 using System.Threading;
 using System.Windows;
 using Microsoft.Web.WebView2.Core;
@@ -7,7 +8,19 @@ namespace NanoEdge
 {
     public static class Program
     {
-        public const string Version = "0.1";
+        // 版本号由 csproj 的 <Version> 生成到程序集，这里只读，不再硬编码。
+        public static readonly string Version = ReadVersion();
+
+        private static string ReadVersion()
+        {
+            var assembly = typeof(Program).Assembly;
+            var info = (AssemblyInformationalVersionAttribute)Attribute.GetCustomAttribute(
+                assembly, typeof(AssemblyInformationalVersionAttribute));
+            if (info != null && !string.IsNullOrEmpty(info.InformationalVersion))
+                return info.InformationalVersion;
+            var version = assembly.GetName().Version;
+            return version == null ? "0.0" : version.ToString(3);
+        }
         private static string ArgValue(string[] args, string name)
         {
             if (args == null) return null;
