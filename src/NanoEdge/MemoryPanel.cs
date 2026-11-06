@@ -36,7 +36,7 @@ namespace NanoEdge
         public event Action CursorEntered;
         public event Action CursorLeft;
 
-        public MemoryPanel(FrameworkElement anchor, MemoryGovernor governor,
+        public MemoryPanel(FrameworkElement anchor, Panel host, MemoryGovernor governor,
             Func<List<TabModel>> tabs, Func<TabModel> active, Func<TabModel, string> exemption,
             Action<TabModel> selectTab, Action<TabModel> toggleResident, Action<string> notify)
         {
@@ -140,11 +140,21 @@ namespace NanoEdge
             {
                 Placement = PlacementMode.Relative,
                 PlacementTarget = anchor,
-                StaysOpen = true,
+                // 点面板以外任何地方就收起；以前 StaysOpen=true 会一直挂着。
+                StaysOpen = false,
                 AllowsTransparency = true,
                 PopupAnimation = PopupAnimation.Fade,
                 Focusable = false,
                 Child = _root
+            };
+            // 挂进可视树，Popup 才会以主窗口为 Owner：切到别的软件或最小化
+            // 时会跟着隐藏，而不是独立置顶在屏幕上（B3）。
+            if (host != null) host.Children.Add(_popup);
+            // 自动关闭也要停采样、清掉钉住状态，否则下次打开状态残留。
+            _popup.Closed += (s, e) =>
+            {
+                if (_refreshTimer != null) _refreshTimer.Stop();
+                IsPinned = false;
             };
 
             _refreshTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
@@ -153,6 +163,8 @@ namespace NanoEdge
 
         public bool IsOpen { get { return _popup.IsOpen; } }
         public FrameworkElement Visual { get { return _root; } }
+        // 自测用：确认 Popup 挂进了可视树（才有 Owner）且未钉死。
+        public Popup HostPopup { get { return _popup; } }
 
         public void SetAnchor(FrameworkElement anchor)
         {
@@ -161,15 +173,19 @@ namespace NanoEdge
 
         public void Open()
         {
-            var anchor = _popup.PlacementTarget as FrameworkElement;
-            if (anchor != null)
-            {
-                _popup.HorizontalOffset = anchor.ActualWidth - PanelWidth;
-                _popup.VerticalOffset = anchor.ActualHeight + 8;
-            }
+            Reposition();
             _popup.IsOpen = true;
             _refreshTimer.Start();
             var unused = RefreshAsync();
+        }
+
+        // 窗口移动或改尺寸后锚点位置会变，重新算一次偏移。
+        public void Reposition()
+        {
+            var anchor = _popup.PlacementTarget as FrameworkElement;
+            if (anchor == null) return;
+            _popup.HorizontalOffset = anchor.ActualWidth - PanelWidth;
+            _popup.VerticalOffset = anchor.ActualHeight + 8;
         }
 
         public void Close()
@@ -261,7 +277,7 @@ namespace NanoEdge
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(56) });
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(64) });
-            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(38) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(50) });
 
             var dot = new Border
             {
@@ -313,7 +329,7 @@ namespace NanoEdge
                 Background = new SolidColorBrush(Colors.Transparent),
                 Child = new TextBlock
                 {
-                    Text = L.T("常驻"),
+                    Text = L.T("内存常驻"),
                     FontSize = 9,
                     HorizontalAlignment = HorizontalAlignment.Center,
                     VerticalAlignment = VerticalAlignment.Center
@@ -326,7 +342,7 @@ namespace NanoEdge
             }
             ((TextBlock)resident.Child).SetResourceReference(TextBlock.ForegroundProperty,
                 residentOn ? "AccentBrush" : "MutedBrush");
-            resident.ToolTip = residentForced ? L.T("自动豁免：") + reason : L.T("常驻（不参与自动丢弃）");
+            resident.ToolTip = residentForced ? L.T("自动豁免：") + reason : L.T("内存常驻：不自动释放这个站点的标签");
             if (tab.MemoryState == TabMemoryState.Discarded) resident.Visibility = Visibility.Collapsed;
             else if (!residentOn) resident.Visibility = Visibility.Collapsed;
             resident.MouseLeftButtonUp += (s, e) =>
@@ -351,16 +367,15 @@ namespace NanoEdge
             row.MouseRightButtonUp += (s, e) =>
             {
                 e.Handled = true;
-                var menu = new ContextMenu();
-                menu.SetResourceReference(Control.BackgroundProperty, "SurfaceBrush");
-                menu.SetResourceReference(Control.ForegroundProperty, "TextBrush");
-                menu.SetResourceReference(Control.BorderBrushProperty, "LineBrush");
+                // A5：第三处菜单也走 Theme 工厂，否则内存面板右键在暗色下仍露白。
+                var menu = Theme.StyleMenu(new ContextMenu());
 
-                var focus = new MenuItem { Header = L.T("切换到此标签"), FontSize = 12 };
+                var focus = Theme.StyleMenuItem(new MenuItem { Header = L.T("切换到此标签"), FontSize = 12 });
                 focus.Click += (s2, e2) => { if (_selectTab != null) _selectTab(tab); };
                 menu.Items.Add(focus);
 
-                var release = new MenuItem { Header = L.T("立即释放此标签"), FontSize = 12, IsEnabled = hasView };
+                var release = Theme.StyleMenuItem(
+                    new MenuItem { Header = L.T("立即释放此标签"), FontSize = 12, IsEnabled = hasView });
                 release.Click += async (s2, e2) =>
                 {
                     if (await _governor.DiscardTabAsync(tab))

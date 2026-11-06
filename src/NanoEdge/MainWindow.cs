@@ -2,11 +2,13 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Interop;
 using System.Windows.Media.Imaging;
 using System.Windows.Shell;
 using System.Windows.Threading;
@@ -35,7 +37,14 @@ namespace NanoEdge
         private TextBlock _statusText, _memoryBadge, _statusRight;
         private Popup _verticalPopup;
         private DispatcherTimer _expandTimer, _collapseTimer, _badgeHoverTimer, _badgeCloseTimer;
+        private bool _verticalCollapseSuspended;
         private TabModel _dragCandidate;
+        private Point _dragStart;
+        private bool _dragInProgress;
+        private Grid _navigationRow;
+        private DateTime _lastChromeDownUtc = DateTime.MinValue;
+        private Point _lastChromeDownPoint;
+        private bool _chromeDragArmed;
         private TabModel _secretReturnTab;   // Alt+` 从密封标签切回的那个普通标签
         private bool _immersive;
         private bool _shellReady;
@@ -72,10 +81,11 @@ namespace NanoEdge
             _settings = settings;
             _args = args;
             _screenshotPath = ArgValue("--screenshot");
-            _noPersist = !string.IsNullOrEmpty(_screenshotPath) || HasArg("--memtest") ||
-                         HasArg("--navtest") || HasArg("--m3ctest") || HasArg("--m4test") ||
-                         HasArg("--m5test") || HasArg("--m6test") || HasArg("--m6btest") ||
-                         HasArg("--m7test") || HasArg("--m8test");
+            _noPersist = !string.IsNullOrEmpty(_screenshotPath) || HasArg("--menupreview") ||
+                         HasArg("--memtest") || HasArg("--navtest") || HasArg("--m3ctest") ||
+                         HasArg("--m4test") || HasArg("--m5test") || HasArg("--m6test") ||
+                         HasArg("--m6btest") || HasArg("--m7test") || HasArg("--m8test") ||
+                         HasArg("--fixtest");
             if (_noPersist)
             {
                 // 自测/截图一律不写用户会话、历史、缩放和下载记录。
@@ -106,13 +116,24 @@ namespace NanoEdge
             catch (Exception ex) { Diagnostics.Log("window icon failed: " + ex.Message); }
             Width = settings.WindowWidth > 400 ? settings.WindowWidth : 1280;
             Height = settings.WindowHeight > 300 ? settings.WindowHeight : 800;
-            if (!double.IsNaN(settings.WindowLeft) && !double.IsNaN(settings.WindowTop))
+            // 窗口最小化时 WPF 的 Left/Top 会变成 -32000（Windows 的最小化坐标）。
+            // 老配置把这种值落盘后，Manual 定位会把窗口放到屏幕外，看起来就像
+            // 「启动没窗口」。无效坐标一律退回居中，并把内存里的脏值清掉，
+            // 后面任意一次窗口移动/关闭会把有效坐标写回去，配置自愈。
+            bool hasUsableBounds = IsSaneWindowCoord(settings.WindowLeft) &&
+                                   IsSaneWindowCoord(settings.WindowTop);
+            if (hasUsableBounds)
             {
                 Left = settings.WindowLeft;
                 Top = settings.WindowTop;
+                WindowStartupLocation = WindowStartupLocation.Manual;
             }
-            WindowStartupLocation = double.IsNaN(settings.WindowLeft)
-                ? WindowStartupLocation.CenterScreen : WindowStartupLocation.Manual;
+            else
+            {
+                WindowStartupLocation = WindowStartupLocation.CenterScreen;
+                settings.WindowLeft = double.NaN;
+                settings.WindowTop = double.NaN;
+            }
             if (settings.WindowMaximized) WindowState = WindowState.Maximized;
             // 截图模式固定 Normal + 常用尺寸：会话里记着「最大化」时，超宽屏会截出
             // 3454×1454，缩到聊天窗口里字全糊了。
@@ -135,6 +156,7 @@ namespace NanoEdge
                 UseAeroCaptionButtons = false
             });
             this.SetResourceReference(BackgroundProperty, "CanvasBrush");
+            InstallWorkAreaHook();
 
             BuildShell();
             RestoreSession();
@@ -171,13 +193,28 @@ namespace NanoEdge
                 }
                 catch (Exception ex) { Diagnostics.Log("shutdown failed: " + ex.Message); }
             };
-            SizeChanged += (s, e) => SyncPopupSize();
-            LocationChanged += (s, e) => SaveWindowBounds();
+            SizeChanged += (s, e) =>
+            {
+                SyncPopupSize();
+                if (_memoryPanel != null && _memoryPanel.IsOpen) _memoryPanel.Reposition();
+            };
+            LocationChanged += (s, e) =>
+            {
+                SaveWindowBounds();
+                if (_memoryPanel != null && _memoryPanel.IsOpen) _memoryPanel.Reposition();
+            };
             Activated += (s, e) => { if (_governor != null) _governor.NotifyActivated(); };
-            Deactivated += (s, e) => { if (_governor != null) _governor.NotifyDeactivated(); };
+            Deactivated += (s, e) =>
+            {
+                if (_governor != null) _governor.NotifyDeactivated();
+                // 切到别的软件窗口，面板不该还浮在屏幕上。
+                if (_memoryPanel != null && _memoryPanel.IsOpen) _memoryPanel.Close();
+            };
             StateChanged += (s, e) =>
             {
                 if (_governor != null) _governor.NotifyMinimized(WindowState == WindowState.Minimized);
+                if (WindowState == WindowState.Minimized && _memoryPanel != null)
+                    _memoryPanel.Close();
             };
         }
 
@@ -365,7 +402,7 @@ namespace NanoEdge
             if (_memoryBadgeBorder == null || _governor == null) return;
             if (_memoryPanel == null)
             {
-                _memoryPanel = new MemoryPanel(_memoryBadgeBorder, _governor, () => _tabs, () => _active,
+                _memoryPanel = new MemoryPanel(_memoryBadgeBorder, _root, _governor, () => _tabs, () => _active,
                     tab => _governor.ExemptionReason(tab), SelectTab, ToggleResident,
                     message => _toast.Show(message));
                 _memoryPanel.CursorEntered += () => { if (_badgeCloseTimer != null) _badgeCloseTimer.Stop(); };
@@ -404,7 +441,9 @@ namespace NanoEdge
                 if (_memoryPanel != null && !_memoryPanel.IsPinned) _memoryPanel.Close();
             };
 
-            _popupPanel = new StackPanel { Orientation = Orientation.Vertical, Margin = new Thickness(6) };
+            // 不要额外的外边距：收起态 rail 里的第一个标签从 y=0 开始，
+            // 展开态也得从 y=0 开始，否则每个标签都会往下错一截。
+            _popupPanel = new StackPanel { Orientation = Orientation.Vertical, Margin = new Thickness(0) };
             _popupContent = new Border
             {
                 Width = ExpandedWidth,
@@ -445,14 +484,30 @@ namespace NanoEdge
 
         private void ScheduleCollapse()
         {
+            if (_verticalCollapseSuspended) return;
             _expandTimer.Stop();
             _collapseTimer.Stop();
             _collapseTimer.Start();
         }
 
+        // 右键菜单和拖放会让鼠标暂时离开悬浮面板，这段时间不能收起。
+        private void SuspendVerticalCollapse()
+        {
+            _verticalCollapseSuspended = true;
+            if (_collapseTimer != null) _collapseTimer.Stop();
+        }
+
+        private void ResumeVerticalCollapse()
+        {
+            _verticalCollapseSuspended = false;
+            if (_verticalPopup != null && _verticalPopup.IsOpen && !_settings.VerticalExpanded)
+                ScheduleCollapse();
+        }
+
         private void OpenVerticalPopup()
         {
             if (_settings.Layout != LayoutMode.Vertical || _settings.VerticalExpanded) return;
+            _verticalCollapseSuspended = false;
             RebuildPopup();
             SyncPopupSize();
             _verticalPopup.IsOpen = true;
@@ -471,7 +526,8 @@ namespace NanoEdge
             // 自测需要确定的初始状态，不加载用户会话。
             if (HasArg("--memtest") || HasArg("--navtest") || HasArg("--m3ctest") ||
                 HasArg("--m4test") || HasArg("--m5test") || HasArg("--m6test") ||
-                HasArg("--m6btest") || HasArg("--m7test") || HasArg("--m8test"))
+                HasArg("--m6btest") || HasArg("--m7test") || HasArg("--m8test") ||
+                HasArg("--fixtest") || HasArg("--menupreview"))
             {
                 NewTab();
                 return;
@@ -479,15 +535,28 @@ namespace NanoEdge
 
             var session = SessionStore.Load();
             _groups.Clear();
-            if (session.Groups != null) _groups.AddRange(session.Groups);
+            if (session.Groups != null)
+            {
+                // 旧版本可能在启动时塞一个「分组0」把所有标签包起来。这类空壳组
+                // 不该再显示。同时把指向不存在分组的标签清回平铺，否则它们在
+                // 垂直栏里会整个消失（VisibleTabs 只遍历 _groups 里的组）。
+                _groups.AddRange(session.Groups.Where(g => g != null &&
+                    !string.IsNullOrEmpty(g.Id) && g.Id != "0" &&
+                    g.Name != "分组0" && g.Name != "Group 0"));
+            }
 
-            if (session.Tabs == null || session.Tabs.Count == 0)
+            var tabs = session.Tabs ?? new List<TabModel>();
+            foreach (var tab in tabs)
+                if (!string.IsNullOrEmpty(tab.GroupId) && !_groups.Any(g => g.Id == tab.GroupId))
+                    tab.GroupId = "";
+
+            if (tabs.Count == 0)
             {
                 NewTab();
                 return;
             }
 
-            foreach (var tab in session.Tabs)
+            foreach (var tab in tabs)
             {
                 _tabs.Add(tab);
                 if (!string.IsNullOrEmpty(tab.InternalPage) ||
@@ -503,9 +572,7 @@ namespace NanoEdge
                 else if (tab.IsStartPage || string.IsNullOrEmpty(tab.Url))
                 {
                     tab.MemoryState = TabMemoryState.Active;
-                    var start = new StartPage(_settings);
-                    start.NavigateRequested += input => Navigate(tab, input);
-                    _browser.RegisterStartPage(tab, start);
+                    _browser.RegisterStartPage(tab, MakeStartPage(tab));
                 }
                 else
                 {
@@ -550,12 +617,23 @@ namespace NanoEdge
             };
         }
 
+        // 最小化时 WPF 会给 -32000；多显示器虚拟屏幕左侧可以是负数，但不会到万级。
+        // 超出这个范围就当无效坐标：既不能拿来启动定位，也不该写进 settings.json。
+        internal static bool IsSaneWindowCoord(double value)
+        {
+            return !double.IsNaN(value) && !double.IsInfinity(value) &&
+                   value > -10000 && value < 100000;
+        }
+
         private void SaveWindowBounds()
         {
             if (_settings == null || _noPersist) return;
             _settings.WindowWidth = ActualWidth;
             _settings.WindowHeight = ActualHeight;
-            if (WindowState == WindowState.Normal)
+            // 状态切换瞬间 LocationChanged 可能先于 StateChanged 触发，此时
+            // WindowState 还是 Normal 而 Left/Top 已经是 -32000，直接写就污染配置。
+            if (WindowState == WindowState.Normal &&
+                IsSaneWindowCoord(Left) && IsSaneWindowCoord(Top))
             {
                 _settings.WindowLeft = Left;
                 _settings.WindowTop = Top;
@@ -608,7 +686,38 @@ namespace NanoEdge
 
         private FrameworkElement BuildToolbar()
         {
-            var grid = new Grid();
+            // 整个工具栏统一接管拖拽/双击，标准两行模式的标签行也在里面。
+            var grid = new Grid { Background = new SolidColorBrush(Colors.Transparent) };
+            // 双击自己计时：DragMove 会进模态循环，e.ClickCount 经常到不了 2。
+            grid.PreviewMouseLeftButtonDown += (s, e) =>
+            {
+                if (IsChromeInteractive(e.OriginalSource as DependencyObject)) return;
+                var now = DateTime.UtcNow;
+                // 坐标统一相对窗口：还原时算横向比例、PointToScreen 都用这个基准。
+                var point = e.GetPosition(this);
+                if (IsDoubleClick(_lastChromeDownUtc, _lastChromeDownPoint, now, point))
+                {
+                    _lastChromeDownUtc = DateTime.MinValue;   // 三击别连着触发
+                    _chromeDragArmed = false;
+                    e.Handled = true;
+                    ToggleMaximize();
+                    return;
+                }
+                _lastChromeDownUtc = now;
+                _lastChromeDownPoint = point;
+                _chromeDragArmed = true;
+            };
+            // 拖拽等鼠标真的动了再启动：单击和双击全程不进 DragMove 的模态
+            // 循环，第二次 down 才收得到，双击判定也不会被拖拽抢走。
+            grid.PreviewMouseMove += (s, e) =>
+            {
+                if (!_chromeDragArmed || e.LeftButton != MouseButtonState.Pressed) return;
+                if (!HandleChromeDragMove(_lastChromeDownPoint, e.GetPosition(this))) return;
+                // 最大化时 HandleChromeDragMove 已经先把窗口还原并摆到鼠标底下；
+                // 顺序不能反，DragMove() 在 Maximized 状态会抛异常被吞掉。
+                try { DragMove(); } catch { }
+            };
+            grid.PreviewMouseLeftButtonUp += (s, e) => { _chromeDragArmed = false; };
             if (_settings.Layout == LayoutMode.Standard)
             {
                 grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(34) });
@@ -634,10 +743,14 @@ namespace NanoEdge
         private FrameworkElement BuildNavigationRow()
         {
             var bar = new Grid { Height = _settings.Layout == LayoutMode.Standard ? 40 : ChromeHeight };
+            _navigationRow = bar;
             bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(34) });   // layout
             bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(90) });  // nav
             if (_settings.Layout == LayoutMode.Compact)
                 bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(45, GridUnitType.Star) });
+            else if (_settings.Layout == LayoutMode.Vertical)
+                // 垂直布局的标签在左侧 rail，顶栏会全是控件；故意留一段空白当拖拽抓手。
+                bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(72) });
             bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(55, GridUnitType.Star) });
             bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(30) });  // new tab
             bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(30) });  // theme
@@ -664,6 +777,8 @@ namespace NanoEdge
                 Grid.SetColumn(_tabStrip, column++);
                 bar.Children.Add(_tabStrip);
             }
+            else if (_settings.Layout == LayoutMode.Vertical)
+                column++;   // 空档列不放元素，地址栏顺延到下一列
 
             var addressBorder = new Border
             {
@@ -671,7 +786,8 @@ namespace NanoEdge
                 CornerRadius = new CornerRadius(6),
                 BorderThickness = new Thickness(1),
                 Margin = new Thickness(4, 0, 4, 0),
-                VerticalAlignment = VerticalAlignment.Center
+                VerticalAlignment = VerticalAlignment.Center,
+                Tag = "interactive"
             };
             addressBorder.SetResourceReference(Border.BackgroundProperty, "InputBrush");
             addressBorder.SetResourceReference(Border.BorderBrushProperty, "InputBorderBrush");
@@ -725,6 +841,7 @@ namespace NanoEdge
                 Margin = new Thickness(2, 0, 2, 0),
                 Cursor = Cursors.Hand,
                 ToolTip = L.T("内存占用（工作集口径）· 悬停查看明细"),
+                Tag = "interactive",
                 Child = _memoryBadge
             };
             _memoryBadgeBorder.SetResourceReference(Border.BackgroundProperty, "AccentSoftBrush");
@@ -765,16 +882,144 @@ namespace NanoEdge
             windowButtons.Children.Add(close);
             bar.Children.Add(At(windowButtons, column));
 
-            bar.PreviewMouseLeftButtonDown += (s, e) =>
-            {
-                var source = e.OriginalSource as DependencyObject;
-                if (source == null) return;
-                if (source is TextBox || FindParent<Button>(source) != null ||
-                    FindParent<ScrollViewer>(source) != null) return;
-                try { DragMove(); } catch { }
-            };
-            bar.MouseLeftButtonDown += (s, e) => { if (e.ClickCount == 2) ToggleMaximize(); };
+            // 拖拽/双击统一由 BuildToolbar 的外层 grid 处理，这里只保留
+            // 命中背景，让导航行自己的空白也能被外层事件经过。
+            bar.Background = new SolidColorBrush(Colors.Transparent);
             return bar;
+        }
+
+        // DragMove 会打断 WPF 的点击计数，所以双击自己按时间窗和位移判断。
+        private static bool IsDoubleClick(DateTime last, Point lastPoint, DateTime now, Point point)
+        {
+            if (last == DateTime.MinValue) return false;
+            return (now - last).TotalMilliseconds <= 500 &&
+                   Math.Abs(point.X - lastPoint.X) < 8 &&
+                   Math.Abs(point.Y - lastPoint.Y) < 8;
+        }
+
+        // 顶栏哪些区域不能拿来拖窗口。只排除真正要收点击的元素：
+        // 旧版把整个 ScrollViewer 排除，标签少时标签条右侧一大片空白就永远拖不动（B1 返工）。
+        private static bool IsChromeInteractive(DependencyObject src)
+        {
+            if (src == null) return false;
+            if (src is TextBox) return true;
+            if (FindParent<Button>(src) != null) return true;
+            var node = src;
+            while (node != null)
+            {
+                var fe = node as FrameworkElement;
+                if (fe != null && (fe.Tag is TabModel ||
+                                   Equals(fe.Tag, "group") ||
+                                   Equals(fe.Tag, "interactive"))) return true;
+                node = VisualTreeHelper.GetParent(node);
+            }
+            return false;
+        }
+
+        // ---------- 最大化时拖顶栏：先还原，再继续跟随鼠标 ----------
+
+        // 物理像素 → DIP。PerMonitorV2 下 PointToScreen / GetMonitorInfo 都是物理像素，
+        // 而 Window.Left/Top/Width/Height 是 DIP；不换算在 125% 缩放下位置会明显偏移。
+        internal static Point PhysicalToDip(Point physical, DpiScale dpi)
+        {
+            var sx = dpi.DpiScaleX > 0 ? dpi.DpiScaleX : 1.0;
+            var sy = dpi.DpiScaleY > 0 ? dpi.DpiScaleY : 1.0;
+            return new Point(physical.X / sx, physical.Y / sy);
+        }
+
+        private static double ClampTo(double value, double lo, double hi)
+        {
+            if (hi < lo) hi = lo;
+            return value < lo ? lo : (value > hi ? hi : value);
+        }
+
+        // RestoreBounds 可能是 Rect.Empty（窗口从未还原过），也可能被系统填成
+        // 最大化矩形（无边框窗口、启动时就最大化时很常见）。后者等于没还原，
+        // 两种都判为不可用，让调用方退回一个明显小于最大化尺寸的普通窗口。
+        private static bool ValidRestoreSize(double value, double maximized)
+        {
+            if (!(value > 0) || double.IsNaN(value) || double.IsInfinity(value)) return false;
+            return !(maximized > 0 && value >= maximized * 0.95);
+        }
+
+        // 纯几何：算出从最大化还原后窗口该摆在哪。抽成静态方法便于 --fixtest 断言。
+        // anchor 是按下点在最大化窗口内的 DIP 坐标，cursor 是当前鼠标的屏幕 DIP 坐标。
+        internal static Rect ComputeRestorePlacement(
+            double maxWidth, double maxHeight,
+            Point anchor, Point cursor,
+            double restoreWidth, double restoreHeight,
+            Rect work)
+        {
+            double w = ValidRestoreSize(restoreWidth, maxWidth)
+                ? restoreWidth : Math.Max(640, maxWidth * 0.72);
+            double h = ValidRestoreSize(restoreHeight, maxHeight)
+                ? restoreHeight : Math.Max(480, maxHeight * 0.72);
+
+            // 鼠标要停在标题栏原来的横向比例上，纵向保持按下时的标题栏内偏移。
+            double ratio = maxWidth > 0 ? anchor.X / maxWidth : 0.5;
+            ratio = ClampTo(ratio, 0.0, 1.0);
+            double left = cursor.X - w * ratio;
+            double top = cursor.Y - anchor.Y;
+
+            // 左上角不跑出工作区；纵向至少留一条 36px 顶栏在屏幕内能抓回来。
+            double minLeft = work.Left;
+            double maxLeft = Math.Max(minLeft, work.Right - Math.Min(w, work.Width));
+            double minTop = work.Top;
+            double maxTop = Math.Max(minTop, work.Bottom - ChromeHeight);
+            return new Rect(ClampTo(left, minLeft, maxLeft), ClampTo(top, minTop, maxTop), w, h);
+        }
+
+        // 当前显示器工作区（DIP）。rcWork 是物理像素，按窗口所在屏的 DPI 缩放换算；
+        // 拿不到时退回 SystemParameters.WorkArea（主屏工作区，本身已是 DIP）。
+        private Rect WorkAreaDip()
+        {
+            var dpi = VisualTreeHelper.GetDpi(this);
+            try
+            {
+                var hwnd = new WindowInteropHelper(this).Handle;
+                var monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                var mi = new MONITORINFO { Size = Marshal.SizeOf(typeof(MONITORINFO)) };
+                if (GetMonitorInfo(monitor, ref mi))
+                {
+                    var tl = PhysicalToDip(new Point(mi.Work.Left, mi.Work.Top), dpi);
+                    var br = PhysicalToDip(new Point(mi.Work.Right, mi.Work.Bottom), dpi);
+                    if (br.X > tl.X && br.Y > tl.Y) return new Rect(tl, br);
+                }
+            }
+            catch { }
+            return SystemParameters.WorkArea;
+        }
+
+        // 拖拽真正启动：超过 3px 阈值才进，单击/双击全程不进 DragMove 的模态循环。
+        // 返回 true 表示调用方可以调 DragMove()。抽成方法是为了让自测能直接断言这条路径。
+        private bool HandleChromeDragMove(Point down, Point current)
+        {
+            if (!_chromeDragArmed) return false;
+            if (Math.Abs(current.X - down.X) < 3 && Math.Abs(current.Y - down.Y) < 3) return false;
+            _chromeDragArmed = false;
+            RestoreFromMaximized(down, current);
+            return true;
+        }
+
+        // DragMove() 在 Maximized 下会抛异常，必须先还原并把窗口挪到鼠标底下。
+        // 还原要在左键仍按下时同步完成，DragMove 才能接着进拖拽循环。
+        private bool RestoreFromMaximized(Point anchor, Point current)
+        {
+            if (WindowState != WindowState.Maximized) return false;
+            var dpi = VisualTreeHelper.GetDpi(this);
+            var cursor = PhysicalToDip(PointToScreen(current), dpi);
+            var bounds = RestoreBounds;
+            double rw = bounds.IsEmpty ? Width : bounds.Width;
+            double rh = bounds.IsEmpty ? Height : bounds.Height;
+            var place = ComputeRestorePlacement(ActualWidth, ActualHeight, anchor, cursor,
+                rw, rh, WorkAreaDip());
+
+            WindowState = WindowState.Normal;
+            Width = place.Width;
+            Height = place.Height;
+            Left = place.Left;
+            Top = place.Top;
+            return true;
         }
 
         // ---------- address bar (SPEC 7.2) ----------
@@ -987,6 +1232,7 @@ namespace NanoEdge
             var scroller = new ScrollViewer
             {
                 Content = _tabStripPanel,
+                Background = new SolidColorBrush(Colors.Transparent),
                 HorizontalScrollBarVisibility = ScrollBarVisibility.Hidden,
                 VerticalScrollBarVisibility = ScrollBarVisibility.Disabled,
                 VerticalAlignment = VerticalAlignment.Center,
@@ -1002,8 +1248,16 @@ namespace NanoEdge
             if (_tabStripPanel != null)
             {
                 _tabStripPanel.Children.Clear();
-                foreach (var tab in VisibleTabs())
+                // 水平布局也要看得见分组，否则误建一个分组后既找不到也删不掉。
+                foreach (var tab in _tabs.Where(t => string.IsNullOrEmpty(t.GroupId)))
                     _tabStripPanel.Children.Add(MakeTabChip(tab, true, true, 110, 200));
+                foreach (var group in _groups)
+                {
+                    _tabStripPanel.Children.Add(MakeGroupHeader(group, true));
+                    if (group.IsCollapsed) continue;
+                    foreach (var tab in _tabs.Where(t => t.GroupId == group.Id))
+                        _tabStripPanel.Children.Add(MakeTabChip(tab, true, true, 110, 200));
+                }
             }
 
             _railPanel.Children.Clear();
@@ -1023,11 +1277,13 @@ namespace NanoEdge
         {
             if (_popupPanel == null) return;
             _popupPanel.Children.Clear();
-            _popupPanel.Children.Add(MakeHeaderRow());
             foreach (var group in _groups)
                 _popupPanel.Children.Add(MakeGroupHeader(group, true));
             foreach (var tab in VisibleTabs())
                 _popupPanel.Children.Add(MakeTabChip(tab, true, true, ExpandedWidth - 24, ExpandedWidth - 24));
+            // 标题行放到最后：放开头会占 30+6px，把下面每个标签都挤下去。
+            // 留在末尾既保住「+ 新建标签」入口，又不破坏标签的一一对应。
+            _popupPanel.Children.Add(MakeHeaderRow());
         }
 
         private IEnumerable<TabModel> VisibleTabs()
@@ -1098,7 +1354,30 @@ namespace NanoEdge
                 RebuildTabStrip();
                 SaveSession();
             };
+            border.MouseRightButtonUp += (s, e) =>
+            {
+                e.Handled = true;
+                SuspendVerticalCollapse();
+                var menu = MakeMenu();
+                menu.Closed += (s2, e2) => ResumeVerticalCollapse();
+                menu.Items.Add(MakeMenuItem(L.T("解散分组"), () => DisbandGroup(group)));
+                menu.PlacementTarget = border;
+                menu.IsOpen = true;
+            };
             return border;
+        }
+
+        // 分组误建后必须能删掉：组内标签恢复平铺，分组本身从会话里移除。
+        private void DisbandGroup(TabGroup group)
+        {
+            if (group == null) return;
+            var name = group.Name;
+            foreach (var tab in _tabs.Where(t => t.GroupId == group.Id).ToList())
+                tab.GroupId = "";
+            _groups.Remove(group);
+            RebuildTabStrip();
+            SaveSession();
+            _toast.Show(L.T("已解散分组：") + name);
         }
 
         // 有 favicon 就用图标，没有就退回首字母色块（SPEC 7.8 的降级口径）。
@@ -1153,10 +1432,22 @@ namespace NanoEdge
                 Tag = tab,
                 AllowDrop = true
             };
-            border.SetResourceReference(Border.BackgroundProperty, active ? "SurfaceBrush" : "TabIdleBrush");
+            // 内存常驻要有看得见的区别：淡色底 + 左侧竖条 + 悬停说明。
+            // 三处背景写入统一走 applyBackground，避免鼠标移开后样式丢失。
+            Action applyBackground = () =>
+                border.SetResourceReference(Border.BackgroundProperty,
+                    tab.Resident ? "AccentSoftBrush" : (active ? "SurfaceBrush" : "TabIdleBrush"));
+            applyBackground();
+            if (tab.Resident)
+            {
+                border.BorderThickness = new Thickness(2, 0, 0, 0);
+                border.SetResourceReference(Border.BorderBrushProperty, "WarnBrush");
+                border.ToolTip = L.T("内存常驻：这个站点的标签不会被自动释放");
+            }
             if (active)
             {
-                border.BorderThickness = new Thickness(0, 0, 0, 2);
+                border.BorderThickness = tab.Resident
+                    ? new Thickness(2, 0, 0, 2) : new Thickness(0, 0, 0, 2);
                 border.SetResourceReference(Border.BorderBrushProperty, "AccentBrush");
             }
 
@@ -1204,34 +1495,48 @@ namespace NanoEdge
 
             border.MouseLeftButtonUp += (s, e) =>
             {
-                if (_dragCandidate != null) return;
-                SelectTab(tab);
+                // 单个 Up 处理器：先取走状态再判断。旧版在隧道阶段置位、
+                // 冒泡阶段判断，普通单击时 _dragCandidate 永远非空，
+                // SelectTab 一次都走不到（B4）。
+                var dragged = _dragInProgress;
+                _dragCandidate = null;
+                _dragInProgress = false;
+                if (!dragged) SelectTab(tab);
             };
             border.MouseEnter += (s, e) =>
             {
                 if (!active) border.SetResourceReference(Border.BackgroundProperty, "HoverBrush");
             };
-            border.MouseLeave += (s, e) =>
-            {
-                if (!active) border.SetResourceReference(Border.BackgroundProperty, "TabIdleBrush");
-            };
+            border.MouseLeave += (s, e) => applyBackground();
             border.MouseRightButtonUp += (s, e) =>
             {
                 e.Handled = true;
                 ShowTabMenu(tab, border);
             };
 
-            // WPF drag & drop: works both in the horizontal strip and the vertical popup.
-            border.PreviewMouseLeftButtonDown += (s, e) => _dragCandidate = tab;
+            // 鼠标真的移动超过阈值才启动拖放，按下时的细微抖动不该把单击变成拖拽。
+            border.PreviewMouseLeftButtonDown += (s, e) =>
+            {
+                _dragCandidate = tab;
+                _dragStart = e.GetPosition(null);
+                _dragInProgress = false;
+            };
             border.MouseMove += (s, e) =>
             {
-                if (e.LeftButton == MouseButtonState.Pressed && _dragCandidate == tab)
+                if (_dragInProgress || _dragCandidate != tab ||
+                    e.LeftButton != MouseButtonState.Pressed) return;
+                var p = e.GetPosition(null);
+                if (Math.Abs(p.X - _dragStart.X) < 4 && Math.Abs(p.Y - _dragStart.Y) < 4) return;
+                _dragInProgress = true;
+                SuspendVerticalCollapse();
+                try { DragDrop.DoDragDrop(border, tab, DragDropEffects.Move); }
+                finally
                 {
+                    _dragInProgress = false;
                     _dragCandidate = null;
-                    DragDrop.DoDragDrop(border, tab, DragDropEffects.Move);
+                    ResumeVerticalCollapse();
                 }
             };
-            border.MouseLeftButtonUp += (s, e) => _dragCandidate = null;
             border.DragOver += (s, e) => e.Effects = DragDropEffects.Move;
             border.Drop += (s, e) =>
             {
@@ -1256,14 +1561,10 @@ namespace NanoEdge
 
         private void ShowTabMenu(TabModel tab, FrameworkElement target)
         {
+            SuspendVerticalCollapse();
             var menu = MakeMenu();
-            menu.Items.Add(MakeMenuItem(tab.IsPinned ? L.T("取消固定") : L.T("固定标签"), () =>
-            {
-                tab.IsPinned = !tab.IsPinned;
-                RebuildTabStrip();
-                SaveSession();
-            }));
-            menu.Items.Add(MakeMenuItem(tab.Resident ? L.T("取消常驻") : L.T("标记为常驻"), () => ToggleResident(tab)));
+            menu.Closed += (s, e) => ResumeVerticalCollapse();
+            menu.Items.Add(MakeMenuItem(tab.Resident ? L.T("取消内存常驻") : L.T("内存常驻（不自动释放）"), () => ToggleResident(tab)));
             menu.Items.Add(MakeMenuItem(L.T("立即释放此标签内存"), () => ReleaseTab(tab)));
             menu.Items.Add(MakeMenuItem(L.T("新建分组并移入"), () =>
             {
@@ -1282,7 +1583,7 @@ namespace NanoEdge
                 }));
             if (IsDuplicatable(tab))
                 menu.Items.Add(MakeMenuItem(L.T("复制标签"), () => DuplicateTab(tab)));
-            menu.Items.Add(new Separator());
+            menu.Items.Add(Theme.StyleSeparator(new Separator()));
             menu.Items.Add(MakeMenuItem(L.T("关闭标签"), () => CloseTab(tab)));
             menu.Items.Add(MakeMenuItem(L.T("关闭其他标签"), () =>
             {
@@ -1295,17 +1596,13 @@ namespace NanoEdge
 
         private ContextMenu MakeMenu()
         {
-            var menu = new ContextMenu();
-            menu.SetResourceReference(ContextMenu.BackgroundProperty, "SurfaceBrush");
-            menu.SetResourceReference(ContextMenu.ForegroundProperty, "TextBrush");
-            menu.SetResourceReference(ContextMenu.BorderBrushProperty, "LineBrush");
-            return menu;
+            // A5：菜单样式统一在 Theme 里定义，三处菜单共用，漏一处就会留白条。
+            return Theme.StyleMenu(new ContextMenu());
         }
 
         private MenuItem MakeMenuItem(string text, Action action)
         {
-            var item = new MenuItem { Header = text, FontSize = 12 };
-            item.SetResourceReference(MenuItem.ForegroundProperty, "TextBrush");
+            var item = Theme.StyleMenuItem(new MenuItem { Header = text, FontSize = 12 });
             item.Click += (s, e) => action();
             return item;
         }
@@ -1335,39 +1632,39 @@ namespace NanoEdge
                 RebuildTabStrip();
                 SaveSession();
             }));
-            menu.Items.Add(new Separator());
-            menu.Items.Add(MakeMenuItem(L.T("历史记录 (Ctrl+H)"), () => OpenInternalPage(_active, InternalPages.History)));
-            menu.Items.Add(MakeMenuItem(L.T("书签 (Ctrl+Shift+O)"), () => OpenInternalPage(_active, InternalPages.Bookmarks)));
+            menu.Items.Add(Theme.StyleSeparator(new Separator()));
+            menu.Items.Add(MakeMenuItem(L.T("历史记录 (Ctrl+H)"), OpenHistory));
+            menu.Items.Add(MakeMenuItem(L.T("书签 (Ctrl+Shift+O)"), OpenBookmarks));
             menu.Items.Add(MakeMenuItem(L.T("下载 (Ctrl+J)"), OpenDownloads));
             menu.Items.Add(MakeMenuItem(L.T("用户脚本"), OpenScripts));
             menu.Items.Add(MakeMenuItem(L.T("设置"), OpenSettings));
-            menu.Items.Add(new Separator());
+            menu.Items.Add(Theme.StyleSeparator(new Separator()));
             menu.Items.Add(MakeMenuItem(L.T("放大 (Ctrl++)"), () => Zoom(_browser.ZoomIn)));
             menu.Items.Add(MakeMenuItem(L.T("缩小 (Ctrl+-)"), () => Zoom(_browser.ZoomOut)));
             menu.Items.Add(MakeMenuItem(L.T("缩放重置 (Ctrl+0)"), () => Zoom(_browser.ZoomReset)));
-            menu.Items.Add(new Separator());
+            menu.Items.Add(Theme.StyleSeparator(new Separator()));
             menu.Items.Add(MakeMenuItem(L.T("内存明细面板 (Ctrl+Shift+M)"), () => OpenMemoryPanel(true)));
             var presets = new MenuItem
             {
                 Header = L.T("内存档位：") + _settings.Memory.PresetName,
                 FontSize = 12
             };
-            presets.SetResourceReference(MenuItem.ForegroundProperty, "TextBrush");
-            presets.Items.Add(MakeMenuItem((_settings.Memory.Preset == MemoryPreset.Conservative ? "● " : "　 ") + L.T("保守"),
+            Theme.StyleMenuItem(presets);
+            presets.Items.Add(MakeMenuItem((_settings.Memory.Preset == MemoryPreset.Conservative ? "● " : "　 ") + L.T("少重载"),
                 () => SetMemoryPreset(MemoryPreset.Conservative)));
-            presets.Items.Add(MakeMenuItem((_settings.Memory.Preset == MemoryPreset.Balanced ? "● " : "　 ") + L.T("均衡"),
+            presets.Items.Add(MakeMenuItem((_settings.Memory.Preset == MemoryPreset.Balanced ? "● " : "　 ") + L.T("标准"),
                 () => SetMemoryPreset(MemoryPreset.Balanced)));
-            presets.Items.Add(MakeMenuItem((_settings.Memory.Preset == MemoryPreset.Aggressive ? "● " : "　 ") + L.T("激进"),
+            presets.Items.Add(MakeMenuItem((_settings.Memory.Preset == MemoryPreset.Aggressive ? "● " : "　 ") + L.T("省内存"),
                 () => SetMemoryPreset(MemoryPreset.Aggressive)));
             menu.Items.Add(presets);
-            menu.Items.Add(new Separator());
+            menu.Items.Add(Theme.StyleSeparator(new Separator()));
             menu.Items.Add(MakeMenuItem(_settings.VerticalExpanded ? L.T("垂直标签：改为悬浮展开") : L.T("垂直标签：固定展开"), () =>
             {
                 _settings.VerticalExpanded = !_settings.VerticalExpanded;
                 SettingsStore.Save(_settings);
                 ApplyLayout();
             }));
-            menu.Items.Add(new Separator());
+            menu.Items.Add(Theme.StyleSeparator(new Separator()));
             menu.Items.Add(MakeMenuItem(L.T("设为默认浏览器"), SetDefaultBrowser));
             menu.Items.Add(MakeMenuItem(L.T("切换主题"), ToggleTheme));
             menu.Items.Add(MakeMenuItem(L.T("沉浸式全屏 (F11)"), ToggleImmersive));
@@ -1414,9 +1711,7 @@ namespace NanoEdge
         {
             var tab = new TabModel { IsSecret = secret, Title = secret ? L.T("文档") : L.T("新标签页") };
             _tabs.Add(tab);
-            var start = new StartPage(_settings);
-            start.NavigateRequested += input => Navigate(tab, input);
-            _browser.RegisterStartPage(tab, start);
+            _browser.RegisterStartPage(tab, MakeStartPage(tab));
             SelectTab(tab);
             if (!string.IsNullOrEmpty(url)) Navigate(tab, url, null, sourceSite);
         }
@@ -1515,13 +1810,21 @@ namespace NanoEdge
             SaveSession();
         }
 
+        // 起始页统一在这里建：搜索引擎下拉的改动要抛回 MainWindow 落盘，
+        // 页面本身不直接写 settings.json。
+        private StartPage MakeStartPage(TabModel tab)
+        {
+            var start = new StartPage(_settings);
+            start.NavigateRequested += input => Navigate(tab, input);
+            start.SearchEngineChanged += OnSettingChanged;
+            return start;
+        }
+
         private FrameworkElement BuildInternalView(TabModel tab, string sourceSite = null)
         {
             if (tab.IsStartPage || string.IsNullOrEmpty(tab.InternalPage))
             {
-                var start = new StartPage(_settings);
-                start.NavigateRequested += input => Navigate(tab, input);
-                return start;
+                return MakeStartPage(tab);
             }
             var site = sourceSite ?? "";
             var view = InternalPages.Create("nano://" + tab.InternalPage, _settings,
@@ -1544,6 +1847,19 @@ namespace NanoEdge
             if (newTab) NewTab(url);
             else Navigate(_active, url);
         }
+
+        // 内部页统一口径：一律新开标签，已经开着就切过去，不重复创建。
+        // 地址栏主动输入 nano://xxx 仍按普通导航覆盖当前页，那是用户显式导航。
+        private void OpenInternalTab(string url, string pageKey)
+        {
+            var existing = _tabs.FirstOrDefault(t => t.InternalPage == pageKey);
+            if (existing != null) { SelectTab(existing); return; }
+            NewTab(url);
+        }
+
+        private void OpenHistory() { OpenInternalTab(InternalPages.History, "history"); }
+
+        private void OpenBookmarks() { OpenInternalTab(InternalPages.Bookmarks, "bookmarks"); }
 
         // Ctrl+J 新开标签：正在下载的页面不能被 ShowInternal 的 Dispose 打断。
         // 已经有下载页就切过去，不重复开。
@@ -1582,6 +1898,8 @@ namespace NanoEdge
         private void OnSettingChanged(string kind)
         {
             SettingsStore.Save(_settings);
+            // 搜索引擎下拉自己已经同步了所有实例，这里只需要落盘。
+            if (kind == "search") return;
             if (kind == "language")
             {
                 L.Apply(_settings.Language);
@@ -1624,9 +1942,7 @@ namespace NanoEdge
                 else if (tab.IsStartPage)
                 {
                     tab.Title = L.T("新标签页");
-                    var start = new StartPage(_settings);
-                    start.NavigateRequested += input => Navigate(tab, input);
-                    _browser.ReplaceLocalView(tab, start);
+                    _browser.ReplaceLocalView(tab, MakeStartPage(tab));
                 }
             }
             if (_active != null) _browser.Show(_active);
@@ -1770,7 +2086,9 @@ namespace NanoEdge
         private void CloseTab(TabModel tab)
         {
             if (tab == null) return;
-            if (_tabs.Count == 1) { Close(); return; }
+            // 关掉最后一个标签时先补一个起始页，再走正常关闭流程。
+            // 直接 Close() 会触发 ShutdownMode.OnMainWindowClose 把整个进程带走。
+            if (_tabs.Count == 1) NewTab();
             RememberClosedTab(tab);
             var index = _tabs.IndexOf(tab);
             _browser.Remove(tab);
@@ -1847,8 +2165,13 @@ namespace NanoEdge
             if (discarded > 0) extra += L.T(" · 已丢弃 ") + discarded;
             if (_active != null && Math.Abs(_active.Zoom - ZoomLevels.Default) > 0.0001)
                 extra += L.T(" · 缩放 ") + ZoomLevels.Label(_active.Zoom);
+            // 没有分组时不再显示「0 个分组」：垂直栏里标签本来就是平铺的，
+            // 这行字容易被读成「所有标签都包在分组 0 下面」。
+            var groupPart = _groups.Count > 0
+                ? _groups.Count + L.T(" 个分组 · 内存档 ") + _settings.Memory.PresetName
+                : L.T("内存档 ") + _settings.Memory.PresetName;
             _statusText.Text = layout + " · " + ThemeText() + " · " + _tabs.Count + L.T(" 个标签 · ") +
-                               _groups.Count + L.T(" 个分组 · 内存档 ") + _settings.Memory.PresetName + extra;
+                               groupPart + extra;
         }
 
         private void UpdateMemoryBadge()
@@ -1890,6 +2213,9 @@ namespace NanoEdge
                     other.Resident = next;
 
             SettingsStore.Save(_settings);
+            // 同一站点的多个标签会一起改状态，必须重建标签条才能看到样式变化。
+            RebuildTabStrip();
+            SaveSession();
             if (_memoryPanel != null) { var unused = _memoryPanel.RefreshAsync(); }
         }
 
@@ -1927,10 +2253,16 @@ namespace NanoEdge
         protected override void OnPreviewKeyDown(KeyEventArgs e)
         {
             base.OnPreviewKeyDown(e);
+            // WPF 的 WebView2 控件会把加速键转发回 WPF 层，所以只放行消息泵
+            // 是不够的：这里再截一次 F5 就会主动 Reload，页面热键照样被盖掉。
+            // 两层都放行，页面 JS 才能拿到 keydown 并 preventDefault。
+            if (e.Key == Key.F5 && Keyboard.Modifiers == ModifierKeys.None) return;
+            if (e.Key == Key.R && Keyboard.Modifiers == ModifierKeys.Control) return;
             if (HandleShortcut(e.Key, Keyboard.Modifiers, e.SystemKey)) e.Handled = true;
         }
 
-        // WebView2 是独立 HWND：页面聚焦时 WPF 收不到按键，必须在消息泵层面先截。
+        // WebView2 是独立 HWND：页面聚焦时 WPF 收不到按键，宿主快捷键只能在
+        // 消息泵层面分发。但刷新类按键必须放给内核，见下面。
         private void OnThreadPreprocessMessage(ref System.Windows.Interop.MSG msg, ref bool handled)
         {
             if (handled) return;
@@ -1940,9 +2272,20 @@ namespace NanoEdge
 
             var key = KeyInterop.KeyFromVirtualKey((int)msg.wParam);
             var modifiers = Keyboard.Modifiers;
+            var ctrl = (modifiers & ModifierKeys.Control) == ModifierKeys.Control;
+            var shift = (modifiers & ModifierKeys.Shift) == ModifierKeys.Shift;
+            var alt = (modifiers & ModifierKeys.Alt) == ModifierKeys.Alt;
+
+            // 刷新键交给 WebView2：页面 JS 先收到 keydown，可以 preventDefault()
+            // 改成自己的行为（pgadmin 的 F5 执行 SQL），页面不拦时内核自己刷新。
+            // 宿主在消息泵层无条件吞掉 WM_KEYDOWN 的话，页面永远收不到（B7）。
+            // Ctrl+F5 仍由宿主做硬刷新；F11/F12 仍是浏览器级行为。
+            if (key == Key.F5 && !ctrl && !shift && !alt) return;
+            if (key == Key.R && ctrl && !shift && !alt) return;
+
             // 只截带修饰键的组合和功能键，别吞掉正常打字。
             if (modifiers == ModifierKeys.None &&
-                key != Key.F5 && key != Key.F11 && key != Key.F12) return;
+                key != Key.F11 && key != Key.F12) return;
             if (HandleShortcut(key, modifiers, Key.None)) handled = true;
         }
 
@@ -2012,8 +2355,8 @@ namespace NanoEdge
             if (key == Key.T && shift) { ReopenClosedTab(); return true; }
             if (key == Key.W) { CloseTab(_active); return true; }
             if (key == Key.D && !shift) { ToggleBookmark(); return true; }
-            if (key == Key.H && !shift) { OpenInternalPage(_active, InternalPages.History); return true; }
-            if (key == Key.O && shift) { OpenInternalPage(_active, InternalPages.Bookmarks); return true; }
+            if (key == Key.H && !shift) { OpenHistory(); return true; }
+            if (key == Key.O && shift) { OpenBookmarks(); return true; }
             if (key == Key.J && !shift) { OpenDownloads(); return true; }
 
             // 缩放档位必须由我们掌握：按站点记忆 + Ctrl+0 一律回到 100%。
@@ -2075,6 +2418,12 @@ namespace NanoEdge
             {
                 _governor.Start();
                 var unused = PrimeMemoryAsync();
+            }
+
+            if (HasArg("--fixtest"))
+            {
+                var unusedFix = new FixSelfTest(this).RunAsync();
+                return;
             }
 
             if (HasArg("--memtest"))
@@ -2140,6 +2489,9 @@ namespace NanoEdge
                 return;
             }
 
+            // A5：菜单样式预览用 Canvas 覆盖层（ContextMenu 是独立 HWND，截图抓不到）。
+            if (HasArg("--menupreview")) BuildMenuPreview();
+
             if (!string.IsNullOrEmpty(_screenshotPath))
             {
                 var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(2600) };
@@ -2173,6 +2525,155 @@ namespace NanoEdge
             var directory = Path.GetDirectoryName(Path.GetFullPath(path));
             if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
             using (var stream = File.Create(path)) encoder.Save(stream);
+        }
+
+        // A5 视觉验证：ContextMenu 是独立 HWND，RenderTargetBitmap.Render(window)
+        // 抓不到。改用主窗口可视树里的 Canvas 覆盖层（不用 Popup）渲染同一套菜单
+        // 画刷：Icon 列、普通行、高亮行、分隔线、二级菜单底都能被截到。
+        // 预览用的是 Theme 里同一批主题键，配合 --fixtest 的画刷/模板断言。
+        private void BuildMenuPreview()
+        {
+            var layer = new Canvas { IsHitTestVisible = false };
+            Grid.SetRow(layer, 0);
+            Grid.SetRowSpan(layer, 3);
+            _root.Children.Add(layer);
+
+            var card = new Border
+            {
+                Width = 300,
+                Padding = new Thickness(6),
+                CornerRadius = new CornerRadius(6),
+                BorderThickness = new Thickness(1)
+            };
+            card.SetResourceReference(Border.BackgroundProperty, "SurfaceBrush");
+            card.SetResourceReference(Border.BorderBrushProperty, "LineBrush");
+
+            var stack = new StackPanel();
+            stack.Children.Add(MenuPreviewRow(L.T("菜单"), false));
+            stack.Children.Add(MenuPreviewRow(L.T("设置"), true));   // 高亮态
+            var separator = Theme.StyleSeparator(new Separator());
+            separator.Margin = new Thickness(4, 3, 4, 3);
+            stack.Children.Add(separator);
+            stack.Children.Add(MenuPreviewRow(L.T("用户脚本"), false));
+
+            // 二级菜单示例：模拟子菜单 Popup 的底和边框，暗色下不能是白底。
+            var submenu = new Border
+            {
+                Margin = new Thickness(30, 4, 0, 2),
+                Padding = new Thickness(4),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(4)
+            };
+            submenu.SetResourceReference(Border.BackgroundProperty, "SurfaceBrush");
+            submenu.SetResourceReference(Border.BorderBrushProperty, "LineBrush");
+            submenu.Child = MenuPreviewRow(L.T("新建标签"), false);
+            stack.Children.Add(submenu);
+            card.Child = stack;
+
+            Canvas.SetLeft(card, 300);
+            Canvas.SetTop(card, 110);
+            layer.Children.Add(card);
+        }
+
+        private static FrameworkElement MenuPreviewRow(string text, bool highlighted)
+        {
+            var row = new Border
+            {
+                Height = 28,
+                Padding = new Thickness(6, 0, 6, 0),
+                CornerRadius = new CornerRadius(3)
+            };
+            row.SetResourceReference(Border.BackgroundProperty,
+                highlighted ? "HoverBrush" : "SurfaceBrush");
+
+            var grid = new Grid();
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(24) }); // Icon 列
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            var icon = new Border
+            {
+                Width = 8,
+                Height = 8,
+                CornerRadius = new CornerRadius(4),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            icon.SetResourceReference(Border.BackgroundProperty, "MutedBrush");
+            Grid.SetColumn(icon, 0);
+            grid.Children.Add(icon);
+
+            var label = new TextBlock
+            {
+                Text = text,
+                FontSize = 12,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            label.SetResourceReference(TextBlock.ForegroundProperty, "TextBrush");
+            Grid.SetColumn(label, 1);
+            grid.Children.Add(label);
+            row.Child = grid;
+            return row;
+        }
+
+        // ---------- A3：最大化按工作区，不盖任务栏 ----------
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NativePoint { public int X; public int Y; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NativeRect { public int Left, Top, Right, Bottom; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MINMAXINFO
+        {
+            public NativePoint Reserved, MaxSize, MaxPosition, MinTrackSize, MaxTrackSize;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MONITORINFO
+        {
+            public int Size;
+            public NativeRect Monitor, Work;
+            public int Flags;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
+
+        private const uint MONITOR_DEFAULTTONEAREST = 2;
+        private const int WM_GETMINMAXINFO = 0x0024;
+
+        private void InstallWorkAreaHook()
+        {
+            SourceInitialized += (s, e) =>
+            {
+                var source = (HwndSource)PresentationSource.FromVisual(this);
+                if (source != null) source.AddHook(WorkAreaHook);
+            };
+        }
+
+        // WindowStyle.None 的窗口由系统按整屏 rcMonitor 算最大化矩形，
+        // 任务栏就被盖住了。这里把最大化尺寸和位置改成当前显示器的 rcWork。
+        private IntPtr WorkAreaHook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam,
+            ref bool handled)
+        {
+            if (msg != WM_GETMINMAXINFO) return IntPtr.Zero;
+            var info = (MINMAXINFO)Marshal.PtrToStructure(lParam, typeof(MINMAXINFO));
+            var monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            var mi = new MONITORINFO { Size = Marshal.SizeOf(typeof(MONITORINFO)) };
+            if (!GetMonitorInfo(monitor, ref mi)) return IntPtr.Zero;
+
+            // WM_GETMINMAXINFO 用物理像素；app.manifest 声明 PerMonitorV2，
+            // GetMonitorInfo 返回的也是物理像素，两边一致，不用再换算 DPI。
+            info.MaxPosition.X = mi.Work.Left - mi.Monitor.Left;
+            info.MaxPosition.Y = mi.Work.Top - mi.Monitor.Top;
+            info.MaxSize.X = mi.Work.Right - mi.Work.Left;
+            info.MaxSize.Y = mi.Work.Bottom - mi.Work.Top;
+            Marshal.StructureToPtr(info, lParam, true);
+            handled = true;
+            return IntPtr.Zero;
         }
     }
 }

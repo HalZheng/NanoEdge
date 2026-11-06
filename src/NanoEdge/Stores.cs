@@ -81,6 +81,30 @@ namespace NanoEdge
             // 只有字段缺失才补默认；用户把起始页快捷方式全删掉是有效状态，
             // 不能每次启动又给长回来。
             if (settings.Shortcuts == null) settings.Shortcuts = Defaults();
+
+            // v1 → v2：默认搜索引擎从 Bing 换成 Google。只动仍停留在旧默认值的配置，
+            // 用户手动选过别的引擎就保留。不这样做的话，老 settings.json 会把新默认值盖掉。
+            if (settings.SchemaVersion < 2)
+            {
+                if (string.IsNullOrWhiteSpace(settings.SearchEngine) ||
+                    string.Equals(settings.SearchEngine, SearchEngineOptions.LegacyBing,
+                        StringComparison.OrdinalIgnoreCase))
+                    settings.SearchEngine = SearchEngineOptions.Google;
+                settings.SchemaVersion = 2;
+            }
+
+            // v2 → v3：状态栏默认隐藏、语言默认跟随系统。老 settings.json 里写死的
+            // true / zh-CN 会盖掉新默认值，看起来像没改，所以必须迁移一次。
+            // 语言只动仍停留在旧默认值的配置，用户手动选过 en-US 的要保留。
+            if (settings.SchemaVersion < 3)
+            {
+                if (settings.ShowStatusBar) settings.ShowStatusBar = false;
+                if (string.IsNullOrWhiteSpace(settings.Language) ||
+                    string.Equals(settings.Language, "zh-CN", StringComparison.OrdinalIgnoreCase))
+                    settings.Language = "system";
+                settings.SchemaVersion = 3;
+            }
+            settings.SearchEngine = SearchEngineOptions.Normalize(settings.SearchEngine);
             return settings;
         }
 
@@ -94,7 +118,7 @@ namespace NanoEdge
         {
             return new List<Shortcut>
             {
-                new Shortcut { Title = "Bing", Url = "https://www.bing.com/" },
+                new Shortcut { Title = "Google", Url = "https://www.google.com/" },
                 new Shortcut { Title = "GitHub", Url = "https://github.com/" },
                 new Shortcut { Title = "localhost:3000", Url = "http://localhost:3000/" },
                 new Shortcut { Title = "localhost:8080", Url = "http://localhost:8080/" },

@@ -17,7 +17,6 @@ namespace NanoEdge
         public string Url = "";
         public string Title = L.T("新标签页");
         public string GroupId = "";
-        public bool IsPinned;
         public bool IsStartPage = true;
         public string InternalPage = "";   // "" | "history" | "bookmarks"，非空时显示纯 WPF 内部页
         public bool IsSecret;
@@ -131,9 +130,9 @@ namespace NanoEdge
             {
                 switch (Preset)
                 {
-                    case MemoryPreset.Conservative: return L.T("保守");
-                    case MemoryPreset.Aggressive: return L.T("激进");
-                    default: return L.T("均衡");
+                    case MemoryPreset.Conservative: return L.T("少重载");
+                    case MemoryPreset.Aggressive: return L.T("省内存");
+                    default: return L.T("标准");
                 }
             }
         }
@@ -141,15 +140,15 @@ namespace NanoEdge
 
     public sealed class AppSettings
     {
-        public int SchemaVersion = 1;
-        public string Language = "zh-CN";
-        public string Theme = "dark";                 // dark | light | system
+        public int SchemaVersion = 3;
+        public string Language = "system";           // zh-CN | en-US | system（跟随系统）
+        public string Theme = "dark";               // dark | light | system（主题的跟随系统，和语言是两回事）
         public LayoutMode Layout = LayoutMode.Compact;
         public bool VerticalExpanded;
-        public bool ShowStatusBar = true;
+        public bool ShowStatusBar = false;           // 默认隐藏，设置页可重新打开
         // 密封标签是否允许页面通知（默认关：不弹、不留权限记录）。
         public bool SecretNotifications;
-        public string SearchEngine = "https://www.bing.com/search?q={q}";
+        public string SearchEngine = SearchEngineOptions.Google;
         public List<Shortcut> Shortcuts = new List<Shortcut>();
         public MemorySettings Memory = new MemorySettings();
         public double WindowLeft = double.NaN;
@@ -164,5 +163,55 @@ namespace NanoEdge
         public List<TabModel> Tabs = new List<TabModel>();
         public List<TabGroup> Groups = new List<TabGroup>();
         public string ActiveTabId = "";
+    }
+
+    public sealed class SearchEngineOption
+    {
+        public readonly string Name;
+        public readonly string Template;
+
+        public SearchEngineOption(string name, string template)
+        {
+            Name = name;
+            Template = template;
+        }
+    }
+
+    // 默认搜索引擎只在这里定义一份：地址栏、起始页下拉、设置页下拉都读它。
+    public static class SearchEngineOptions
+    {
+        public const string Google = "https://www.google.com/search?q={q}";
+        public const string Bing = "https://www.bing.com/search?q={q}";
+        public const string Baidu = "https://www.baidu.com/s?wd={q}";
+        public const string DuckDuckGo = "https://duckduckgo.com/?q={q}";
+
+        // 0.19 之前的默认值，迁移时用来判断"用户有没有手动改过"。
+        public const string LegacyBing = Bing;
+
+        public static readonly SearchEngineOption[] All =
+        {
+            new SearchEngineOption("Google", Google),
+            new SearchEngineOption("Bing", Bing),
+            new SearchEngineOption("百度", Baidu),
+            new SearchEngineOption("DuckDuckGo", DuckDuckGo)
+        };
+
+        public static string NameOf(string template)
+        {
+            foreach (var option in All)
+                if (string.Equals(option.Template, template, StringComparison.OrdinalIgnoreCase))
+                    return L.T(option.Name);
+            return L.T(All[0].Name);
+        }
+
+        // 配置里存了不认识的模板（手改过 settings.json）时退回默认，别让搜索框变哑。
+        public static string Normalize(string template)
+        {
+            if (string.IsNullOrWhiteSpace(template)) return Google;
+            foreach (var option in All)
+                if (string.Equals(option.Template, template, StringComparison.OrdinalIgnoreCase))
+                    return option.Template;
+            return Google;
+        }
     }
 }

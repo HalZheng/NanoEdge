@@ -51,7 +51,7 @@ dotnet build src/NanoEdge/NanoEdge.csproj -c Release
 .\src\NanoEdge\bin\Release\net48\NanoEdge.exe --m8test
 ```
 
-历史自测参数：`--memtest`、`--navtest`、`--m3ctest`、`--m4test`、`--m5test`、`--m6test`、`--m6btest`、`--m7test`。
+历史自测参数：`--memtest`、`--navtest`、`--m3ctest`、`--m4test`、`--m5test`、`--m6test`、`--m6btest`、`--m7test`、`--m8test`、`--fixtest`（修复批次的针对性回归）。
 
 ## 文档
 

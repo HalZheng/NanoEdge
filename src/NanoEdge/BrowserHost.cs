@@ -24,15 +24,9 @@ namespace NanoEdge
             if (text.StartsWith("about:", StringComparison.OrdinalIgnoreCase)) return text;
             if (text.StartsWith("file:", StringComparison.OrdinalIgnoreCase)) return text;
 
-            var firstSpace = text.IndexOf(' ');
-            if (firstSpace > 0)
-            {
-                var prefix = text.Substring(0, firstSpace).ToLowerInvariant();
-                var engine = Keyword(prefix);
-                if (engine != null)
-                    return engine.Replace("{q}", Uri.EscapeDataString(text.Substring(firstSpace + 1).Trim()));
-                return Search(text, settings);
-            }
+            // 带了空格就整句当搜索词，交给当前默认搜索引擎。
+            // 0.19 之前的 b/g/gh/npm 前缀已移除，改用起始页和设置页的下拉切换。
+            if (text.Contains(" ")) return Search(text, settings);
 
             if (text.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
                 text.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
@@ -50,20 +44,6 @@ namespace NanoEdge
             return host == "localhost" || host.StartsWith("localhost:") ||
                    host.StartsWith("127.0.0.1") || host.StartsWith("192.168.") ||
                    host.StartsWith("10.") || host.StartsWith("[");
-        }
-
-        private static string Keyword(string prefix)
-        {
-            switch (prefix)
-            {
-                case "b": return "https://www.bing.com/search?q={q}";
-                case "g": return "https://www.google.com/search?q={q}";
-                case "bd": return "https://www.baidu.com/s?wd={q}";
-                case "gh": return "https://github.com/search?q={q}";
-                case "npm": return "https://www.npmjs.com/search?q={q}";
-                case "so": return "https://stackoverflow.com/search?q={q}";
-                default: return null;
-            }
         }
 
         // 能不能当网址打开（决定地址栏第一行是不是"打开 xxx"）。
@@ -185,6 +165,14 @@ namespace NanoEdge
         {
             WebView2 view;
             return _webviews.TryGetValue(tab.Id, out view) && view != null ? view.CoreWebView2 : null;
+        }
+
+        // 自测用：把真实键盘焦点设到 WebView2 的子 HWND 上。
+        internal IntPtr WindowHandleOf(TabModel tab)
+        {
+            WebView2 view;
+            if (!_webviews.TryGetValue(tab.Id, out view) || view == null) return IntPtr.Zero;
+            try { return view.Handle; } catch { return IntPtr.Zero; }
         }
 
         public bool HasLiveView(TabModel tab)

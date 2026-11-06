@@ -12,13 +12,14 @@ namespace NanoEdge
     // 语言切换要重建内部页视图，不能由页面自己干。
     public sealed class SettingsPage : UserControl
     {
-        public event Action<string> Changed;              // theme | layout | memory | language | status | privacy
+        public event Action<string> Changed;              // theme | layout | memory | language | status | privacy | search
         public event Action OpenDataFolderRequested;
         public event Action SetDefaultBrowserRequested;
 
         private readonly AppSettings _settings;
         private readonly Grid _root;
         private readonly StackPanel _body;
+        private readonly Canvas _dropdownLayer = new Canvas();
         private TextBlock _memoryHint;
 
         public SettingsPage(AppSettings settings)
@@ -64,6 +65,10 @@ namespace NanoEdge
             };
             Grid.SetRow(scroll, 1);
             _root.Children.Add(scroll);
+            // 覆盖层跨两行，下拉悬浮在内容之上，不把下面的设置行挤下去。
+            Grid.SetRowSpan(_dropdownLayer, 2);
+            Panel.SetZIndex(_dropdownLayer, 100);
+            _root.Children.Add(_dropdownLayer);
             Content = _root;
 
             SizeChanged += (s, e) => UpdateWidth();
@@ -81,6 +86,13 @@ namespace NanoEdge
         {
             _body.Children.Clear();
 
+            // ---------- 搜索 ----------
+            _body.Children.Add(Section(L.T("搜索")));
+            var picker = new SearchEnginePicker(_settings, () => Raise("search"), _dropdownLayer,
+                Array.Exists(Environment.GetCommandLineArgs(),
+                    a => string.Equals(a, "--enginedropdown", StringComparison.OrdinalIgnoreCase)));
+            _body.Children.Add(Row(L.T("默认搜索引擎"), L.T("地址栏和起始页都用它，切换后立即生效"), picker));
+
             // ---------- 外观 ----------
             _body.Children.Add(Section(L.T("外观")));
             _body.Children.Add(Row(L.T("主题"), L.T("暗色适合夜间，跟随系统会随 Windows 设置切换"),
@@ -89,10 +101,12 @@ namespace NanoEdge
                     _settings.Theme = index == 0 ? "dark" : index == 1 ? "light" : "system";
                     Raise("theme");
                 })));
-            _body.Children.Add(Row(L.T("语言"), L.T("切换后界面立即重建，网页内容不受影响"),
-                Segments(new[] { "中文", "English" }, L.IsEnglish ? 1 : 0, index =>
+            _body.Children.Add(Row(L.T("语言"),
+                L.T("切换后界面立即重建，网页内容不受影响；跟随系统按 Windows 显示语言判断"),
+                Segments(new[] { "中文", "English", L.T("跟随系统") },
+                    LanguageIndex(_settings.Language), index =>
                 {
-                    _settings.Language = index == 1 ? "en-US" : "zh-CN";
+                    _settings.Language = index == 0 ? "zh-CN" : index == 1 ? "en-US" : "system";
                     Raise("language");
                 })));
 
@@ -122,19 +136,29 @@ namespace NanoEdge
             _memoryHint = new TextBlock
             {
                 Text = MemoryHintText(),
-                FontSize = 10,
-                Margin = new Thickness(0, 0, 0, 4),
+                FontSize = 11,
+                Margin = new Thickness(2, 0, 2, 12),
+                LineHeight = 18,
                 TextWrapping = TextWrapping.Wrap
             };
             _memoryHint.SetResourceReference(TextBlock.ForegroundProperty, "MutedBrush");
             _body.Children.Add(_memoryHint);
-            _body.Children.Add(Row(L.T("档位"), L.T("只影响后台标签的降冷与丢弃，不改页面行为"),
-                Segments(new[] { L.T("保守"), L.T("均衡"), L.T("激进") }, (int)_settings.Memory.Preset, index =>
+            _body.Children.Add(Row(L.T("档位"), L.T("省内存就多重载，少重载就多占内存，选一个能接受的取舍"),
+                Segments(new[] { L.T("少重载"), L.T("标准"), L.T("省内存") }, (int)_settings.Memory.Preset, index =>
                 {
                     _settings.Memory.ApplyPreset((MemoryPreset)index);
                     if (_memoryHint != null) _memoryHint.Text = MemoryHintText();
                     Raise("memory");
                 })));
+            var note = new TextBlock
+            {
+                Text = L.T("释放内存会关掉这个标签的网页进程。切回来时页面重新加载，滚动位置和表单内容尽量用快照恢复，登录状态通常还在。"),
+                FontSize = 10,
+                Margin = new Thickness(2, 8, 2, 0),
+                TextWrapping = TextWrapping.Wrap
+            };
+            note.SetResourceReference(TextBlock.ForegroundProperty, "MutedBrush");
+            _body.Children.Add(note);
 
             // ---------- 隐私 ----------
             _body.Children.Add(Section(L.T("隐私")));
@@ -170,14 +194,28 @@ namespace NanoEdge
             return 0;
         }
 
+        // 选中项看的是持久化的 AppSettings.Language，不是 L.Language：
+        // "system" 经 L.Normalize 会变成具体的 zh-CN / en-US，用生效语言判断
+        // 会把「跟随系统」误显示成「中文 / English」。抽成静态方法便于自测断言。
+        internal static int LanguageIndex(string language)
+        {
+            if (string.Equals(language, "system", StringComparison.OrdinalIgnoreCase)) return 2;
+            if (!string.IsNullOrEmpty(language) &&
+                language.StartsWith("en", StringComparison.OrdinalIgnoreCase)) return 1;
+            return 0;
+        }
+
         private string MemoryHintText()
         {
-            var memory = _settings.Memory;
-            var discard = memory.BackgroundDiscardMs == int.MaxValue
-                ? L.T("不自动丢弃")
-                : string.Format(L.T("后台 {0} 分钟丢弃"), memory.BackgroundDiscardMs / 60000);
-            return string.Format(L.T("失焦 {0} 秒降冷 · {1} · 工作集上限 {2}MB"),
-                memory.CoolDelayMs / 1000, discard, memory.PressureLimitMB);
+            switch (_settings.Memory.Preset)
+            {
+                case MemoryPreset.Conservative:
+                    return L.T("少重载：失焦 30 秒降冷，后台标签从不自动释放，工作集到 1200MB 才施压。切回标签基本不用重新加载，但开很多标签时内存占用最高。");
+                case MemoryPreset.Aggressive:
+                    return L.T("省内存：失焦 1 秒降冷，后台 5 分钟就释放，工作集上限 450MB。内存占用最低，但切回旧标签经常要重新加载页面。");
+                default:
+                    return L.T("标准：失焦 2 秒降冷，后台 30 分钟释放，工作集上限 700MB。平时切回不用重载，很久没看的标签会重新加载。");
+            }
         }
 
         private void Raise(string kind)

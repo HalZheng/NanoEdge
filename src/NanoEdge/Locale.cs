@@ -24,8 +24,18 @@ namespace NanoEdge
 
         public static string Normalize(string language)
         {
-            if (string.IsNullOrWhiteSpace(language)) return "zh-CN";
-            return language.Trim().ToLowerInvariant().StartsWith("en") ? "en-US" : "zh-CN";
+            var value = string.IsNullOrWhiteSpace(language) ? "system" : language.Trim();
+
+            // "system" 是持久化值，不是实际生效语言。必须在这里归一到具体的
+            // zh-CN / en-US，否则 IsEnglish 会把 "system" 当成中文，英文系统也显示中文。
+            // 只覆盖中英两种；其它语言没有完整词条，退回中文原文（不会缺词）。
+            if (string.Equals(value, "system", StringComparison.OrdinalIgnoreCase))
+            {
+                var culture = System.Globalization.CultureInfo.CurrentUICulture;
+                var name = culture == null ? "" : culture.Name ?? "";
+                return name.StartsWith("en", StringComparison.OrdinalIgnoreCase) ? "en-US" : "zh-CN";
+            }
+            return value.ToLowerInvariant().StartsWith("en") ? "en-US" : "zh-CN";
         }
 
         public static string T(string chinese)
@@ -144,14 +154,16 @@ namespace NanoEdge
                 { "标签页", "Tabs" },
                 { "新建标签", "New tab" },
                 { "关闭标签", "Close tab" },
-                { "取消固定", "Unpin" },
-                { "固定标签", "Pin tab" },
-                { "取消常驻", "Stop keeping resident" },
-                { "标记为常驻", "Keep resident" },
+                { "取消内存常驻", "Stop keeping in memory" },
+                { "内存常驻（不自动释放）", "Keep in memory (no auto-release)" },
+                { "内存常驻：这个站点的标签不会被自动释放",
+                  "Kept in memory: tabs on this site are never auto-released" },
                 { "立即释放此标签内存", "Release this tab's memory" },
                 { "新建分组并移入", "New group and move in" },
                 { "分组 ", "Group " },
                 { "移出分组", "Remove from group" },
+                { "解散分组", "Disband group" },
+                { "已解散分组：", "Disbanded group: " },
                 { "关闭其他标签", "Close other tabs" },
 
                 // ---------- 布局 / 主菜单 ----------
@@ -217,10 +229,9 @@ namespace NanoEdge
                 // ---------- 内存面板 ----------
                 { "正在播放音频", "Playing audio" },
                 { "有未完成下载", "Active downloads" },
-                { "已固定", "Pinned" },
                 { "已打开 DevTools", "DevTools open" },
                 { "密封标签保活", "Secret tab kept alive" },
-                { "常驻", "Resident" },
+                { "内存常驻", "In memory" },
                 { "活跃", "Active" },
                 { "降冷", "Cooled" },
                 { "已丢弃", "Discarded" },
@@ -251,7 +262,8 @@ namespace NanoEdge
                 { "未加载", "Not loaded" },
                 { "提交 ", "Commit " },
                 { "自动豁免：", "Auto-exempt: " },
-                { "常驻（不参与自动丢弃）", "Resident (not auto-discarded)" },
+                { "内存常驻：不自动释放这个站点的标签",
+                  "Kept in memory: never auto-releases tabs on this site" },
                 { "切换到此标签", "Switch to this tab" },
                 { "立即释放此标签", "Release this tab" },
                 { "外壳", "Shell" },
@@ -366,8 +378,9 @@ namespace NanoEdge
 
                 // ---------- 起始页 / 占位页 ----------
                 { "搜索或输入网址", "Search or enter an address" },
-                { "输入网址或搜索词 · 支持 b / g / gh / npm 前缀",
-                  "Enter a URL or search term · prefixes b / g / gh / npm" },
+                { "输入网址或搜索词，回车打开", "Enter a URL or search term, then press Enter" },
+                { "百度", "Baidu" },
+                { "默认搜索引擎：", "Default search engine: " },
                 { "添加", "Add" },
                 { "已释放内存 · 页面状态已保存", "Memory released · page state saved" },
                 { "恢复页面", "Restore page" },
@@ -382,8 +395,8 @@ namespace NanoEdge
                 { "暗色适合夜间，跟随系统会随 Windows 设置切换",
                   "Dark suits the night; System follows your Windows setting" },
                 { "语言", "Language" },
-                { "切换后界面立即重建，网页内容不受影响",
-                  "The UI rebuilds immediately; page content is untouched" },
+                { "切换后界面立即重建，网页内容不受影响；跟随系统按 Windows 显示语言判断",
+                  "The UI rebuilds immediately; page content is untouched. System picks the language by the Windows display language" },
                 { "布局", "Layout" },
                 { "标签布局", "Tab layout" },
                 { "紧凑单行把所有东西挤在一行，垂直标签在左侧",
@@ -395,8 +408,24 @@ namespace NanoEdge
                   "One line at the bottom: layout, theme, tab count, memory preset" },
                 { "内存", "Memory" },
                 { "档位", "Preset" },
-                { "只影响后台标签的降冷与丢弃，不改页面行为",
-                  "Only affects cooling and discarding of background tabs" },
+                { "少重载", "Fewer reloads" },
+                { "标准", "Standard" },
+                { "省内存", "Save memory" },
+                { "内存档 ", "Memory " },
+                { "省内存就多重载，少重载就多占内存，选一个能接受的取舍",
+                  "Saving memory means more reloads; fewer reloads means more memory. Pick your trade-off." },
+                { "少重载：失焦 30 秒降冷，后台标签从不自动释放，工作集到 1200MB 才施压。切回标签基本不用重新加载，但开很多标签时内存占用最高。",
+                  "Fewer reloads: cools after 30s, never auto-releases background tabs, pressure starts at 1200MB. Tabs rarely reload when you return, but many tabs use the most memory." },
+                { "省内存：失焦 1 秒降冷，后台 5 分钟就释放，工作集上限 450MB。内存占用最低，但切回旧标签经常要重新加载页面。",
+                  "Save memory: cools after 1s, releases background tabs after 5 min, 450MB working set limit. Lowest memory use, but older tabs often reload when you return." },
+                { "标准：失焦 2 秒降冷，后台 30 分钟释放，工作集上限 700MB。平时切回不用重载，很久没看的标签会重新加载。",
+                  "Standard: cools after 2s, releases background tabs after 30 min, 700MB working set limit. Most tabs don't reload; ones you haven't seen in a while do." },
+                { "释放内存会关掉这个标签的网页进程。切回来时页面重新加载，滚动位置和表单内容尽量用快照恢复，登录状态通常还在。",
+                  "Releasing memory closes the tab's renderer process. The page reloads when you return; scroll position and form contents are restored from a snapshot when possible, and sign-in state usually survives." },
+                { "搜索", "Search" },
+                { "默认搜索引擎", "Default search engine" },
+                { "地址栏和起始页都用它，切换后立即生效",
+                  "Used by the address bar and start page; applies immediately" },
                 { "隐私", "Privacy" },
                 { "密封标签通知", "Secret tab notifications" },
                 { "关闭时密封标签的页面通知请求会被直接拒绝",
@@ -407,10 +436,6 @@ namespace NanoEdge
                 { "默认浏览器", "Default browser" },
                 { "只写注册表登记，Windows 会要求您在「默认应用」里确认",
                   "Registers only; Windows asks you to confirm in Default apps" },
-                { "不自动丢弃", "never auto-discarded" },
-                { "后台 {0} 分钟丢弃", "discard after {0} min" },
-                { "失焦 {0} 秒降冷 · {1} · 工作集上限 {2}MB",
-                  "cool after {0}s · {1} · working set limit {2}MB" },
                 { "语言已切换", "Language changed" },
                 { "打开目录失败：", "Failed to open the folder: " },
 

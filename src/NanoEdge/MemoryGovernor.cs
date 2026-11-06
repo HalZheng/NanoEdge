@@ -133,10 +133,9 @@ namespace NanoEdge
         {
             if (tab.IsPlayingAudio) return L.T("正在播放音频");
             if (tab.ActiveDownloads > 0) return L.T("有未完成下载");
-            if (tab.IsPinned) return L.T("已固定");
             if (tab.HasOpenedDevTools) return L.T("已打开 DevTools");
             if (tab.IsSecret && tab.KeepAlive) return L.T("密封标签保活");
-            if (tab.Resident || IsResidentOrigin(tab)) return L.T("常驻");
+            if (tab.Resident || IsResidentOrigin(tab)) return L.T("内存常驻");
             return null;
         }
 

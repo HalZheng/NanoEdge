@@ -14,12 +14,15 @@ namespace NanoEdge
     public sealed class StartPage : UserControl
     {
         public event Action<string> NavigateRequested;
+        public event Action<string> SearchEngineChanged;
 
         private const int Columns = 4;
         private const int MaxShortcuts = 24;
 
         private readonly AppSettings _settings;
         private readonly TextBox _search;
+        private SearchEnginePicker _enginePicker;
+        private Canvas _dropdownLayer;
         private Grid _shortcutGrid;
 
         private Grid _overlay;
@@ -36,6 +39,10 @@ namespace NanoEdge
             this.SetResourceReference(BackgroundProperty, "CanvasBrush");
 
             var root = new Grid();
+            // 覆盖层放下拉列表：Canvas 的子元素不占布局空间，展开时
+            // 不会把下面的快捷方式挤下去。
+            _dropdownLayer = new Canvas();
+            Panel.SetZIndex(_dropdownLayer, 100);
             var stack = new StackPanel
             {
                 HorizontalAlignment = HorizontalAlignment.Center,
@@ -71,6 +78,8 @@ namespace NanoEdge
             searchBorder.SetResourceReference(Border.BorderBrushProperty, "InputBorderBrush");
 
             var searchGrid = new Grid();
+            searchGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            searchGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             _search = new TextBox
             {
                 Name = "SearchBox",
@@ -78,7 +87,7 @@ namespace NanoEdge
                 Background = new SolidColorBrush(Colors.Transparent),
                 VerticalContentAlignment = VerticalAlignment.Center,
                 FontSize = 13,
-                Margin = new Thickness(14, 0, 14, 0)
+                Margin = new Thickness(14, 0, 8, 0)
             };
             _search.SetResourceReference(TextBox.ForegroundProperty, "TextBrush");
             _search.SetResourceReference(TextBox.CaretBrushProperty, "AccentBrush");
@@ -101,8 +110,19 @@ namespace NanoEdge
                     e.Handled = true;
                 }
             };
+            Grid.SetColumn(_search, 0);
+            Grid.SetColumn(searchHint, 0);
+            _enginePicker = new SearchEnginePicker(_settings, () =>
+            {
+                var handler = SearchEngineChanged;
+                if (handler != null) handler("search");
+            }, _dropdownLayer,
+            Array.Exists(Environment.GetCommandLineArgs(),
+                a => string.Equals(a, "--enginedropdown", StringComparison.OrdinalIgnoreCase)));
+            Grid.SetColumn(_enginePicker, 1);
             searchGrid.Children.Add(_search);
             searchGrid.Children.Add(searchHint);
+            searchGrid.Children.Add(_enginePicker);
             searchBorder.Child = searchGrid;
             stack.Children.Add(searchBorder);
 
@@ -112,7 +132,7 @@ namespace NanoEdge
 
             var hint = new TextBlock
             {
-                Text = L.T("输入网址或搜索词 · 支持 b / g / gh / npm 前缀"),
+                Text = L.T("输入网址或搜索词，回车打开"),
                 FontSize = 11,
                 HorizontalAlignment = HorizontalAlignment.Center,
                 Margin = new Thickness(0, 24, 0, 0)
@@ -122,6 +142,7 @@ namespace NanoEdge
 
             root.Children.Add(stack);
             root.Children.Add(BuildEditorOverlay());
+            root.Children.Add(_dropdownLayer);
             Content = root;
 
             Loaded += (s, e) => { if (_overlay.Visibility != Visibility.Visible) _search.Focus(); };
@@ -464,17 +485,13 @@ namespace NanoEdge
 
         private ContextMenu MakeMenu()
         {
-            var menu = new ContextMenu();
-            menu.SetResourceReference(ContextMenu.BackgroundProperty, "SurfaceBrush");
-            menu.SetResourceReference(ContextMenu.ForegroundProperty, "TextBrush");
-            menu.SetResourceReference(ContextMenu.BorderBrushProperty, "LineBrush");
-            return menu;
+            // A5：和 MainWindow / MemoryPanel 共用同一套菜单样式工厂。
+            return Theme.StyleMenu(new ContextMenu());
         }
 
         private static MenuItem MakeMenuItem(string text, Action action)
         {
-            var item = new MenuItem { Header = text, FontSize = 12 };
-            item.SetResourceReference(MenuItem.ForegroundProperty, "TextBrush");
+            var item = Theme.StyleMenuItem(new MenuItem { Header = text, FontSize = 12 });
             item.Click += (s, e) => action();
             return item;
         }
@@ -494,5 +511,177 @@ namespace NanoEdge
         }
 
         internal void CommitForTest() { CommitEditor(); }
+    }
+
+    // 搜索引擎下拉是覆盖式悬浮：列表放在宿主提供的 Canvas 覆盖层里，
+    // 用绝对坐标定位，不占布局空间，展开时不会把下方快捷方式挤下去。
+    // Canvas 的子元素不影响父容器 DesiredSize，又都在可视树内，
+    // RenderTargetBitmap 截图能拍到（Popup 的独立 HWND 拍不到）。
+    internal sealed class SearchEnginePicker : Grid
+    {
+        // 同时开着多个起始页 / 设置页时，切换一处，其它处也要跟着改显示。
+        private static event Action EngineChanged;
+
+        private readonly AppSettings _settings;
+        private readonly Action _notify;
+        private readonly bool _openOnLoad;
+        private readonly Canvas _overlay;
+        private readonly TextBlock _label;
+        private readonly Border _list;
+        private readonly Border _button;
+        private Window _window;
+        private MouseButtonEventHandler _outsideHandler;
+
+        public SearchEnginePicker(AppSettings settings, Action notify, Canvas overlay,
+            bool openOnLoad = false)
+        {
+            _settings = settings;
+            _notify = notify;
+            _overlay = overlay;
+            _openOnLoad = openOnLoad;
+
+            _button = new Border
+            {
+                Height = 28,
+                CornerRadius = new CornerRadius(6),
+                Padding = new Thickness(10, 0, 10, 0),
+                Margin = new Thickness(0, 0, 8, 0),
+                Cursor = Cursors.Hand,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            _button.SetResourceReference(Border.BackgroundProperty, "HoverBrush");
+            var buttonRow = new StackPanel { Orientation = Orientation.Horizontal };
+            _label = new TextBlock { FontSize = 11, VerticalAlignment = VerticalAlignment.Center };
+            _label.SetResourceReference(TextBlock.ForegroundProperty, "TextBrush");
+            var arrow = new TextBlock { Text = " ▼", FontSize = 9, VerticalAlignment = VerticalAlignment.Center };
+            arrow.SetResourceReference(TextBlock.ForegroundProperty, "MutedBrush");
+            buttonRow.Children.Add(_label);
+            buttonRow.Children.Add(arrow);
+            _button.Child = buttonRow;
+            _button.MouseLeftButtonUp += (s, e) => { e.Handled = true; Toggle(); };
+            Children.Add(_button);
+
+            _list = new Border
+            {
+                Width = 180,
+                Padding = new Thickness(4),
+                CornerRadius = new CornerRadius(8),
+                BorderThickness = new Thickness(1),
+                Visibility = Visibility.Collapsed
+            };
+            _list.SetResourceReference(Border.BackgroundProperty, "SurfaceBrush");
+            _list.SetResourceReference(Border.BorderBrushProperty, "LineBrush");
+
+            var items = new StackPanel();
+            foreach (var option in SearchEngineOptions.All)
+            {
+                var picked = option;
+                var item = new Border
+                {
+                    Height = 30,
+                    CornerRadius = new CornerRadius(5),
+                    Padding = new Thickness(10, 0, 10, 0),
+                    Cursor = Cursors.Hand
+                };
+                var text = new TextBlock
+                {
+                    Text = L.T(picked.Name),
+                    FontSize = 11,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+                text.SetResourceReference(TextBlock.ForegroundProperty, "TextBrush");
+                item.Child = text;
+                item.MouseEnter += (s, e) => item.SetResourceReference(Border.BackgroundProperty, "HoverBrush");
+                item.MouseLeave += (s, e) => item.Background = new SolidColorBrush(Colors.Transparent);
+                item.MouseLeftButtonUp += (s, e) => { e.Handled = true; Pick(picked.Template); };
+                items.Children.Add(item);
+            }
+            _list.Child = items;
+            if (_overlay != null)
+            {
+                _overlay.Children.Add(_list);
+                Panel.SetZIndex(_list, 100);
+            }
+
+            Refresh();
+            EngineChanged += OnEngineChanged;
+
+            Loaded += (s, e) =>
+            {
+                // 点下拉以外的任何地方就收起。--enginedropdown 只用于命令行截图验证。
+                _window = Window.GetWindow(this);
+                if (_window != null)
+                {
+                    _outsideHandler = (s2, e2) =>
+                    {
+                        if (IsOpen() && !IsInside(e2.OriginalSource)) Close();
+                    };
+                    _window.PreviewMouseLeftButtonDown += _outsideHandler;
+                }
+                if (_openOnLoad) Open();
+            };
+            Unloaded += (s, e) =>
+            {
+                EngineChanged -= OnEngineChanged;
+                if (_window != null && _outsideHandler != null)
+                    _window.PreviewMouseLeftButtonDown -= _outsideHandler;
+            };
+        }
+
+        private void OnEngineChanged() { Refresh(); }
+
+        private void Refresh()
+        {
+            _settings.SearchEngine = SearchEngineOptions.Normalize(_settings.SearchEngine);
+            _label.Text = SearchEngineOptions.NameOf(_settings.SearchEngine);
+            _button.ToolTip = L.T("默认搜索引擎：") + _label.Text;
+        }
+
+        private bool IsOpen() { return _list.Visibility == Visibility.Visible; }
+
+        private void Toggle() { if (IsOpen()) Close(); else Open(); }
+
+        private void Open()
+        {
+            PlaceDropdown();
+            _list.Visibility = Visibility.Visible;
+        }
+
+        // 按按钮在覆盖层坐标系里的位置摆放，右边缘对齐按钮右边缘。
+        private void PlaceDropdown()
+        {
+            if (_overlay == null) return;
+            try
+            {
+                var p = _button.TransformToVisual(_overlay).Transform(new Point(0, 0));
+                Canvas.SetLeft(_list, p.X + _button.ActualWidth - _list.Width - 8);
+                Canvas.SetTop(_list, p.Y + _button.ActualHeight + 6);
+            }
+            catch { }
+        }
+
+        private void Close() { _list.Visibility = Visibility.Collapsed; }
+
+        private void Pick(string template)
+        {
+            _settings.SearchEngine = template;
+            Refresh();
+            Close();
+            var changed = EngineChanged;
+            if (changed != null) changed();
+            if (_notify != null) _notify();
+        }
+
+        // 下拉列表已经不在 picker 的可视树里了，两个容器都要算「内部」。
+        private bool IsInside(object source)
+        {
+            var node = source as DependencyObject;
+            while (node != null)
+            {
+                if (ReferenceEquals(node, this) || ReferenceEquals(node, _list)) return true;
+                node = VisualTreeHelper.GetParent(node);
+            }
+            return false;
+        }
     }
 }
