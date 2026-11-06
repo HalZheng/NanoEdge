@@ -25,7 +25,7 @@ jobs:
             throw "Tag '$tag' must look like v1.2.3 (or v1.2.3.4)."
           }
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "NanoEdge-v$version.exe" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "asset=NanoEdge-v$version.exe" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -39,10 +39,10 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item src/NanoEdge/bin/Release/net48/NanoEdge.exe "dist/NanoEdge-v${{ steps.version.outputs.version }}.exe"
+          Copy-Item src/NanoEdge/bin/Release/net48/NanoEdge.exe "dist/${{ steps.version.outputs.asset }}"
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/NanoEdge-v${{ steps.version.outputs.version }}.exe
+          files: dist/${{ steps.version.outputs.asset }}
           generate_release_notes: true
