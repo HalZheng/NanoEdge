@@ -26,6 +26,8 @@ namespace NanoEdge
 
         private Grid _root, _bodyGrid, _tabHost;
         private Border _toolbarHost, _rail, _statusBar, _popupContent, _memoryBadgeBorder;
+        private Button _railPin, _popupPin;
+        private FrameworkElement _railHeader;
         private StackPanel _railPanel, _popupPanel;
         private ScrollViewer _tabStrip;
         private StackPanel _tabStripPanel;
@@ -35,13 +37,25 @@ namespace NanoEdge
         private DispatcherTimer _suggestTimer, _suggestCloseTimer;
         private bool _suppressSuggest;
         private TextBlock _statusText, _memoryBadge, _statusRight;
+        private double _tabChipMin = 110;
+        private double _tabChipMax = 200;
         private Popup _verticalPopup;
         private DispatcherTimer _expandTimer, _collapseTimer, _badgeHoverTimer, _badgeCloseTimer;
         private bool _verticalCollapseSuspended;
         private TabModel _dragCandidate;
         private Point _dragStart;
         private bool _dragInProgress;
+        private TabGroup _groupDragCandidate;
+        private Point _groupDragStart;
+        private bool _groupDragInProgress;
+        private DateTime _lastGroupDragUtc = DateTime.MinValue;
         private Grid _navigationRow;
+        private Button _tabStripPrev, _tabStripNext;
+        private ScrollViewer _railScroller, _popupScroller;
+        private ScrollViewer _dragScrollVerticalTarget;
+        private DispatcherTimer _dragScrollTimer;
+        private int _dragScrollDir;
+        private int _dragScrollVerticalDir;
         private DateTime _lastChromeDownUtc = DateTime.MinValue;
         private Point _lastChromeDownPoint;
         private bool _chromeDragArmed;
@@ -275,10 +289,28 @@ namespace NanoEdge
             _bodyGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             Grid.SetRow(_bodyGrid, 1);
 
-            _rail = new Border { Width = RailWidth, ClipToBounds = true };
+            _rail = new Border { Width = RailWidth, ClipToBounds = true, AllowDrop = true };
             _rail.SetResourceReference(Border.BackgroundProperty, "ChromeBrush");
             _rail.BorderThickness = new Thickness(0, 0, 1, 0);
             _rail.SetResourceReference(Border.BorderBrushProperty, "LineBrush");
+            _rail.DragOver += (s, e) =>
+            {
+                if (!e.Data.GetDataPresent(typeof(TabModel)) &&
+                    !e.Data.GetDataPresent(typeof(TabGroup))) return;
+                e.Effects = DragDropEffects.Move;
+                e.Handled = true;
+            };
+            _rail.Drop += (s, e) =>
+            {
+                var tab = e.Data.GetData(typeof(TabModel)) as TabModel;
+                if (tab != null) DropTabOnBlank(tab);
+                else
+                {
+                    var group = e.Data.GetData(typeof(TabGroup)) as TabGroup;
+                    if (group != null) MoveGroupToEnd(group);
+                }
+                e.Handled = true;
+            };
             _railPanel = new StackPanel { Orientation = Orientation.Vertical };
             var railScroller = new ScrollViewer
             {
@@ -286,7 +318,16 @@ namespace NanoEdge
                 VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
                 HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled
             };
-            _rail.Child = railScroller;
+            _railScroller = railScroller;
+            var railGrid = new Grid();
+            railGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            railGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            _railHeader = MakeHeaderRow(true);
+            Grid.SetRow(_railHeader, 0);
+            railGrid.Children.Add(_railHeader);
+            Grid.SetRow(railScroller, 1);
+            railGrid.Children.Add(railScroller);
+            _rail.Child = railGrid;
             Grid.SetColumn(_rail, 0);
             _bodyGrid.Children.Add(_rail);
 
@@ -441,20 +482,49 @@ namespace NanoEdge
                 if (_memoryPanel != null && !_memoryPanel.IsPinned) _memoryPanel.Close();
             };
 
-            // 不要额外的外边距：收起态 rail 里的第一个标签从 y=0 开始，
-            // 展开态也得从 y=0 开始，否则每个标签都会往下错一截。
             _popupPanel = new StackPanel { Orientation = Orientation.Vertical, Margin = new Thickness(0) };
+            var popupScroller = new ScrollViewer
+            {
+                Content = _popupPanel,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled
+            };
+            _popupScroller = popupScroller;
+            // 图钉放到顶部固定行，标签整体下移一行；左右不留空档，
+            // 展开和收起时标签的左边缘保持同一位置。
+            var popupGrid = new Grid();
+            popupGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            popupGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            var popupHeader = MakeHeaderRow(false);
+            Grid.SetRow(popupHeader, 0);
+            popupGrid.Children.Add(popupHeader);
+            Grid.SetRow(popupScroller, 1);
+            popupGrid.Children.Add(popupScroller);
             _popupContent = new Border
             {
                 Width = ExpandedWidth,
                 BorderThickness = new Thickness(1),
                 CornerRadius = new CornerRadius(8),
-                Child = new ScrollViewer
+                AllowDrop = true,
+                Child = popupGrid
+            };
+            _popupContent.DragOver += (s, e) =>
+            {
+                if (!e.Data.GetDataPresent(typeof(TabModel)) &&
+                    !e.Data.GetDataPresent(typeof(TabGroup))) return;
+                e.Effects = DragDropEffects.Move;
+                e.Handled = true;
+            };
+            _popupContent.Drop += (s, e) =>
+            {
+                var tab = e.Data.GetData(typeof(TabModel)) as TabModel;
+                if (tab != null) DropTabOnBlank(tab);
+                else
                 {
-                    Content = _popupPanel,
-                    VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-                    HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled
+                    var group = e.Data.GetData(typeof(TabGroup)) as TabGroup;
+                    if (group != null) MoveGroupToEnd(group);
                 }
+                e.Handled = true;
             };
             _popupContent.SetResourceReference(Border.BackgroundProperty, "SurfaceBrush");
             _popupContent.SetResourceReference(Border.BorderBrushProperty, "LineBrush");
@@ -550,6 +620,9 @@ namespace NanoEdge
                 if (!string.IsNullOrEmpty(tab.GroupId) && !_groups.Any(g => g.Id == tab.GroupId))
                     tab.GroupId = "";
 
+            // 空分组没有可渲染的区段；只保留真正有成员的组。
+            _groups.RemoveAll(g => !tabs.Any(t => t.GroupId == g.Id));
+
             if (tabs.Count == 0)
             {
                 NewTab();
@@ -582,9 +655,34 @@ namespace NanoEdge
                 }
             }
             SnapshotStore.Prune(_tabs.Select(t => t.Id));
+            NormalizeGroupRuns();
 
             _active = _tabs.FirstOrDefault(t => t.Id == session.ActiveTabId) ?? _tabs[0];
             SelectTab(_active);
+        }
+
+        // 分组必须是 _tabs 里的一段连续区段，否则渲染时会把成员从原位搬走。
+        // 老会话可能留下交错的 GroupId，这里按第一次出现的位置收拢。
+        private void NormalizeGroupRuns()
+        {
+            if (_tabs.Count < 2) return;
+            var ordered = new List<TabModel>(_tabs.Count);
+            var emitted = new HashSet<string>();
+            foreach (var tab in _tabs)
+            {
+                if (!string.IsNullOrEmpty(tab.GroupId))
+                {
+                    if (!emitted.Add(tab.GroupId)) continue;
+                    ordered.AddRange(_tabs.Where(t => t.GroupId == tab.GroupId));
+                }
+                else
+                {
+                    ordered.Add(tab);
+                }
+            }
+            if (ordered.Count != _tabs.Count) return;
+            _tabs.Clear();
+            _tabs.AddRange(ordered);
         }
 
         // 会话写盘做 150ms 合并：标题/URL 变化很密集，逐次全量写会卡 UI。
@@ -628,18 +726,27 @@ namespace NanoEdge
         private void SaveWindowBounds()
         {
             if (_settings == null || _noPersist) return;
-            _settings.WindowWidth = ActualWidth;
-            _settings.WindowHeight = ActualHeight;
-            // 状态切换瞬间 LocationChanged 可能先于 StateChanged 触发，此时
-            // WindowState 还是 Normal 而 Left/Top 已经是 -32000，直接写就污染配置。
-            if (WindowState == WindowState.Normal &&
-                IsSaneWindowCoord(Left) && IsSaneWindowCoord(Top))
+            // 最大化/最小化时 ActualWidth/Height 不是用户设定的还原尺寸，
+            // 写进去会把下次启动的"还原大小"永久记成满屏矩形。
+            if (CanPersistNormalGeometry(WindowState))
             {
-                _settings.WindowLeft = Left;
-                _settings.WindowTop = Top;
+                _settings.WindowWidth = ActualWidth;
+                _settings.WindowHeight = ActualHeight;
+                // 状态切换瞬间 LocationChanged 可能先于 StateChanged 触发，此时
+                // WindowState 还是 Normal 而 Left/Top 已经是 -32000，直接写就污染配置。
+                if (IsSaneWindowCoord(Left) && IsSaneWindowCoord(Top))
+                {
+                    _settings.WindowLeft = Left;
+                    _settings.WindowTop = Top;
+                }
             }
             _settings.WindowMaximized = WindowState == WindowState.Maximized;
             ScheduleSettingsSave();
+        }
+
+        internal static bool CanPersistNormalGeometry(WindowState state)
+        {
+            return state == WindowState.Normal;
         }
 
         // 拖动窗口时 LocationChanged 是连续事件，不能每次都写 settings.json。
@@ -671,6 +778,11 @@ namespace NanoEdge
             _rail.Width = railWidth;
             _rail.Visibility = vertical && !_immersive ? Visibility.Visible : Visibility.Collapsed;
             _bodyGrid.ColumnDefinitions[0].Width = new GridLength(vertical && !_immersive ? railWidth : 0);
+            if (_railPin != null)
+                _railPin.Visibility = expanded && !_immersive
+                    ? Visibility.Visible : Visibility.Collapsed;
+            SetPinState(_railPin);
+            SetPinState(_popupPin);
             if (!vertical || expanded) _verticalPopup.IsOpen = false;
             _statusBar.Visibility = _settings.ShowStatusBar && !_immersive ? Visibility.Visible : Visibility.Collapsed;
             _toolbarHost.Visibility = _immersive ? Visibility.Collapsed : Visibility.Visible;
@@ -723,9 +835,9 @@ namespace NanoEdge
                 grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(34) });
                 grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(40) });
 
-                _tabStrip = MakeTabStrip();
-                Grid.SetRow(_tabStrip, 0);
-                grid.Children.Add(_tabStrip);
+                var tabStripHost = MakeTabStrip();
+                Grid.SetRow(tabStripHost, 0);
+                grid.Children.Add(tabStripHost);
                 var bar = BuildNavigationRow();
                 Grid.SetRow(bar, 1);
                 grid.Children.Add(bar);
@@ -752,7 +864,6 @@ namespace NanoEdge
                 // 垂直布局的标签在左侧 rail，顶栏会全是控件；故意留一段空白当拖拽抓手。
                 bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(72) });
             bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(55, GridUnitType.Star) });
-            bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(30) });  // new tab
             bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(30) });  // theme
             bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(56) });  // memory
             bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(30) });  // menu
@@ -773,9 +884,9 @@ namespace NanoEdge
 
             if (_settings.Layout == LayoutMode.Compact)
             {
-                _tabStrip = MakeTabStrip();
-                Grid.SetColumn(_tabStrip, column++);
-                bar.Children.Add(_tabStrip);
+                var tabStripHost = MakeTabStrip();
+                Grid.SetColumn(tabStripHost, column++);
+                bar.Children.Add(tabStripHost);
             }
             else if (_settings.Layout == LayoutMode.Vertical)
                 column++;   // 空档列不放元素，地址栏顺延到下一列
@@ -821,7 +932,6 @@ namespace NanoEdge
             Grid.SetColumn(addressBorder, column++);
             bar.Children.Add(addressBorder);
 
-            bar.Children.Add(At(IconButton("+", L.T("新建标签 (Ctrl+T)"), () => NewTab()), column++));
             bar.Children.Add(At(IconButton("◐", L.T("切换主题"), ToggleTheme), column++));
 
             _memoryBadge = new TextBlock
@@ -909,6 +1019,7 @@ namespace NanoEdge
             {
                 var fe = node as FrameworkElement;
                 if (fe != null && (fe.Tag is TabModel ||
+                                   fe.Tag is TabGroup ||
                                    Equals(fe.Tag, "group") ||
                                    Equals(fe.Tag, "interactive"))) return true;
                 node = VisualTreeHelper.GetParent(node);
@@ -1226,10 +1337,10 @@ namespace NanoEdge
             return null;
         }
 
-        private ScrollViewer MakeTabStrip()
+        private FrameworkElement MakeTabStrip()
         {
             _tabStripPanel = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
-            var scroller = new ScrollViewer
+            _tabStrip = new ScrollViewer
             {
                 Content = _tabStripPanel,
                 Background = new SolidColorBrush(Colors.Transparent),
@@ -1238,78 +1349,670 @@ namespace NanoEdge
                 VerticalAlignment = VerticalAlignment.Center,
                 Margin = new Thickness(2, 0, 2, 0)
             };
-            return scroller;
+            // 隐藏水平滚动条后，标签过多只能靠滚轮横向滚动；Edge 也是滚轮/
+            // 触控板横滑。这里不改变标签尺寸，避免紧凑模式又一次重排。
+            _tabStrip.PreviewMouseWheel += (s, e) =>
+            {
+                if (e.Delta == 0) return;
+                _tabStrip.ScrollToHorizontalOffset(_tabStrip.HorizontalOffset - e.Delta);
+                UpdateTabStripScrollButtons();
+                e.Handled = true;
+            };
+            // 标签条空白处也是落点：拖到分组外的空白 = 移出分组并落到末尾。
+            _tabStrip.AllowDrop = true;
+            _tabStrip.DragOver += (s, e) =>
+            {
+                PumpDragAutoScroll(e);
+                if (!e.Data.GetDataPresent(typeof(TabModel)) &&
+                    !e.Data.GetDataPresent(typeof(TabGroup))) return;
+                e.Effects = DragDropEffects.Move;
+                e.Handled = true;
+            };
+            _tabStrip.Drop += (s, e) =>
+            {
+                StopDragAutoScroll();
+                var tab = e.Data.GetData(typeof(TabModel)) as TabModel;
+                if (tab != null) DropTabOnBlank(tab);
+                else
+                {
+                    var group = e.Data.GetData(typeof(TabGroup)) as TabGroup;
+                    if (group != null) MoveGroupToEnd(group);
+                }
+                e.Handled = true;
+            };
+            _tabStrip.ScrollChanged += (s, e) => UpdateTabStripScrollButtons();
+            _tabStrip.SizeChanged += (s, e) => UpdateTabStripScrollButtons();
+
+            _tabStripPrev = MakeStripChevron("‹", L.T("向左滚动标签"), -1,
+                HorizontalAlignment.Left);
+            _tabStripNext = MakeStripChevron("›", L.T("向右滚动标签"), 1,
+                HorizontalAlignment.Right);
+            var host = new Grid();
+            host.Children.Add(_tabStrip);
+            host.Children.Add(_tabStripPrev);
+            host.Children.Add(_tabStripNext);
+            return host;
+        }
+
+        private Button MakeStripChevron(string glyph, string tip, int dir,
+            HorizontalAlignment align)
+        {
+            var button = IconButton(glyph, tip, () => ScrollTabStrip(dir));
+            button.Tag = dir < 0 ? "tab-scroll-left" : "tab-scroll-right";
+            button.Width = 18;
+            button.Height = 30;
+            button.HorizontalAlignment = align;
+            button.VerticalAlignment = VerticalAlignment.Center;
+            button.Visibility = Visibility.Collapsed;
+            button.Margin = new Thickness(align == HorizontalAlignment.Left ? 2 : 0, 0,
+                align == HorizontalAlignment.Right ? 2 : 0, 0);
+            return button;
+        }
+
+        private void ScrollTabStrip(int dir)
+        {
+            if (_tabStrip == null) return;
+            var step = Math.Max(80, _tabStrip.ViewportWidth / 2);
+            _tabStrip.ScrollToHorizontalOffset(_tabStrip.HorizontalOffset + dir * step);
+            UpdateTabStripScrollButtons();
+        }
+
+        private void UpdateTabStripScrollButtons()
+        {
+            if (_tabStrip == null || _tabStripPrev == null || _tabStripNext == null) return;
+            var canLeft = _tabStrip.HorizontalOffset > 0.5;
+            var canRight = _tabStrip.ScrollableWidth - _tabStrip.HorizontalOffset > 0.5;
+            _tabStripPrev.Visibility = canLeft ? Visibility.Visible : Visibility.Collapsed;
+            _tabStripNext.Visibility = canRight ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        private void EnsureDragScrollTimer()
+        {
+            if (_dragScrollTimer != null) return;
+            _dragScrollTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(30)
+            };
+            _dragScrollTimer.Tick += (s, e) =>
+            {
+                if (_dragScrollVerticalTarget != null && _dragScrollVerticalDir != 0)
+                {
+                    _dragScrollVerticalTarget.ScrollToVerticalOffset(
+                        _dragScrollVerticalTarget.VerticalOffset +
+                        _dragScrollVerticalDir * 16);
+                    return;
+                }
+                if (_dragScrollDir != 0 && _tabStrip != null && _tabStrip.IsVisible)
+                {
+                    _tabStrip.ScrollToHorizontalOffset(
+                        _tabStrip.HorizontalOffset + _dragScrollDir * 16);
+                    UpdateTabStripScrollButtons();
+                    return;
+                }
+                StopDragAutoScroll();
+            };
+        }
+
+        // 拖到标签条/侧栏边缘时自动滚动，才能把标签放到当前隐藏的位置。
+        private void PumpDragAutoScroll(DragEventArgs e)
+        {
+            if (_tabStrip != null && _tabStrip.IsVisible)
+            {
+                _dragScrollVerticalTarget = null;
+                _dragScrollVerticalDir = 0;
+                var hp = e.GetPosition(_tabStrip);
+                const double edge = 30;
+                var hdir = 0;
+                if (hp.X >= 0 && hp.X < edge) hdir = -1;
+                else if (hp.X <= _tabStrip.ActualWidth &&
+                    hp.X > _tabStrip.ActualWidth - edge) hdir = 1;
+                _dragScrollDir = hdir;
+                PumpTimer(hdir);
+                return;
+            }
+
+            _dragScrollDir = 0;
+            ScrollViewer vertical = null;
+            if (_verticalPopup != null && _verticalPopup.IsOpen &&
+                _popupScroller != null && _popupScroller.IsVisible)
+                vertical = _popupScroller;
+            else if (_railScroller != null && _railScroller.IsVisible)
+                vertical = _railScroller;
+            if (vertical == null)
+            {
+                StopDragAutoScroll();
+                return;
+            }
+            var p = e.GetPosition(vertical);
+            var dir = 0;
+            if (p.Y >= 0 && p.Y < 30) dir = -1;
+            else if (p.Y <= vertical.ActualHeight && p.Y > vertical.ActualHeight - 30)
+                dir = 1;
+            _dragScrollVerticalTarget = vertical;
+            _dragScrollVerticalDir = dir;
+            PumpTimer(dir);
+        }
+
+        private void PumpTimer(int dir)
+        {
+            if (dir != 0)
+            {
+                EnsureDragScrollTimer();
+                if (!_dragScrollTimer.IsEnabled) _dragScrollTimer.Start();
+            }
+            else if (_dragScrollTimer != null)
+            {
+                _dragScrollTimer.Stop();
+            }
+        }
+
+        private void StopDragAutoScroll()
+        {
+            _dragScrollDir = 0;
+            _dragScrollVerticalDir = 0;
+            _dragScrollVerticalTarget = null;
+            if (_dragScrollTimer != null) _dragScrollTimer.Stop();
         }
 
         // ---------- tab rendering ----------
 
+        // 三种布局共用同一顺序：_tabs。分组是 _tabs 里的一段连续区段，
+        // 渲染时在区段第一个成员的位置插入“分组头 + 成员 + 同色线”。
+        // 这样纵向分组成员不会再掉到最下面，新标签也永远在最后。
         private void RebuildTabStrip()
         {
-            if (_tabStripPanel != null)
-            {
-                _tabStripPanel.Children.Clear();
-                // 水平布局也要看得见分组，否则误建一个分组后既找不到也删不掉。
-                foreach (var tab in _tabs.Where(t => string.IsNullOrEmpty(t.GroupId)))
-                    _tabStripPanel.Children.Add(MakeTabChip(tab, true, true, 110, 200));
-                foreach (var group in _groups)
-                {
-                    _tabStripPanel.Children.Add(MakeGroupHeader(group, true));
-                    if (group.IsCollapsed) continue;
-                    foreach (var tab in _tabs.Where(t => t.GroupId == group.Id))
-                        _tabStripPanel.Children.Add(MakeTabChip(tab, true, true, 110, 200));
-                }
-            }
+            RebuildHorizontalStrip();
+            RebuildVerticalPanels();
+            UpdateStatus();
+        }
 
+        private void RebuildHorizontalStrip()
+        {
+            if (_tabStripPanel == null || _settings.Layout == LayoutMode.Vertical) return;
+            UpdateTabChipMetrics();
+            SyncCompactColumnShare();
+            _tabStripPanel.Children.Clear();
+            var rendered = new HashSet<string>();
+            foreach (var tab in _tabs)
+            {
+                if (string.IsNullOrEmpty(tab.GroupId))
+                {
+                    _tabStripPanel.Children.Add(MakeTabChip(tab, true, true,
+                        _tabChipMin, _tabChipMax));
+                    continue;
+                }
+                if (!rendered.Add(tab.GroupId)) continue;
+                var group = _groups.FirstOrDefault(g => g.Id == tab.GroupId);
+                if (group == null)
+                {
+                    tab.GroupId = "";
+                    _tabStripPanel.Children.Add(MakeTabChip(tab, true, true,
+                        _tabChipMin, _tabChipMax));
+                    continue;
+                }
+                var firstMember = _tabs.FirstOrDefault(t => t.GroupId == group.Id);
+                _tabStripPanel.Children.Add(MakeBoundaryGap(firstMember, true));
+                _tabStripPanel.Children.Add(MakeHorizontalGroupSection(group));
+            }
+            _tabStripPanel.Children.Add(MakeNewTabButton());
+            ScrollActiveTabIntoView();
+            Dispatcher.BeginInvoke(new Action(UpdateTabStripScrollButtons),
+                DispatcherPriority.Loaded);
+        }
+
+        // 标签越多，chip 越窄；缩到 80px 后再靠横向滚动，和 Edge 的紧凑条一致。
+        private void UpdateTabChipMetrics()
+        {
+            var count = _tabs.Count;
+            if (count > 14) { _tabChipMin = 80; _tabChipMax = 110; }
+            else if (count > 9) { _tabChipMin = 90; _tabChipMax = 130; }
+            else if (count > 5) { _tabChipMin = 100; _tabChipMax = 160; }
+            else { _tabChipMin = 110; _tabChipMax = 200; }
+        }
+
+        // 紧凑模式下把地址栏的一部分宽度让给标签条；超过 8 个标签开始让。
+        private void SyncCompactColumnShare()
+        {
+            if (_settings.Layout != LayoutMode.Compact || _navigationRow == null) return;
+            if (_navigationRow.ColumnDefinitions.Count < 5) return;
+            var share = _tabs.Count > 8 ? 60.0 : 45.0;
+            var tabColumn = _navigationRow.ColumnDefinitions[2];
+            var addressColumn = _navigationRow.ColumnDefinitions[3];
+            if (tabColumn.Width.IsStar && Math.Abs(tabColumn.Width.Value - share) < 0.1) return;
+            tabColumn.Width = new GridLength(share, GridUnitType.Star);
+            addressColumn.Width = new GridLength(100 - share, GridUnitType.Star);
+        }
+
+        private void RebuildVerticalPanels()
+        {
+            if (_railPanel == null) return;
             _railPanel.Children.Clear();
             var expanded = _settings.Layout == LayoutMode.Vertical && _settings.VerticalExpanded;
-            if (expanded) _railPanel.Children.Add(MakeHeaderRow());
-            foreach (var group in _groups)
-                _railPanel.Children.Add(MakeGroupHeader(group, expanded));
-            foreach (var tab in VisibleTabs())
-                _railPanel.Children.Add(MakeTabChip(tab, expanded, expanded,
-                    expanded ? ExpandedWidth - 24 : 36, expanded ? ExpandedWidth - 24 : 36));
-
+            BuildVerticalItems(_railPanel, expanded, expanded ? ExpandedWidth - 8 : 36);
             RebuildPopup();
-            UpdateStatus();
         }
 
         private void RebuildPopup()
         {
             if (_popupPanel == null) return;
             _popupPanel.Children.Clear();
-            foreach (var group in _groups)
-                _popupPanel.Children.Add(MakeGroupHeader(group, true));
-            foreach (var tab in VisibleTabs())
-                _popupPanel.Children.Add(MakeTabChip(tab, true, true, ExpandedWidth - 24, ExpandedWidth - 24));
-            // 标题行放到最后：放开头会占 30+6px，把下面每个标签都挤下去。
-            // 留在末尾既保住「+ 新建标签」入口，又不破坏标签的一一对应。
-            _popupPanel.Children.Add(MakeHeaderRow());
+            BuildVerticalItems(_popupPanel, true, ExpandedWidth - 8);
+        }
+
+        // 纵向 rail 和 hover popup 用同一套顺序；宽度不同只影响 chip 尺寸。
+        private void BuildVerticalItems(StackPanel panel, bool expanded, double chipWidth)
+        {
+            var rendered = new HashSet<string>();
+            foreach (var tab in _tabs)
+            {
+                if (string.IsNullOrEmpty(tab.GroupId))
+                {
+                    panel.Children.Add(MakeTabChip(tab, expanded, expanded, chipWidth, chipWidth, true));
+                    continue;
+                }
+                if (!rendered.Add(tab.GroupId)) continue;
+                var group = _groups.FirstOrDefault(g => g.Id == tab.GroupId);
+                if (group == null)
+                {
+                    tab.GroupId = "";
+                    panel.Children.Add(MakeTabChip(tab, expanded, expanded, chipWidth, chipWidth, true));
+                    continue;
+                }
+                var firstMember = _tabs.FirstOrDefault(t => t.GroupId == group.Id);
+                panel.Children.Add(MakeBoundaryGap(firstMember, false));
+                panel.Children.Add(MakeVerticalGroupSection(group, expanded, chipWidth,
+                    expanded ? chipWidth + 4 : RailWidth));
+            }
+            panel.Children.Add(MakeNewTabButton());
         }
 
         private IEnumerable<TabModel> VisibleTabs()
         {
-            foreach (var tab in _tabs.Where(t => string.IsNullOrEmpty(t.GroupId)))
-                yield return tab;
-            foreach (var group in _groups)
+            // 顺序以 _tabs 为准；折叠分组只隐藏成员，不改变其他标签的位置。
+            foreach (var tab in _tabs)
             {
-                if (group.IsCollapsed) continue;
-                foreach (var tab in _tabs.Where(t => t.GroupId == group.Id))
-                    yield return tab;
+                if (!string.IsNullOrEmpty(tab.GroupId))
+                {
+                    var group = _groups.FirstOrDefault(g => g.Id == tab.GroupId);
+                    if (group != null && group.IsCollapsed) continue;
+                }
+                yield return tab;
             }
         }
 
-        private FrameworkElement MakeHeaderRow()
+        private Button MakeNewTabButton()
         {
-            var row = new Grid { Height = 30, Margin = new Thickness(0, 0, 0, 6) };
+            var button = IconButton("+", L.T("新建标签 (Ctrl+T)"), () => NewTab());
+            button.Tag = "newtab";
+            button.Margin = new Thickness(2);
+            button.HorizontalAlignment = HorizontalAlignment.Left;
+            return button;
+        }
+
+        // 横向滚动后把当前标签滚进可视区；标题频繁变化时 Rebuild 也不会把人甩出去。
+        private void ScrollActiveTabIntoView()
+        {
+            // 构造阶段（Loaded 之前）BringIntoView 会把布局树卡进循环；
+            // 启动时的活动标签不需要滚动，等窗口真正显示后再跟随。
+            if (!_shellReady) return;
+            if (_tabStripPanel == null || _active == null) return;
+            var chip = FindTabChip(_tabStripPanel, _active);
+            if (chip != null) chip.BringIntoView();
+        }
+
+        private static FrameworkElement FindTabChip(StackPanel panel, TabModel tab)
+        {
+            if (panel == null) return null;
+            foreach (var child in panel.Children)
+            {
+                var fe = child as FrameworkElement;
+                if (fe == null) continue;
+                if (fe.Tag is TabModel && ReferenceEquals(fe.Tag, tab)) return fe;
+                var grid = fe as Grid;
+                if (grid == null) continue;
+                foreach (var stack in grid.Children.OfType<StackPanel>())
+                {
+                    var found = FindTabChip(stack, tab);
+                    if (found != null) return found;
+                }
+            }
+            return null;
+        }
+
+        // 分组区段之间的边界落点：把标签放成平铺状态，不强行加入相邻分组。
+        // gap 只留 6px，细线居中，落点明确；分组内部落点才用分组自定义色。
+        private FrameworkElement MakeBoundaryGap(TabModel anchor, bool horizontal)
+        {
+            var gap = new Border
+            {
+                Width = horizontal ? 6 : double.NaN,
+                Height = horizontal ? double.NaN : 6,
+                Background = Brushes.Transparent,
+                AllowDrop = true,
+                Tag = "section-gap"
+            };
+            var caret = new Border
+            {
+                Width = horizontal ? 2 : double.NaN,
+                Height = horizontal ? double.NaN : 2,
+                HorizontalAlignment = horizontal
+                    ? HorizontalAlignment.Center : HorizontalAlignment.Stretch,
+                VerticalAlignment = horizontal
+                    ? VerticalAlignment.Stretch : VerticalAlignment.Center,
+                Visibility = Visibility.Collapsed,
+                IsHitTestVisible = false,
+                Tag = "gap-caret"
+            };
+            caret.SetResourceReference(Border.BackgroundProperty, "AccentBrush");
+            gap.Child = caret;
+            gap.DragOver += (s, e) =>
+            {
+                PumpDragAutoScroll(e);
+                var tab = e.Data.GetData(typeof(TabModel)) as TabModel;
+                var group = e.Data.GetData(typeof(TabGroup)) as TabGroup;
+                if (tab == null && group == null) return;
+                if (group != null && anchor != null && group.Id == anchor.GroupId)
+                {
+                    caret.Visibility = Visibility.Collapsed;
+                    e.Effects = DragDropEffects.None;
+                    e.Handled = true;
+                    return;
+                }
+                caret.Visibility = Visibility.Visible;
+                e.Effects = DragDropEffects.Move;
+                e.Handled = true;
+            };
+            gap.DragLeave += (s, e) =>
+            {
+                caret.Visibility = Visibility.Collapsed;
+                StopDragAutoScroll();
+            };
+            gap.Drop += (s, e) =>
+            {
+                StopDragAutoScroll();
+                caret.Visibility = Visibility.Collapsed;
+                var tab = e.Data.GetData(typeof(TabModel)) as TabModel;
+                if (tab != null) MoveTabToBoundary(tab, anchor);
+                else
+                {
+                    var group = e.Data.GetData(typeof(TabGroup)) as TabGroup;
+                    if (group != null && anchor != null) MoveGroupAt(group, anchor, false);
+                }
+                e.Handled = true;
+            };
+            return gap;
+        }
+
+        // 横向分组区段：分组头在左，成员在右，顶部一条同色线贯穿整个区段。
+        private FrameworkElement MakeHorizontalGroupSection(TabGroup group)
+        {
+            var stack = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            stack.Children.Add(MakeGroupHeader(group, true));
+            if (!group.IsCollapsed)
+            {
+                foreach (var tab in _tabs.Where(t => t.GroupId == group.Id))
+                    stack.Children.Add(MakeTabChip(tab, true, true,
+                        _tabChipMin, _tabChipMax));
+            }
+
+            var grid = new Grid
+            {
+                Tag = group,
+                Background = Brushes.Transparent,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            grid.Children.Add(stack);
+            var line = new Border
+            {
+                Height = 2,
+                Margin = new Thickness(2, 0, 2, 0),
+                Background = GroupBrush(group.Color),
+                VerticalAlignment = VerticalAlignment.Top,
+                IsHitTestVisible = false,
+                CornerRadius = new CornerRadius(1),
+                Opacity = 0.9
+            };
+            grid.Children.Add(line);
+            AttachGroupSectionDropTarget(grid, line, group, true);
+            return grid;
+        }
+
+        // 纵向分组区段：分组头在上，成员垂直堆叠，左侧一条同色线贯穿整个区段。
+        private FrameworkElement MakeVerticalGroupSection(TabGroup group, bool expanded, double chipWidth, double sectionWidth)
+        {
+            var stack = new StackPanel { Orientation = Orientation.Vertical };
+            stack.Children.Add(MakeGroupHeader(group, expanded));
+            if (!group.IsCollapsed)
+            {
+                foreach (var tab in _tabs.Where(t => t.GroupId == group.Id))
+                    stack.Children.Add(MakeTabChip(tab, expanded, expanded, chipWidth, chipWidth, true));
+            }
+
+            var grid = new Grid
+            {
+                Tag = group,
+                Width = sectionWidth,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Background = Brushes.Transparent
+            };
+            grid.Children.Add(stack);
+            var line = new Border
+            {
+                Width = 2,
+                Margin = new Thickness(0, 2, 0, 2),
+                Background = GroupBrush(group.Color),
+                HorizontalAlignment = HorizontalAlignment.Left,
+                IsHitTestVisible = false,
+                CornerRadius = new CornerRadius(1),
+                Opacity = 0.9
+            };
+            grid.Children.Add(line);
+            AttachGroupSectionDropTarget(grid, line, group, false);
+            return grid;
+        }
+
+        // 分组区段本身也是放置目标：落在分组线/成员之间的空白处 = 加入该组。
+        // 成员 chip 的 Drop 会先截住；这里只处理冒泡上来的区段空白。
+        private void AttachGroupSectionDropTarget(Panel grid, Border line,
+            TabGroup group, bool horizontal)
+        {
+            grid.AllowDrop = true;
+            var groupCaret = new Border
+            {
+                Width = horizontal ? 2 : double.NaN,
+                Height = horizontal ? double.NaN : 2,
+                HorizontalAlignment = horizontal
+                    ? HorizontalAlignment.Left : HorizontalAlignment.Stretch,
+                VerticalAlignment = horizontal
+                    ? VerticalAlignment.Stretch : VerticalAlignment.Top,
+                Visibility = Visibility.Collapsed,
+                IsHitTestVisible = false,
+                Tag = "group-drop-caret"
+            };
+            groupCaret.Background = GroupBrush(group.Color);
+            grid.Children.Add(groupCaret);
+            Action hideGroupCaret = () => groupCaret.Visibility = Visibility.Collapsed;
+            Func<DragEventArgs, bool> overMember = e =>
+            {
+                var origin = e.OriginalSource as DependencyObject;
+                while (origin != null && origin != grid)
+                {
+                    var fe = origin as FrameworkElement;
+                    if (fe != null && fe.Tag is TabModel) return true;
+                    try { origin = VisualTreeHelper.GetParent(origin); }
+                    catch { origin = LogicalTreeHelper.GetParent(origin); }
+                }
+                return false;
+            };
+
+            grid.DragOver += (s, e) =>
+            {
+                PumpDragAutoScroll(e);
+                var tabSource = e.Data.GetData(typeof(TabModel)) as TabModel;
+                var groupSource = e.Data.GetData(typeof(TabGroup)) as TabGroup;
+                if (tabSource == null && groupSource == null) return;
+                if (groupSource != null && groupSource.Id == group.Id)
+                {
+                    hideGroupCaret();
+                    e.Effects = DragDropEffects.None;
+                    e.Handled = true;
+                    return;
+                }
+                e.Effects = DragDropEffects.Move;
+                grid.SetResourceReference(Panel.BackgroundProperty, "AccentSoftBrush");
+                line.Opacity = 1;
+                if (horizontal) line.Height = 3;
+                else line.Width = 3;
+
+                var after = horizontal
+                    ? e.GetPosition(grid).X > grid.ActualWidth / 2
+                    : e.GetPosition(grid).Y > grid.ActualHeight / 2;
+                if (tabSource != null)
+                {
+                    // 落在成员上时由 chip 自己的线提示；落在组头/空白处追加到组尾。
+                    if (overMember(e))
+                    {
+                        hideGroupCaret();
+                    }
+                    else
+                    {
+                        after = true;
+                        if (horizontal)
+                            groupCaret.HorizontalAlignment = HorizontalAlignment.Right;
+                        else
+                            groupCaret.VerticalAlignment = VerticalAlignment.Bottom;
+                        groupCaret.Visibility = Visibility.Visible;
+                    }
+                }
+                else
+                {
+                    if (horizontal)
+                        groupCaret.HorizontalAlignment = after
+                            ? HorizontalAlignment.Right : HorizontalAlignment.Left;
+                    else
+                        groupCaret.VerticalAlignment = after
+                            ? VerticalAlignment.Bottom : VerticalAlignment.Top;
+                    groupCaret.Visibility = Visibility.Visible;
+                }
+                e.Handled = true;
+            };
+            grid.DragLeave += (s, e) =>
+            {
+                hideGroupCaret();
+                ResetGroupSectionHighlight(grid, line, horizontal);
+                StopDragAutoScroll();
+            };
+            grid.Drop += (s, e) =>
+            {
+                StopDragAutoScroll();
+                hideGroupCaret();
+                ResetGroupSectionHighlight(grid, line, horizontal);
+                var after = horizontal
+                    ? e.GetPosition(grid).X > grid.ActualWidth / 2
+                    : e.GetPosition(grid).Y > grid.ActualHeight / 2;
+                var tabSource = e.Data.GetData(typeof(TabModel)) as TabModel;
+                if (tabSource != null)
+                {
+                    if (tabSource.GroupId != group.Id) MoveTabIntoGroup(tabSource, group);
+                }
+                else
+                {
+                    var groupSource = e.Data.GetData(typeof(TabGroup)) as TabGroup;
+                    if (groupSource != null && groupSource.Id != group.Id)
+                    {
+                        var anchor = _tabs.FirstOrDefault(t => t.GroupId == group.Id);
+                        if (anchor != null) MoveGroupAt(groupSource, anchor, after);
+                    }
+                }
+                e.Handled = true;
+            };
+        }
+
+        private static void ResetGroupSectionHighlight(Panel grid, Border line,
+            bool horizontal)
+        {
+            grid.Background = Brushes.Transparent;
+            line.Opacity = 0.9;
+            if (horizontal) line.Height = 2;
+            else line.Width = 2;
+        }
+
+        // 顶部固定行：左边留空，右边图钉；固定态图钉带一条同色斜线，
+        // 表示“划掉/取消固定”。收起和展开都保留这一行，标签位置不上下跳。
+        private FrameworkElement MakeHeaderRow(bool forRail)
+        {
+            // 收起/展开都必须保留这一行，标签位置才不会上下跳。
+            var row = new Grid { Height = 22, Background = Brushes.Transparent };
             row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            var label = new TextBlock { Text = L.T("标签页"), FontSize = 12, VerticalAlignment = VerticalAlignment.Center };
-            label.SetResourceReference(TextBlock.ForegroundProperty, "MutedBrush");
-            row.Children.Add(label);
-            var add = IconButton("+", L.T("新建标签"), () => NewTab());
-            Grid.SetColumn(add, 1);
-            row.Children.Add(add);
+            var pin = MakeVerticalPinButton();
+            if (forRail) _railPin = pin; else _popupPin = pin;
+            pin.HorizontalAlignment = HorizontalAlignment.Right;
+            pin.VerticalAlignment = VerticalAlignment.Center;
+            pin.Margin = new Thickness(0, 0, 4, 0);
+            Grid.SetColumn(pin, 1);
+            row.Children.Add(pin);
+            SetPinState(pin);
             return row;
+        }
+
+        private Button MakeVerticalPinButton()
+        {
+            var content = new Grid { Width = 20, Height = 20 };
+            var glyph = new TextBlock
+            {
+                Text = "📌",
+                FontSize = 12,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            glyph.SetResourceReference(TextBlock.ForegroundProperty, "TextBrush");
+            // 取消固定：图钉正中一条同色斜线划掉，而不是右上角红叉。
+            var slash = new System.Windows.Shapes.Line
+            {
+                X1 = 2,
+                Y1 = 2,
+                X2 = 18,
+                Y2 = 18,
+                StrokeThickness = 1.5,
+                Visibility = Visibility.Collapsed,
+                IsHitTestVisible = false,
+                Tag = "pin-slash"
+            };
+            slash.SetResourceReference(System.Windows.Shapes.Shape.StrokeProperty,
+                "TextBrush");
+            content.Children.Add(glyph);
+            content.Children.Add(slash);
+            var button = IconButton("", L.T("固定垂直标签栏"), ToggleVerticalPin);
+            button.Tag = "vertical-pin";
+            button.Width = 20;
+            button.Height = 20;
+            button.Content = content;
+            return button;
+        }
+
+        private void SetPinState(Button button)
+        {
+            if (button == null) return;
+            button.ToolTip = L.T(_settings.VerticalExpanded
+                ? "取消固定垂直标签栏" : "固定垂直标签栏");
+            if (button.Content is Grid content)
+            {
+                var slash = content.Children.OfType<System.Windows.Shapes.Line>()
+                    .FirstOrDefault(t => Equals(t.Tag, "pin-slash"));
+                if (slash != null)
+                    slash.Visibility = _settings.VerticalExpanded
+                        ? Visibility.Visible : Visibility.Collapsed;
+            }
+        }
+
+        private void ToggleVerticalPin()
+        {
+            _settings.VerticalExpanded = !_settings.VerticalExpanded;
+            SettingsStore.Save(_settings);
+            if (!_settings.VerticalExpanded && _verticalPopup != null)
+                _verticalPopup.IsOpen = false;
+            ApplyLayout();
         }
 
         private FrameworkElement MakeGroupHeader(TabGroup group, bool withName)
@@ -1320,13 +2023,19 @@ namespace NanoEdge
                 Margin = new Thickness(0, 2, 0, 2),
                 CornerRadius = new CornerRadius(5),
                 Cursor = Cursors.Hand,
-                Tag = "group"
+                Tag = "group",
+                AllowDrop = true
             };
             border.SetResourceReference(Border.BackgroundProperty, "HoverBrush");
             var panel = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(6, 0, 6, 0), VerticalAlignment = VerticalAlignment.Center };
-            var dot = new Border { Width = 8, Height = 8, CornerRadius = new CornerRadius(4), Margin = new Thickness(0, 0, 7, 0) };
-            try { dot.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString(group.Color)); }
-            catch { dot.Background = Brushes.Gray; }
+            var dot = new Border
+            {
+                Width = 8,
+                Height = 8,
+                CornerRadius = new CornerRadius(4),
+                Margin = new Thickness(0, 0, 7, 0),
+                Background = GroupBrush(group.Color)
+            };
             panel.Children.Add(dot);
             if (withName)
             {
@@ -1348,8 +2057,44 @@ namespace NanoEdge
                 panel.Children.Add(count);
             }
             border.Child = panel;
+
+            // 分组头的拖放交给外层分组区段统一处理：用区段的自定义色
+            // 插入线和高亮判断落点，避免头/线两套提示打架。
+
+            // 分组头也是整组拖动的抓手；单击仍然折叠/展开。
+            border.PreviewMouseLeftButtonDown += (s, e) =>
+            {
+                _groupDragCandidate = group;
+                _groupDragStart = e.GetPosition(null);
+                _groupDragInProgress = false;
+            };
+            border.MouseMove += (s, e) =>
+            {
+                if (_groupDragInProgress || _groupDragCandidate != group ||
+                    e.LeftButton != MouseButtonState.Pressed) return;
+                var p = e.GetPosition(null);
+                if (Math.Abs(p.X - _groupDragStart.X) < 4 &&
+                    Math.Abs(p.Y - _groupDragStart.Y) < 4) return;
+                _groupDragInProgress = true;
+                SuspendVerticalCollapse();
+                try { DragDrop.DoDragDrop(border, group, DragDropEffects.Move); }
+                finally
+                {
+                    _groupDragInProgress = false;
+                    _groupDragCandidate = null;
+                    _lastGroupDragUtc = DateTime.UtcNow;
+                    StopDragAutoScroll();
+                    ResumeVerticalCollapse();
+                }
+            };
             border.MouseLeftButtonUp += (s, e) =>
             {
+                var dragged = _groupDragInProgress;
+                _groupDragCandidate = null;
+                _groupDragInProgress = false;
+                // DoDragDrop 的 finally 可能早于 Up；刚拖完的 Up 不能当成折叠点击。
+                if (dragged ||
+                    (DateTime.UtcNow - _lastGroupDragUtc).TotalMilliseconds < 250) return;
                 group.IsCollapsed = !group.IsCollapsed;
                 RebuildTabStrip();
                 SaveSession();
@@ -1357,14 +2102,275 @@ namespace NanoEdge
             border.MouseRightButtonUp += (s, e) =>
             {
                 e.Handled = true;
-                SuspendVerticalCollapse();
-                var menu = MakeMenu();
-                menu.Closed += (s2, e2) => ResumeVerticalCollapse();
-                menu.Items.Add(MakeMenuItem(L.T("解散分组"), () => DisbandGroup(group)));
-                menu.PlacementTarget = border;
-                menu.IsOpen = true;
+                ShowGroupMenu(group, border);
             };
             return border;
+        }
+
+        private ContextMenu BuildGroupMenu(TabGroup group, FrameworkElement target = null)
+        {
+            var menu = MakeMenu();
+            menu.Items.Add(MakeMenuItem(L.T("重命名分组"), () => BeginRenameGroup(group, target)));
+            var colors = new MenuItem { Header = L.T("分组颜色"), FontSize = 12 };
+            Theme.StyleMenuItem(colors);
+            for (var i = 0; i < GroupColorPalette.Length; i++)
+            {
+                var color = GroupColorPalette[i];
+                var label = L.T(GroupColorNames[i]);
+                var item = MakeMenuItem(label, () => SetGroupColor(group, color));
+                item.Icon = MakeColorSwatch(color);
+                if (SameColor(group.Color, color)) item.Header = "✓ " + label;
+                colors.Items.Add(item);
+            }
+            menu.Items.Add(colors);
+            menu.Items.Add(Theme.StyleSeparator(new Separator()));
+            menu.Items.Add(MakeMenuItem(L.T("关闭分组（关闭全部标签）"), () => CloseGroup(group)));
+            menu.Items.Add(MakeMenuItem(L.T("解散分组"), () => DisbandGroup(group)));
+            return menu;
+        }
+
+        private void ShowGroupMenu(TabGroup group, FrameworkElement target)
+        {
+            SuspendVerticalCollapse();
+            var menu = BuildGroupMenu(group, target);
+            menu.Closed += (s, e) => ResumeVerticalCollapse();
+            menu.PlacementTarget = target;
+            menu.IsOpen = true;
+        }
+
+        private void SetGroupColor(TabGroup group, string color)
+        {
+            if (group == null || string.IsNullOrEmpty(color)) return;
+            group.Color = color;
+            RebuildTabStrip();
+            SaveSession();
+        }
+
+        private void BeginRenameGroup(TabGroup group, FrameworkElement target)
+        {
+            if (group == null) return;
+            SuspendVerticalCollapse();
+            var box = new TextBox
+            {
+                Text = group.Name,
+                Width = 190,
+                FontSize = 12,
+                Padding = new Thickness(6, 4, 6, 4),
+                Margin = new Thickness(0, 0, 0, 8)
+            };
+            box.SetResourceReference(Control.BackgroundProperty, "CanvasBrush");
+            box.SetResourceReference(Control.ForegroundProperty, "TextBrush");
+            box.SetResourceReference(Control.BorderBrushProperty, "LineBrush");
+            var ok = new Button
+            {
+                Content = L.T("确定"),
+                Width = 64,
+                Height = 26,
+                FontSize = 11
+            };
+            ok.SetResourceReference(Control.BackgroundProperty, "AccentBrush");
+            ok.SetResourceReference(Control.ForegroundProperty, "CanvasBrush");
+            var cancel = new Button
+            {
+                Content = L.T("取消"),
+                Width = 64,
+                Height = 26,
+                FontSize = 11,
+                Margin = new Thickness(8, 0, 0, 0)
+            };
+            cancel.SetResourceReference(Control.BackgroundProperty, "SurfaceBrush");
+            cancel.SetResourceReference(Control.ForegroundProperty, "TextBrush");
+            var buttons = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                HorizontalAlignment = HorizontalAlignment.Right
+            };
+            buttons.Children.Add(cancel);
+            buttons.Children.Add(ok);
+            var label = new TextBlock
+            {
+                Text = L.T("分组名称"),
+                FontSize = 11,
+                Margin = new Thickness(0, 0, 0, 6)
+            };
+            label.SetResourceReference(TextBlock.ForegroundProperty, "MutedBrush");
+            var panel = new StackPanel();
+            panel.Children.Add(label);
+            panel.Children.Add(box);
+            panel.Children.Add(buttons);
+            var content = new Border
+            {
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(7),
+                Padding = new Thickness(10),
+                Child = panel
+            };
+            content.SetResourceReference(Border.BackgroundProperty, "SurfaceBrush");
+            content.SetResourceReference(Border.BorderBrushProperty, "LineBrush");
+            var popup = new Popup
+            {
+                Placement = PlacementMode.Bottom,
+                PlacementTarget = target ?? _tabStripPanel,
+                StaysOpen = false,
+                AllowsTransparency = true,
+                Child = content
+            };
+            void Commit()
+            {
+                var name = box.Text == null ? "" : box.Text.Trim();
+                if (!string.IsNullOrEmpty(name)) group.Name = name;
+                popup.IsOpen = false;
+                RebuildTabStrip();
+                SaveSession();
+            }
+            ok.Click += (s, e) => Commit();
+            cancel.Click += (s, e) => popup.IsOpen = false;
+            box.KeyDown += (s, e) =>
+            {
+                if (e.Key == Key.Enter) { Commit(); e.Handled = true; }
+                else if (e.Key == Key.Escape) { popup.IsOpen = false; e.Handled = true; }
+            };
+            popup.Closed += (s, e) => ResumeVerticalCollapse();
+            popup.IsOpen = true;
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                box.Focus();
+                box.SelectAll();
+            }), DispatcherPriority.Input);
+        }
+
+        // 关闭分组 = 关闭组内全部标签，和“解散”（保留标签）不同。
+        private void CloseGroup(TabGroup group)
+        {
+            if (group == null) return;
+            var members = _tabs.Where(t => t.GroupId == group.Id).ToList();
+            if (members.Count == 0) return;
+            foreach (var member in members) CloseTab(member);
+            _groups.RemoveAll(g => g.Id == group.Id);
+            RebuildTabStrip();
+            SaveSession();
+            _toast.Show(L.T("已关闭分组：") + group.Name);
+        }
+
+        private static Brush GroupBrush(string color)
+        {
+            try
+            {
+                var parsed = ColorConverter.ConvertFromString(color);
+                if (parsed is Color) return new SolidColorBrush((Color)parsed);
+            }
+            catch { }
+            return Brushes.Gray;
+        }
+
+        private static Border MakeColorSwatch(string color)
+        {
+            return new Border
+            {
+                Width = 12,
+                Height = 12,
+                CornerRadius = new CornerRadius(6),
+                Background = GroupBrush(color),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+        }
+
+        private static bool SameColor(string a, string b)
+        {
+            return !string.IsNullOrEmpty(a) && !string.IsNullOrEmpty(b) &&
+                string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static readonly string[] GroupColorPalette =
+        {
+            "#FF4D9D", "#4D9DFF", "#4DD18C", "#FFB84D", "#B47DFF", "#E05B5B"
+        };
+
+        private static readonly string[] GroupColorNames =
+        {
+            "粉色", "蓝色", "绿色", "橙色", "紫色", "红色"
+        };
+
+        private static readonly Random GroupColorRandom = new Random();
+
+        private string PickGroupColor()
+        {
+            var free = GroupColorPalette
+                .Where(c => !_groups.Any(g => SameColor(g.Color, c)))
+                .ToList();
+            if (free.Count == 0) free.AddRange(GroupColorPalette);
+            return free[GroupColorRandom.Next(free.Count)];
+        }
+
+        private TabGroup CreateGroup(string name = null)
+        {
+            var group = new TabGroup
+            {
+                Name = name ?? (L.T("分组 ") + (_groups.Count + 1)),
+                Color = PickGroupColor()
+            };
+            _groups.Add(group);
+            return group;
+        }
+
+        private void CreateGroupForTab(TabModel tab)
+        {
+            if (tab == null) return;
+            // 原地建组：不把标签搬到末尾。原来在别的组里就先脱离，
+            // 脱离逻辑会保持旧组区段连续；平铺标签则保持原索引。
+            if (!string.IsNullOrEmpty(tab.GroupId)) DetachFromGroupCore(tab);
+            var group = CreateGroup();
+            tab.GroupId = group.Id;
+            RebuildTabStrip();
+            SaveSession();
+            _toast.Show(L.T("已新建分组：") + group.Name);
+        }
+
+        private void DetachFromGroup(TabModel tab)
+        {
+            if (tab == null || string.IsNullOrEmpty(tab.GroupId)) return;
+            DetachFromGroupCore(tab);
+            RebuildTabStrip();
+            SaveSession();
+        }
+
+        // 移出分组时保持原分组区段连续：优先放回原组末尾；原组因此解散则保持原索引。
+        private void DetachFromGroupCore(TabModel tab)
+        {
+            var groupId = tab.GroupId;
+            var index = _tabs.IndexOf(tab);
+            if (index < 0 || string.IsNullOrEmpty(groupId)) { tab.GroupId = ""; return; }
+            tab.GroupId = "";
+            _tabs.RemoveAt(index);
+            var last = -1;
+            for (var i = 0; i < _tabs.Count; i++)
+            {
+                if (_tabs[i].GroupId == groupId) last = i;
+            }
+            _tabs.Insert(last >= 0 ? last + 1 : Math.Min(index, _tabs.Count), tab);
+            _groups.RemoveAll(g => g.Id == groupId && !_tabs.Any(t => t.GroupId == groupId));
+        }
+
+        // 拖到分组头：移入目标分组并排在同组末尾；收起的分组自动展开，保证操作看得见。
+        internal void MoveTabIntoGroup(TabModel tab, TabGroup group, bool created = false)
+        {
+            if (tab == null || group == null || tab.GroupId == group.Id) return;
+            var oldGroupId = tab.GroupId;
+            _tabs.Remove(tab);
+            tab.GroupId = group.Id;
+            var last = -1;
+            for (var i = 0; i < _tabs.Count; i++)
+            {
+                if (_tabs[i].GroupId == group.Id) last = i;
+            }
+            _tabs.Insert(last < 0 ? _tabs.Count : last + 1, tab);
+            if (!string.IsNullOrEmpty(oldGroupId))
+                _groups.RemoveAll(g => g.Id == oldGroupId && !_tabs.Any(t => t.GroupId == oldGroupId));
+            group.IsCollapsed = false;
+            RebuildTabStrip();
+            SaveSession();
+            _toast.Show((created ? L.T("已新建分组：") : L.T("已移入分组：")) + group.Name);
         }
 
         // 分组误建后必须能删掉：组内标签恢复平铺，分组本身从会话里移除。
@@ -1418,7 +2424,8 @@ namespace NanoEdge
             return badge;
         }
 
-        private FrameworkElement MakeTabChip(TabModel tab, bool showTitle, bool showClose, double minWidth, double maxWidth)
+        private FrameworkElement MakeTabChip(TabModel tab, bool showTitle, bool showClose,
+            double minWidth, double maxWidth, bool verticalInsert = false)
         {
             var active = ReferenceEquals(tab, _active);
             var border = new Border
@@ -1483,7 +2490,50 @@ namespace NanoEdge
                 Grid.SetColumn(close, showTitle ? 2 : 1);
                 grid.Children.Add(close);
             }
+
+            // 拖放插入提示：横向布局贴 chip 左/右边缘的竖线，纵向布局贴
+            // chip 上/下边缘的横线；两种情况都不参与布局。
+            var caret = new Border
+            {
+                Width = verticalInsert ? double.NaN : 2,
+                Height = verticalInsert ? 2 : double.NaN,
+                Margin = verticalInsert
+                    ? new Thickness(2, 0, 2, 0) : new Thickness(0, 2, 0, 2),
+                HorizontalAlignment = verticalInsert
+                    ? HorizontalAlignment.Stretch : HorizontalAlignment.Left,
+                VerticalAlignment = verticalInsert
+                    ? VerticalAlignment.Top : VerticalAlignment.Stretch,
+                Visibility = Visibility.Collapsed,
+                IsHitTestVisible = false,
+                Tag = "drop-caret"
+            };
+            var caretGroup = string.IsNullOrEmpty(tab.GroupId) ? null
+                : _groups.FirstOrDefault(g => g.Id == tab.GroupId);
+            if (caretGroup != null) caret.Background = GroupBrush(caretGroup.Color);
+            else caret.SetResourceReference(Border.BackgroundProperty, "AccentBrush");
+            Grid.SetColumnSpan(caret, Math.Max(1, grid.ColumnDefinitions.Count));
+            grid.Children.Add(caret);
+
+            // 两个平铺标签中心重叠时的特殊高亮：整块描边，和插入线区分开。
+            var halo = new Border
+            {
+                BorderThickness = new Thickness(2),
+                CornerRadius = new CornerRadius(6),
+                Margin = new Thickness(0),
+                Visibility = Visibility.Collapsed,
+                IsHitTestVisible = false,
+                Tag = "group-halo"
+            };
+            halo.SetResourceReference(Border.BorderBrushProperty, "AccentBrush");
+            Grid.SetColumnSpan(halo, Math.Max(1, grid.ColumnDefinitions.Count));
+            grid.Children.Add(halo);
+
             border.Child = grid;
+            Action hideCaret = () =>
+            {
+                caret.Visibility = Visibility.Collapsed;
+                halo.Visibility = Visibility.Collapsed;
+            };
 
             // 中键关闭标签：和主流浏览器一致。
             border.MouseDown += (s, e) =>
@@ -1534,27 +2584,324 @@ namespace NanoEdge
                 {
                     _dragInProgress = false;
                     _dragCandidate = null;
+                    StopDragAutoScroll();
                     ResumeVerticalCollapse();
                 }
             };
-            border.DragOver += (s, e) => e.Effects = DragDropEffects.Move;
+            Action<bool> showCaretAt = after =>
+            {
+                if (verticalInsert)
+                    caret.VerticalAlignment = after ? VerticalAlignment.Bottom : VerticalAlignment.Top;
+                else
+                    caret.HorizontalAlignment = after ? HorizontalAlignment.Right : HorizontalAlignment.Left;
+                caret.Visibility = Visibility.Visible;
+            };
+            Func<DragEventArgs, bool> afterPoint = e => verticalInsert
+                ? e.GetPosition(border).Y > border.ActualHeight / 2
+                : e.GetPosition(border).X > border.ActualWidth / 2;
+
+            border.DragOver += (s, e) =>
+            {
+                PumpDragAutoScroll(e);
+                var tabSource = e.Data.GetData(typeof(TabModel)) as TabModel;
+                if (tabSource != null)
+                {
+                    if (tabSource == tab)
+                    {
+                        hideCaret();
+                        e.Effects = DragDropEffects.None;
+                        e.Handled = true;
+                        return;
+                    }
+                    var point = e.GetPosition(border);
+                    // 目标平铺时，无论源是平铺还是组内标签，中心重叠都建新组；
+                    // 这样“从组里拖出来 + 和新标签重叠”可以一次完成。
+                    var overlap = string.IsNullOrEmpty(tab.GroupId) &&
+                                  IsGroupOverlap(point, border.ActualWidth,
+                                      border.ActualHeight, verticalInsert);
+                    if (overlap)
+                    {
+                        caret.Visibility = Visibility.Collapsed;
+                        halo.Visibility = Visibility.Visible;
+                        e.Effects = DragDropEffects.Move;
+                        e.Handled = true;
+                        return;
+                    }
+                    halo.Visibility = Visibility.Collapsed;
+                    showCaretAt(afterPoint(e));
+                    e.Effects = DragDropEffects.Move;
+                    // 组内成员继续冒泡，让外层分组区段做整组高亮；平铺 chip 自己截住。
+                    e.Handled = string.IsNullOrEmpty(tab.GroupId);
+                    return;
+                }
+
+                var groupSource = e.Data.GetData(typeof(TabGroup)) as TabGroup;
+                if (groupSource == null)
+                {
+                    hideCaret();
+                    e.Effects = DragDropEffects.None;
+                    e.Handled = true;
+                    return;
+                }
+                halo.Visibility = Visibility.Collapsed;
+                // 拖到组内成员时，由外层区段统一显示整组插入线。
+                if (!string.IsNullOrEmpty(tab.GroupId))
+                {
+                    hideCaret();
+                    e.Handled = false;
+                    return;
+                }
+                showCaretAt(afterPoint(e));
+                e.Effects = DragDropEffects.Move;
+                e.Handled = true;
+            };
+            border.DragLeave += (s, e) =>
+            {
+                hideCaret();
+                StopDragAutoScroll();
+            };
             border.Drop += (s, e) =>
             {
-                var source = e.Data.GetData(typeof(TabModel)) as TabModel;
-                if (source != null && source != tab) ReorderTabs(source, tab);
+                hideCaret();
+                StopDragAutoScroll();
+                var tabSource = e.Data.GetData(typeof(TabModel)) as TabModel;
+                if (tabSource != null)
+                {
+                    if (tabSource != tab)
+                    {
+                        var dropPoint = e.GetPosition(border);
+                        var overlap = string.IsNullOrEmpty(tab.GroupId) &&
+                                      IsGroupOverlap(dropPoint, border.ActualWidth,
+                                          border.ActualHeight, verticalInsert);
+                        if (overlap)
+                        {
+                            CreateGroupFromPair(tabSource, tab);
+                            e.Handled = true;
+                            return;
+                        }
+                        var after = afterPoint(e);
+                        if (!string.IsNullOrEmpty(tab.GroupId))
+                        {
+                            var group = _groups.FirstOrDefault(g => g.Id == tab.GroupId);
+                            if (group != null)
+                            {
+                                if (tabSource.GroupId == group.Id)
+                                    ReorderTabsAt(tabSource, tab, after);
+                                else
+                                    MoveTabIntoGroupAt(tabSource, group, tab, after);
+                            }
+                        }
+                        else if (!string.IsNullOrEmpty(tabSource.GroupId))
+                        {
+                            // 拖到平铺标签 = 离开原分组，落在目标位置。
+                            MoveTabOutOfGroupAt(tabSource, tab, after);
+                        }
+                        else
+                        {
+                            ReorderTabsAt(tabSource, tab, after);
+                        }
+                    }
+                    e.Handled = true;
+                    return;
+                }
+
+                var groupSource = e.Data.GetData(typeof(TabGroup)) as TabGroup;
+                if (groupSource == null) { e.Handled = true; return; }
+                // 组内目标由区段处理；平铺目标在这里整组落在它前/后。
+                if (!string.IsNullOrEmpty(tab.GroupId)) return;
+                MoveGroupAt(groupSource, tab, afterPoint(e));
                 e.Handled = true;
             };
             return border;
         }
 
+        // 标签之间的拖放只负责排序：同组内交换顺序，跨组不偷偷改 GroupId
+        //（移入分组统一走分组头 / 区段的 Drop）。
         private void ReorderTabs(TabModel source, TabModel target)
         {
+            ReorderTabsAt(source, target, false);
+        }
+
+        private void ReorderTabsAt(TabModel source, TabModel target, bool after)
+        {
+            if (source == null || target == null || source == target) return;
+            if (source.GroupId != target.GroupId) return;
             var from = _tabs.IndexOf(source);
             if (from < 0) return;
             _tabs.RemoveAt(from);
             var to = _tabs.IndexOf(target);
-            _tabs.Insert(to < 0 ? _tabs.Count : to, source);
-            source.GroupId = target.GroupId;
+            if (to < 0)
+            {
+                _tabs.Insert(from, source);
+                return;
+            }
+            _tabs.Insert(after ? to + 1 : to, source);
+            RebuildTabStrip();
+            SaveSession();
+        }
+
+        // 成员附近落下：插到目标成员前/后，而不是一律追加到分组末尾。
+        internal void MoveTabIntoGroupAt(TabModel tab, TabGroup group, TabModel target, bool after)
+        {
+            if (tab == null || group == null || tab == target) return;
+            if (tab.GroupId == group.Id)
+            {
+                ReorderTabsAt(tab, target, after);
+                return;
+            }
+            var oldGroupId = tab.GroupId;
+            _tabs.Remove(tab);
+            tab.GroupId = group.Id;
+            var to = target == null || target.GroupId != group.Id
+                ? _tabs.Count : _tabs.IndexOf(target);
+            if (to < 0) to = _tabs.Count;
+            else if (after) to++;
+            _tabs.Insert(to, tab);
+            if (!string.IsNullOrEmpty(oldGroupId))
+                _groups.RemoveAll(g => g.Id == oldGroupId && !_tabs.Any(t => t.GroupId == oldGroupId));
+            group.IsCollapsed = false;
+            RebuildTabStrip();
+            SaveSession();
+            _toast.Show(L.T("已移入分组：") + group.Name);
+        }
+
+        // 拖到平铺标签：离开原分组，落在目标标签前/后；原组空了就删除。
+        private void MoveTabOutOfGroupAt(TabModel tab, TabModel target, bool after)
+        {
+            if (tab == null || target == null || tab == target) return;
+            if (string.IsNullOrEmpty(tab.GroupId))
+            {
+                ReorderTabsAt(tab, target, after);
+                return;
+            }
+            var groupId = tab.GroupId;
+            var from = _tabs.IndexOf(tab);
+            if (from < 0) return;
+            tab.GroupId = "";
+            _tabs.RemoveAt(from);
+            var to = _tabs.IndexOf(target);
+            if (to < 0)
+                _tabs.Insert(Math.Min(from, _tabs.Count), tab);
+            else
+                _tabs.Insert(after ? to + 1 : to, tab);
+            _groups.RemoveAll(g => g.Id == groupId && !_tabs.Any(t => t.GroupId == groupId));
+            RebuildTabStrip();
+            SaveSession();
+            _toast.Show(L.T("已移出分组"));
+        }
+
+        // 拖到标签条/侧栏空白：移出分组并落到末尾。
+        private void DropTabOnBlank(TabModel tab)
+        {
+            if (tab == null) return;
+            var groupId = tab.GroupId;
+            if (!string.IsNullOrEmpty(groupId))
+            {
+                tab.GroupId = "";
+                _groups.RemoveAll(g => g.Id == groupId && !_tabs.Any(t => t.GroupId == groupId));
+                _toast.Show(L.T("已移出分组"));
+            }
+            _tabs.Remove(tab);
+            _tabs.Add(tab);
+            RebuildTabStrip();
+            SaveSession();
+        }
+
+        // 落到分组区段边界：保持平铺（不加入任何组），插在 anchor 前面。
+        // anchor 可能是源标签自己（把组首拖到组前），此时插到同组剩余成员前面。
+        private void MoveTabToBoundary(TabModel tab, TabModel anchor)
+        {
+            if (tab == null) return;
+            var groupId = tab.GroupId;
+            var from = _tabs.IndexOf(tab);
+            if (from < 0) return;
+            var movedOut = !string.IsNullOrEmpty(groupId);
+            tab.GroupId = "";
+            _tabs.RemoveAt(from);
+            var to = anchor == null ? _tabs.Count : _tabs.IndexOf(anchor);
+            if (to < 0)
+            {
+                var remaining = string.IsNullOrEmpty(groupId) ? null
+                    : _tabs.FirstOrDefault(t => t.GroupId == groupId);
+                to = remaining != null ? _tabs.IndexOf(remaining)
+                    : Math.Min(from, _tabs.Count);
+            }
+            _tabs.Insert(to, tab);
+            if (movedOut)
+            {
+                _groups.RemoveAll(g => g.Id == groupId &&
+                    !_tabs.Any(t => t.GroupId == groupId));
+                _toast.Show(L.T("已移出分组"));
+            }
+            RebuildTabStrip();
+            SaveSession();
+        }
+
+        // 两个平铺标签拖到彼此中心区域 = 新建分组。中心 40% 视为“高度重叠”，
+        // 边缘留给正常的前/后排序。
+        internal static bool IsGroupOverlap(Point point, double width, double height,
+            bool vertical)
+        {
+            var size = vertical ? height : width;
+            if (size <= 0) return false;
+            var ratio = (vertical ? point.Y : point.X) / size;
+            return ratio >= 0.3 && ratio <= 0.7;
+        }
+
+        internal void CreateGroupFromPair(TabModel source, TabModel target)
+        {
+            if (source == null || target == null || source == target) return;
+            if (!string.IsNullOrEmpty(target.GroupId)) return;
+            var sourceIndex = _tabs.IndexOf(source);
+            var targetIndex = _tabs.IndexOf(target);
+            if (sourceIndex < 0 || targetIndex < 0) return;
+            var oldGroupId = source.GroupId;
+            _tabs.Remove(source);
+            var insertAt = _tabs.IndexOf(target);
+            if (sourceIndex > targetIndex) insertAt++;
+            _tabs.Insert(insertAt, source);
+            var group = CreateGroup();
+            source.GroupId = group.Id;
+            target.GroupId = group.Id;
+            if (!string.IsNullOrEmpty(oldGroupId))
+                _groups.RemoveAll(g => g.Id == oldGroupId && !_tabs.Any(t => t.GroupId == oldGroupId));
+            RebuildTabStrip();
+            SaveSession();
+            _toast.Show(L.T("已新建分组：") + group.Name);
+        }
+
+        // 整组拖动：以目标标签（或目标分组）为锚点，把成员区段整体搬过去。
+        internal void MoveGroupAt(TabGroup source, TabModel targetTab, bool after)
+        {
+            if (source == null || targetTab == null) return;
+            if (targetTab.GroupId == source.Id) return;
+            var members = _tabs.Where(t => t.GroupId == source.Id).ToList();
+            if (members.Count == 0) return;
+            var targetGroupId = targetTab.GroupId;
+            var anchor = targetTab;
+            if (!string.IsNullOrEmpty(targetGroupId))
+            {
+                var targetMembers = _tabs.Where(t => t.GroupId == targetGroupId).ToList();
+                if (targetMembers.Count == 0) return;
+                anchor = after ? targetMembers[targetMembers.Count - 1] : targetMembers[0];
+            }
+            if (_tabs.IndexOf(anchor) < 0) return;
+            foreach (var member in members) _tabs.Remove(member);
+            var to = _tabs.IndexOf(anchor);
+            if (to < 0) to = _tabs.Count;
+            else if (after) to++;
+            _tabs.InsertRange(to, members);
+            RebuildTabStrip();
+            SaveSession();
+        }
+
+        private void MoveGroupToEnd(TabGroup group)
+        {
+            if (group == null) return;
+            var members = _tabs.Where(t => t.GroupId == group.Id).ToList();
+            if (members.Count == 0) return;
+            foreach (var member in members) _tabs.Remove(member);
+            _tabs.AddRange(members);
             RebuildTabStrip();
             SaveSession();
         }
@@ -1566,21 +2913,9 @@ namespace NanoEdge
             menu.Closed += (s, e) => ResumeVerticalCollapse();
             menu.Items.Add(MakeMenuItem(tab.Resident ? L.T("取消内存常驻") : L.T("内存常驻（不自动释放）"), () => ToggleResident(tab)));
             menu.Items.Add(MakeMenuItem(L.T("立即释放此标签内存"), () => ReleaseTab(tab)));
-            menu.Items.Add(MakeMenuItem(L.T("新建分组并移入"), () =>
-            {
-                var group = new TabGroup { Name = L.T("分组 ") + (_groups.Count + 1) };
-                _groups.Add(group);
-                tab.GroupId = group.Id;
-                RebuildTabStrip();
-                SaveSession();
-            }));
+            menu.Items.Add(MakeMenuItem(L.T("新建分组并移入"), () => CreateGroupForTab(tab)));
             if (!string.IsNullOrEmpty(tab.GroupId))
-                menu.Items.Add(MakeMenuItem(L.T("移出分组"), () =>
-                {
-                    tab.GroupId = "";
-                    RebuildTabStrip();
-                    SaveSession();
-                }));
+                menu.Items.Add(MakeMenuItem(L.T("移出分组"), () => DetachFromGroup(tab)));
             if (IsDuplicatable(tab))
                 menu.Items.Add(MakeMenuItem(L.T("复制标签"), () => DuplicateTab(tab)));
             menu.Items.Add(Theme.StyleSeparator(new Separator()));
@@ -1626,12 +2961,6 @@ namespace NanoEdge
             menu.Items.Add(MakeMenuItem(L.T("切换密封标签 (Alt+`)"), ToggleSecret));
             menu.Items.Add(MakeMenuItem(L.T("密封标签通知：") + (_settings.SecretNotifications ? L.T("允许") : L.T("关闭")),
                 ToggleSecretNotifications));
-            menu.Items.Add(MakeMenuItem(L.T("新建分组"), () =>
-            {
-                _groups.Add(new TabGroup { Name = L.T("分组 ") + (_groups.Count + 1) });
-                RebuildTabStrip();
-                SaveSession();
-            }));
             menu.Items.Add(Theme.StyleSeparator(new Separator()));
             menu.Items.Add(MakeMenuItem(L.T("历史记录 (Ctrl+H)"), OpenHistory));
             menu.Items.Add(MakeMenuItem(L.T("书签 (Ctrl+Shift+O)"), OpenBookmarks));

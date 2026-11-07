@@ -30,6 +30,34 @@ namespace NanoEdge
             return null;
         }
 
+        // 自测/截图进程使用独立的单实例名，避免把正在使用的 NanoEdge 顶掉，
+        // 也避免自测参数被已有实例当成 URL 收走。
+        private static bool IsSelfTest(string[] args)
+        {
+            if (args == null) return false;
+            foreach (var arg in args)
+            {
+                if (arg.StartsWith("--screenshot=", StringComparison.OrdinalIgnoreCase)) return true;
+                switch (arg)
+                {
+                    case "--fixtest":
+                    case "--memtest":
+                    case "--navtest":
+                    case "--m3ctest":
+                    case "--m4test":
+                    case "--m5test":
+                    case "--m6test":
+                    case "--m6btest":
+                    case "--m7test":
+                    case "--m8test":
+                    case "--menupreview":
+                    case "--test-mutex":
+                        return true;
+                }
+            }
+            return false;
+        }
+
         // 外部唤起时参数就是一个 URL；以 -- 开头的是我们自己的调试开关，跳过。
         private static string FirstUrlArg(string[] args)
         {
@@ -57,7 +85,9 @@ namespace NanoEdge
             L.Apply(settings.Language);
 
             bool ownsMutex;
-            using (var mutex = new Mutex(true, "NanoEdge.SingleInstance", out ownsMutex))
+            var mutexName = IsSelfTest(args)
+                ? "NanoEdge.SingleInstance.SelfTest" : "NanoEdge.SingleInstance";
+            using (var mutex = new Mutex(true, mutexName, out ownsMutex))
             {
                 if (!ownsMutex)
                 {

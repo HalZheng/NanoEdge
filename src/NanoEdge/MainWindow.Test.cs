@@ -352,6 +352,23 @@ namespace NanoEdge
                         ? "RESULT: PASS (" + _passes + " checks)"
                         : "RESULT: FAIL " + string.Join(", ", _failures));
                     WriteReport();
+                    // Popup 是独立 HWND：Toast / 悬浮面板不主动关会让进程在
+                    // Shutdown 后仍挂住（与 MemorySelfTest 的收尾同一原因）。
+                    try { if (_w._toast != null) _w._toast.Hide(); } catch { }
+                    try { if (_w._verticalPopup != null) _w._verticalPopup.IsOpen = false; } catch { }
+                    try { if (_w._memoryPanel != null) _w._memoryPanel.Close(); } catch { }
+                    try { if (_w._suggestions != null) _w._suggestions.Close(); } catch { }
+                    // 主动走窗口关闭路径，让 WebView2 释放和 Popup 收尾都同步完成；
+                    // 只调 Shutdown 时，独立 HWND 有可能让进程在报告写完后仍挂着。
+                    // 再加一个后台看门狗：测试进程宁可直接退出，也不允许挂住全量自测。
+                    var watchdog = new System.Threading.Thread(() =>
+                    {
+                        System.Threading.Thread.Sleep(3000);
+                        Environment.Exit(0);
+                    });
+                    watchdog.IsBackground = true;
+                    watchdog.Start();
+                    try { _w.Close(); } catch { }
                     try { Application.Current.Shutdown(); } catch { }
                 }
             }
@@ -411,6 +428,23 @@ namespace NanoEdge
                     RoutedEvent = UIElement.MouseLeftButtonUpEvent
                 };
                 chip.RaiseEvent(up);
+            }
+
+            // 分组现在包在一个 Grid 区段里；测试要同时看得到平铺 chip 和区段内的 chip/头。
+            private static IEnumerable<FrameworkElement> TabItems(Panel panel)
+            {
+                if (panel == null) yield break;
+                foreach (var child in panel.Children)
+                {
+                    var fe = child as FrameworkElement;
+                    if (fe == null) continue;
+                    yield return fe;
+                    var grid = fe as Grid;
+                    if (grid == null || !(grid.Tag is TabGroup)) continue;
+                    foreach (var stack in grid.Children.OfType<StackPanel>())
+                        foreach (var inner in stack.Children.OfType<FrameworkElement>())
+                            yield return inner;
+                }
             }
 
             [DllImport("user32.dll")]
@@ -518,12 +552,12 @@ namespace NanoEdge
                 _w.ApplyLayout();
                 _w.NewTab();
                 _w.NewTab();
+                Check("new tab is appended at the end", _w._tabs.Last() == _w._active,
+                    "last=" + (_w._tabs.Last() == _w._active));
                 _w.RebuildTabStrip();
 
-                var chips = _w._tabStripPanel == null
-                    ? new List<Border>()
-                    : _w._tabStripPanel.Children.OfType<Border>()
-                        .Where(b => b.Tag is TabModel).ToList();
+                var chips = TabItems(_w._tabStripPanel).OfType<Border>()
+                    .Where(b => b.Tag is TabModel).ToList();
                 Check("multiple tab chips rendered", chips.Count >= 3, "chips=" + chips.Count);
                 if (chips.Count >= 3)
                 {
@@ -539,6 +573,84 @@ namespace NanoEdge
                         "active=" + (_w._active == null ? "null" : _w._active.Id));
                 }
 
+                var overlayChip = chips.FirstOrDefault(b => ReferenceEquals(b.Tag, _w._active));
+                var overlayGrid = overlayChip == null ? null : overlayChip.Child as Grid;
+                var dropCaret = overlayGrid == null ? null
+                    : overlayGrid.Children.OfType<Border>()
+                        .FirstOrDefault(b => Equals(b.Tag, "drop-caret"));
+                var groupHalo = overlayGrid == null ? null
+                    : overlayGrid.Children.OfType<Border>()
+                        .FirstOrDefault(b => Equals(b.Tag, "group-halo"));
+                Check("tab chip has drop caret and group halo overlays",
+                    dropCaret != null && groupHalo != null,
+                    "caret=" + (dropCaret != null) + " halo=" + (groupHalo != null));
+
+                // 新标签追加在 _tabs 末尾；+ 紧跟最后一个标签，不再固定占导航行。
+                var stripChildren = _w._tabStripPanel == null ? new List<UIElement>()
+                    : _w._tabStripPanel.Children.Cast<UIElement>().ToList();
+                Check("new tab button follows the last tab",
+                    stripChildren.Count >= 2 &&
+                    stripChildren[stripChildren.Count - 1] is Button &&
+                    Equals(((FrameworkElement)stripChildren[stripChildren.Count - 1]).Tag, "newtab") &&
+                    ((FrameworkElement)stripChildren[stripChildren.Count - 2]).Tag is TabModel,
+                    "last=" + (stripChildren.Count == 0 ? "none"
+                        : stripChildren[stripChildren.Count - 1].GetType().Name));
+                Check("new tab button is not fixed in the navigation row",
+                    _w._navigationRow != null &&
+                    !_w._navigationRow.Children.OfType<Button>()
+                        .Any(b => Equals(b.Tag, "newtab")),
+                    "navButtons=" + (_w._navigationRow == null ? "null"
+                        : _w._navigationRow.Children.OfType<Button>().Count().ToString()));
+                Check("tab strip has scroll chevrons",
+                    _w._tabStripPrev != null && _w._tabStripNext != null &&
+                    Equals(_w._tabStripPrev.Tag, "tab-scroll-left") &&
+                    Equals(_w._tabStripNext.Tag, "tab-scroll-right"),
+                    "prev=" + (_w._tabStripPrev != null) +
+                    " next=" + (_w._tabStripNext != null));
+
+                // 多标签：chip 变窄、地址栏让宽、右侧出现滚动箭头；滚动后左侧也出现。
+                var overflowProbes = new List<TabModel>();
+                for (var i = 0; i < 22; i++)
+                {
+                    var probe = new TabModel
+                    {
+                        Title = "overflow " + i,
+                        Url = "about:blank",
+                        IsStartPage = false
+                    };
+                    _w._tabs.Add(probe);
+                    overflowProbes.Add(probe);
+                }
+                _w.RebuildTabStrip();
+                _w.UpdateLayout();
+                _w.UpdateTabStripScrollButtons();
+                Check("overflowing strip shows the right scroll chevron",
+                    _w._tabStrip.ScrollableWidth > 0.5 &&
+                    _w._tabStripNext.Visibility == Visibility.Visible,
+                    "scrollable=" + _w._tabStrip.ScrollableWidth +
+                    " viewport=" + _w._tabStrip.ViewportWidth +
+                    " extent=" + _w._tabStrip.ExtentWidth +
+                    " actual=" + _w._tabStrip.ActualWidth +
+                    " panel=" + _w._tabStripPanel.ActualWidth +
+                    " children=" + _w._tabStripPanel.Children.Count +
+                    " tabs=" + _w._tabs.Count +
+                    " next=" + _w._tabStripNext.Visibility);
+                Check("many tabs give the strip more address-bar width",
+                    _w._navigationRow.ColumnDefinitions[2].Width.Value == 60,
+                    "share=" + _w._navigationRow.ColumnDefinitions[2].Width.Value);
+                _w.ScrollTabStrip(1);
+                _w.UpdateLayout();
+                _w.UpdateTabStripScrollButtons();
+                Check("scrolled strip shows the left scroll chevron",
+                    _w._tabStripPrev.Visibility == Visibility.Visible,
+                    "offset=" + _w._tabStrip.HorizontalOffset);
+                _w._tabStrip.ScrollToHorizontalOffset(0);
+                foreach (var probe in overflowProbes) _w._tabs.Remove(probe);
+                _w.RebuildTabStrip();
+                Check("fewer tabs restore the compact column share",
+                    _w._navigationRow.ColumnDefinitions[2].Width.Value == 45,
+                    "share=" + _w._navigationRow.ColumnDefinitions[2].Width.Value);
+
                 // ---- C2：关掉最后一个标签不退出浏览器 ----
                 while (_w._tabs.Count > 1) _w.CloseTab(_w._tabs[0]);
                 _w.CloseTab(_w._tabs[0]);
@@ -552,22 +664,177 @@ namespace NanoEdge
                     _w._tabs.Count == 1 && _w._tabs[0].IsStartPage,
                     "start=" + (_w._tabs.Count == 1 && _w._tabs[0].IsStartPage));
 
-                // ---- 分组：水平布局看得见，且能解散 ----
-                var group = new TabGroup { Name = "selftest" };
-                _w._groups.Add(group);
-                _w._tabs[0].GroupId = group.Id;
-                _w.RebuildTabStrip();
+                // ---- 分组：拖放 / 排序拆分 / 颜色 / 解散 ----
+                // 走真实入口「新建分组并移入」：CreateGroupForTab。
+                var originalTab = _w._tabs[0];
+                _w.CreateGroupForTab(originalTab);
+                var group = _w._groups[_w._groups.Count - 1];
+                Check("new group gets a random palette color",
+                    MainWindow.GroupColorPalette.Contains(group.Color),
+                    "color=" + group.Color);
+                Check("group color palette entries are distinct",
+                    MainWindow.GroupColorPalette.Distinct().Count() ==
+                    MainWindow.GroupColorPalette.Length,
+                    "colors=" + MainWindow.GroupColorPalette.Length);
 
-                var panel = _w._tabStripPanel;
-                var headers = panel == null ? new List<Border>()
-                    : panel.Children.OfType<Border>().Where(b => Equals(b.Tag, "group")).ToList();
+                Func<List<Border>> groupHeaders = () => TabItems(_w._tabStripPanel)
+                    .OfType<Border>().Where(b => Equals(b.Tag, "group")).ToList();
+                var headers = groupHeaders();
                 Check("horizontal strip shows group header", headers.Count == 1,
                     "headers=" + headers.Count);
-                Check("grouped tab still rendered", panel != null && panel.Children.OfType<Border>()
-                    .Any(b => b.Tag is TabModel && ((TabModel)b.Tag).GroupId == group.Id),
-                    "panel=" + (panel == null ? "null" : panel.Children.Count.ToString()));
+                Check("group header accepts tab drops",
+                    headers.Count == 1 && headers[0].AllowDrop,
+                    "allowDrop=" + (headers.Count == 1 && headers[0].AllowDrop));
+                Check("grouped tab still rendered", TabItems(_w._tabStripPanel)
+                    .Any(f => f.Tag is TabModel && ((TabModel)f.Tag).GroupId == group.Id),
+                    "panel=" + (_w._tabStripPanel == null ? "null"
+                        : _w._tabStripPanel.Children.Count.ToString()));
+                var firstSection = _w._tabStripPanel == null ? null
+                    : _w._tabStripPanel.Children.OfType<Grid>()
+                        .FirstOrDefault(g => g.Tag is TabGroup);
+                var firstSectionItems = firstSection == null ? new List<FrameworkElement>()
+                    : firstSection.Children.OfType<StackPanel>().FirstOrDefault()?
+                        .Children.OfType<FrameworkElement>().ToList() ?? new List<FrameworkElement>();
+                Check("group header and member share one section",
+                    firstSection != null &&
+                    firstSectionItems.Any(f => Equals(f.Tag, "group")) &&
+                    firstSectionItems.Any(f => f.Tag is TabModel &&
+                        ((TabModel)f.Tag).GroupId == group.Id),
+                    "items=" + firstSectionItems.Count);
+                Check("group section accepts tab drops",
+                    firstSection != null && firstSection.AllowDrop,
+                    "allowDrop=" + (firstSection != null && firstSection.AllowDrop));
+                var groupCaret = firstSection == null ? null
+                    : firstSection.Children.OfType<Border>()
+                        .FirstOrDefault(b => Equals(b.Tag, "group-drop-caret"));
+                var expectedGroupColor = (Color)ColorConverter.ConvertFromString(group.Color);
+                Check("group section has a group-colored insertion caret",
+                    groupCaret != null && groupCaret.Background is SolidColorBrush sb &&
+                    sb.Color == expectedGroupColor,
+                    groupCaret == null ? "no caret"
+                        : "caret=" + groupCaret.Background);
+                Check("horizontal strip blank area accepts tab drops",
+                    _w._tabStrip != null && _w._tabStrip.AllowDrop,
+                    "allowDrop=" + (_w._tabStrip != null && _w._tabStrip.AllowDrop));
+                Check("vertical rail blank area accepts tab drops",
+                    _w._rail != null && _w._rail.AllowDrop,
+                    "allowDrop=" + (_w._rail != null && _w._rail.AllowDrop));
+                Check("vertical popup blank area accepts tab drops",
+                    _w._popupContent != null && _w._popupContent.AllowDrop,
+                    "allowDrop=" + (_w._popupContent != null && _w._popupContent.AllowDrop));
 
-                // 视觉证据：水平标签条里应该能看见分组头。
+                // 颜色：换色后分组头的圆点跟着变。
+                var color2 = MainWindow.GroupColorPalette
+                    .First(c => !MainWindow.SameColor(c, group.Color));
+                _w.SetGroupColor(group, color2);
+                _w.RebuildTabStrip();
+                var header = groupHeaders().FirstOrDefault();
+                var headerPanel = header == null ? null : header.Child as StackPanel;
+                var dot = headerPanel == null ? null
+                    : headerPanel.Children.OfType<Border>().FirstOrDefault();
+                var dotBrush = dot == null ? null : dot.Background as SolidColorBrush;
+                var expectedColor = (Color)ColorConverter.ConvertFromString(color2);
+                Check("group color updates the header dot",
+                    dotBrush != null && dotBrush.Color == expectedColor,
+                    "dot=" + (dotBrush == null ? "null" : dotBrush.Color.ToString()) +
+                    " expected=" + expectedColor);
+
+                // 颜色菜单：六项预设色都带色块，当前颜色打勾。
+                try
+                {
+                    var colorMenu = _w.BuildGroupMenu(group);
+                    var colorsItem = colorMenu.Items.OfType<MenuItem>()
+                        .FirstOrDefault(m => m.Items.Count == MainWindow.GroupColorPalette.Length);
+                    Check("group menu lists all preset colors",
+                        colorsItem != null &&
+                        colorsItem.Items.Count == MainWindow.GroupColorPalette.Length &&
+                        colorsItem.Items.OfType<MenuItem>().All(m => m.Icon is Border),
+                        "items=" + (colorsItem == null ? "none"
+                            : colorsItem.Items.Count.ToString()) +
+                        " swatches=" + (colorsItem == null ? "none"
+                            : colorsItem.Items.OfType<MenuItem>()
+                                .Count(m => m.Icon is Border).ToString()));
+                    var marked = colorsItem == null ? 0
+                        : colorsItem.Items.OfType<MenuItem>()
+                            .Count(m => ((string)m.Header).StartsWith("✓ ", StringComparison.Ordinal));
+                    Check("current group color is marked", marked == 1, "marked=" + marked);
+                    Check("group menu includes rename and close entries",
+                        colorMenu.Items.OfType<MenuItem>()
+                            .Any(m => Equals(m.Header, L.T("重命名分组"))) &&
+                        colorMenu.Items.OfType<MenuItem>()
+                            .Any(m => Equals(m.Header,
+                                L.T("关闭分组（关闭全部标签）"))),
+                        "menuItems=" + colorMenu.Items.OfType<MenuItem>().Count());
+
+                    colorMenu.ApplyTemplate();
+                    colorMenu.Measure(new Size(320, 400));
+                    var menuW = Math.Max(160, Math.Ceiling(colorMenu.DesiredSize.Width));
+                    var menuH = Math.Max(80, Math.Ceiling(colorMenu.DesiredSize.Height));
+                    colorMenu.Arrange(new Rect(0, 0, menuW, menuH));
+                    colorMenu.UpdateLayout();
+                    var colorRtb = new RenderTargetBitmap((int)menuW, (int)menuH,
+                        96, 96, PixelFormats.Pbgra32);
+                    colorRtb.Render(colorMenu);
+                    var colorEncoder = new PngBitmapEncoder();
+                    colorEncoder.Frames.Add(BitmapFrame.Create(colorRtb));
+                    var colorPath = Path.Combine(Root(), "out", "check-group-color-menu.png");
+                    using (var stream = File.Create(colorPath)) colorEncoder.Save(stream);
+                    Line("group color menu screenshot: out/check-group-color-menu.png");
+                }
+                catch (Exception ex) { Line("group color menu screenshot failed: " + ex.Message); }
+
+                // 第二个分组走同一条路径，顺便提供「两个不同颜色分组头」的截图。
+                var extra = new TabModel
+                {
+                    Title = "group drop probe",
+                    Url = "about:blank",
+                    IsStartPage = false
+                };
+                _w._tabs.Insert(1, extra);
+                _w.RebuildTabStrip();
+                var extraIndex = _w._tabs.IndexOf(extra);
+                _w.CreateGroupForTab(extra);
+                var group2 = _w._groups[_w._groups.Count - 1];
+                _w.RebuildTabStrip();
+                Check("group creation keeps the tab at its index",
+                    _w._tabs.IndexOf(extra) == extraIndex,
+                    "before=" + extraIndex + " after=" + _w._tabs.IndexOf(extra));
+                headers = groupHeaders();
+                Check("two groups render two headers", headers.Count == 2,
+                    "headers=" + headers.Count);
+                Check("two default group colors differ",
+                    !MainWindow.SameColor(group.Color, group2.Color),
+                    group.Color + "/" + group2.Color);
+                var sectionGaps = _w._tabStripPanel.Children.OfType<Border>()
+                    .Where(b => Equals(b.Tag, "section-gap")).ToList();
+                Check("section boundary gaps are drop targets",
+                    sectionGaps.Count == 2 && sectionGaps.All(g => g.AllowDrop),
+                    "count=" + sectionGaps.Count);
+                Check("section boundary gap has an insertion caret",
+                    sectionGaps.Count > 0 && sectionGaps.All(g =>
+                        g.Child is Border c && Equals(c.Tag, "gap-caret")),
+                    "gaps=" + sectionGaps.Count);
+
+                // 两个连续分组之间：独立标签可以落在 gap 上，保持平铺。
+                var gapProbe = new TabModel
+                {
+                    Title = "gap probe",
+                    Url = "about:blank",
+                    IsStartPage = false
+                };
+                _w._tabs.Add(gapProbe);
+                _w.RebuildTabStrip();
+                _w.MoveTabToBoundary(gapProbe, extra);
+                Check("flat tab can sit between two groups",
+                    string.IsNullOrEmpty(gapProbe.GroupId) &&
+                    _w._tabs.IndexOf(gapProbe) < _w._tabs.IndexOf(extra) &&
+                    _w._tabs.IndexOf(gapProbe) > _w._tabs.IndexOf(_w._tabs.First(t => t.GroupId == group.Id)),
+                    "gap=" + _w._tabs.IndexOf(gapProbe) +
+                    " extra=" + _w._tabs.IndexOf(extra));
+                _w._tabs.Remove(gapProbe);
+                _w.RebuildTabStrip();
+
+                // 视觉证据：两个不同颜色的分组头。
                 try
                 {
                     _w.UpdateLayout();
@@ -576,23 +843,377 @@ namespace NanoEdge
                 }
                 catch (Exception ex) { Line("group header screenshot failed: " + ex.Message); }
 
+                // 纵向：分组区段按 _tabs 顺序内联，成员不再掉到最下面；+ 在最后一个标签下面。
+                try
+                {
+                    _w._settings.Layout = LayoutMode.Vertical;
+                    _w._settings.VerticalExpanded = true;
+                    _w.ApplyLayout();
+                    _w.RebuildTabStrip();
+                    var railTabs = TabItems(_w._railPanel).Where(f => f.Tag is TabModel)
+                        .Select(f => (TabModel)f.Tag).ToList();
+                    Check("vertical tab order follows _tabs",
+                        railTabs.SequenceEqual(_w._tabs),
+                        "rail=" + string.Join(",", railTabs.Select(t => t.Title)) +
+                        " tabs=" + string.Join(",", _w._tabs.Select(t => t.Title)));
+                    var railSection = _w._railPanel.Children.OfType<Grid>()
+                        .FirstOrDefault(g => g.Tag is TabGroup);
+                    var railSectionItems = railSection == null ? new List<FrameworkElement>()
+                        : railSection.Children.OfType<StackPanel>().FirstOrDefault()?
+                            .Children.OfType<FrameworkElement>().ToList()
+                            ?? new List<FrameworkElement>();
+                    Check("vertical group header and member stay in one section",
+                        railSection != null &&
+                        railSectionItems.Any(f => Equals(f.Tag, "group")) &&
+                        railSectionItems.Any(f => f.Tag is TabModel),
+                        "items=" + railSectionItems.Count);
+                    Check("vertical group section accepts tab drops",
+                        railSection != null && railSection.AllowDrop,
+                        "allowDrop=" + (railSection != null && railSection.AllowDrop));
+                    var verticalGaps = _w._railPanel.Children.OfType<Border>()
+                        .Where(b => Equals(b.Tag, "section-gap")).ToList();
+                    Check("vertical section boundary gaps are drop targets",
+                        verticalGaps.Count == 2 && verticalGaps.All(g => g.AllowDrop),
+                        "count=" + verticalGaps.Count);
+                    var railLast = _w._railPanel.Children.Cast<UIElement>().Last()
+                        as FrameworkElement;
+                    var popLast = _w._popupPanel.Children.Cast<UIElement>().Last()
+                        as FrameworkElement;
+                    Check("vertical new tab button follows the last tab",
+                        railLast is Button && Equals(railLast.Tag, "newtab"),
+                        "last=" + (railLast == null ? "none" : railLast.GetType().Name));
+                    Check("popup new tab button follows the last tab",
+                        popLast is Button && Equals(popLast.Tag, "newtab"),
+                        "last=" + (popLast == null ? "none" : popLast.GetType().Name));
+                    var popTabs = TabItems(_w._popupPanel).Where(f => f.Tag is TabModel)
+                        .Select(f => (TabModel)f.Tag).ToList();
+                    Check("popup tab order follows _tabs",
+                        popTabs.SequenceEqual(_w._tabs),
+                        "popup=" + string.Join(",", popTabs.Select(t => t.Title)) +
+                        " tabs=" + string.Join(",", _w._tabs.Select(t => t.Title)));
+                    try
+                    {
+                        _w.UpdateLayout();
+                        _w.CaptureScreenshot(Path.Combine(Root(), "out",
+                            "check-vertical-groups.png"));
+                        Line("vertical group screenshot: out/check-vertical-groups.png");
+                    }
+                    catch (Exception ex) { Line("vertical group screenshot failed: " + ex.Message); }
+                }
+                finally
+                {
+                    _w._settings.Layout = LayoutMode.Compact;
+                    _w._settings.VerticalExpanded = false;
+                    _w.ApplyLayout();
+                }
+
+                // 首组前面的边界：独立标签可以保持在组外。
+                var frontProbe = new TabModel
+                {
+                    Title = "front probe",
+                    Url = "about:blank",
+                    IsStartPage = false
+                };
+                _w._tabs.Add(frontProbe);
+                _w.RebuildTabStrip();
+                var firstGroupMember = _w._tabs.First(t => t.GroupId == group.Id);
+                _w.MoveTabToBoundary(frontProbe, firstGroupMember);
+                Check("flat tab can sit before the leading group",
+                    string.IsNullOrEmpty(frontProbe.GroupId) &&
+                    _w._tabs.IndexOf(frontProbe) == 0 &&
+                    _w._tabs.IndexOf(firstGroupMember) > 0,
+                    "front=" + _w._tabs.IndexOf(frontProbe) +
+                    " groupFirst=" + _w._tabs.IndexOf(firstGroupMember));
+                _w._tabs.Remove(frontProbe);
+                _w.RebuildTabStrip();
+
+                // 拖到分组头 = 移入并排到同组末尾。
+                var flat = new TabModel
+                {
+                    Title = "drop target probe",
+                    Url = "about:blank",
+                    IsStartPage = false
+                };
+                _w._tabs.Add(flat);
+                _w.RebuildTabStrip();
+                _w.MoveTabIntoGroup(flat, group);
+                var lastOther = _w._tabs
+                    .Where(t => t.GroupId == group.Id && t != flat).LastOrDefault();
+                var flatIndex = _w._tabs.IndexOf(flat);
+                var lastIndex = lastOther == null ? -1 : _w._tabs.IndexOf(lastOther);
+                Check("tab dropped on the header joins the group",
+                    flat.GroupId == group.Id, "groupId=" + flat.GroupId);
+                Check("dropped tab is appended after existing group tabs",
+                    flatIndex == lastIndex + 1,
+                    "flat=" + flatIndex + " last=" + lastIndex);
+
+                // 收起的分组头收到标签后自动展开，避免"拖进去了却看不见"。
+                group.IsCollapsed = true;
+                _w.RebuildTabStrip();
+                _w.MoveTabIntoGroup(extra, group);
+                Check("moving across groups expands the target group",
+                    !group.IsCollapsed && extra.GroupId == group.Id,
+                    "collapsed=" + group.IsCollapsed + " groupId=" + extra.GroupId);
+
+                // 同组拖放只排序，不改 GroupId。
+                _w.ReorderTabs(extra, flat);
+                Check("same-group drop reorders without changing membership",
+                    extra.GroupId == group.Id && flat.GroupId == group.Id &&
+                    _w._tabs.IndexOf(extra) < _w._tabs.IndexOf(flat),
+                    "extra=" + _w._tabs.IndexOf(extra) +
+                    " flat=" + _w._tabs.IndexOf(flat));
+
+                // 跨组拖放不改归属（要移入分组请拖分组头）。
+                var flat2 = new TabModel
+                {
+                    Title = "cross group probe",
+                    Url = "about:blank",
+                    IsStartPage = false
+                };
+                _w._tabs.Add(flat2);
+                _w.RebuildTabStrip();
+                var beforeIndex = _w._tabs.IndexOf(flat);
+                _w.ReorderTabs(flat, flat2);
+                Check("dropping across group boundaries keeps membership",
+                    flat.GroupId == group.Id && string.IsNullOrEmpty(flat2.GroupId),
+                    "flat=" + flat.GroupId + " flat2=" + flat2.GroupId);
+                Check("cross-group drop is a no-op for order",
+                    _w._tabs.IndexOf(flat) == beforeIndex,
+                    "before=" + beforeIndex + " after=" + _w._tabs.IndexOf(flat));
+
+                // 分组之后新增的平铺标签必须渲染在分组之后，不能被塞回分组前面。
+                var tail = new TabModel
+                {
+                    Title = "tail probe",
+                    Url = "about:blank",
+                    IsStartPage = false
+                };
+                _w._tabs.Add(tail);
+                _w.RebuildTabStrip();
+                var tailTabs = TabItems(_w._tabStripPanel).OfType<Border>()
+                    .Where(b => b.Tag is TabModel).ToList();
+                Check("flat tab after a group renders last",
+                    tailTabs.Count > 0 && ReferenceEquals(tailTabs.Last().Tag, tail),
+                    "last=" + (tailTabs.Count == 0 ? "none"
+                        : ((TabModel)tailTabs.Last().Tag).Title));
+                _w._tabs.Remove(tail);
+                _w.RebuildTabStrip();
+
+                // ---- 批次 2：成员附近插入 / 拖出 / 空白落点 ----
+                var atProbe = new TabModel
+                {
+                    Title = "at probe",
+                    Url = "about:blank",
+                    IsStartPage = false
+                };
+                _w._tabs.Add(atProbe);
+                _w.RebuildTabStrip();
+                _w.MoveTabIntoGroupAt(atProbe, group, flat, false);
+                Check("member drop inserts before the target",
+                    atProbe.GroupId == group.Id &&
+                    _w._tabs.IndexOf(atProbe) == _w._tabs.IndexOf(flat) - 1,
+                    "at=" + _w._tabs.IndexOf(atProbe) +
+                    " flat=" + _w._tabs.IndexOf(flat));
+                _w.MoveTabIntoGroupAt(atProbe, group, flat, true);
+                Check("member drop after the target reorders within the group",
+                    atProbe.GroupId == group.Id &&
+                    _w._tabs.IndexOf(atProbe) == _w._tabs.IndexOf(flat) + 1,
+                    "at=" + _w._tabs.IndexOf(atProbe) +
+                    " flat=" + _w._tabs.IndexOf(flat));
+                _w._tabs.Remove(atProbe);
+                _w.RebuildTabStrip();
+
+                var outProbe = new TabModel
+                {
+                    Title = "out probe",
+                    Url = "about:blank",
+                    IsStartPage = false
+                };
+                _w._tabs.Add(outProbe);
+                _w.MoveTabIntoGroup(outProbe, group);
+                _w.MoveTabOutOfGroupAt(outProbe, flat2, false);
+                Check("drop on a flat tab removes the tab from the group",
+                    string.IsNullOrEmpty(outProbe.GroupId) &&
+                    _w._tabs.IndexOf(outProbe) == _w._tabs.IndexOf(flat2) - 1,
+                    "group=" + outProbe.GroupId +
+                    " out=" + _w._tabs.IndexOf(outProbe) +
+                    " flat2=" + _w._tabs.IndexOf(flat2));
+                _w._tabs.Remove(outProbe);
+                _w.RebuildTabStrip();
+
+                _w.DropTabOnBlank(flat);
+                Check("drop on blank space removes the tab and moves it last",
+                    string.IsNullOrEmpty(flat.GroupId) && _w._tabs.Last() == flat,
+                    "group=" + flat.GroupId + " last=" +
+                    (_w._tabs.Last() == flat));
+
+                // ---- 整组拖动：成员区段整体搬移，前后目标都保持连续 ----
+                var moveProbe = new TabModel
+                {
+                    Title = "move probe",
+                    Url = "about:blank",
+                    IsStartPage = false
+                };
+                _w._tabs.Insert(0, moveProbe);
+                _w.RebuildTabStrip();
+                _w.MoveGroupAt(group, moveProbe, false);
+                var members = _w._tabs.Where(t => t.GroupId == group.Id).ToList();
+                Check("group moves before a flat target as one block",
+                    members.Count > 0 &&
+                    _w._tabs.IndexOf(members.Last()) < _w._tabs.IndexOf(moveProbe),
+                    "lastMember=" +
+                    (members.Count == 0 ? -1 : _w._tabs.IndexOf(members.Last())) +
+                    " probe=" + _w._tabs.IndexOf(moveProbe));
+                _w.MoveGroupAt(group, moveProbe, true);
+                Check("group moves after a flat target as one block",
+                    members.Count > 0 &&
+                    _w._tabs.IndexOf(members.First()) > _w._tabs.IndexOf(moveProbe),
+                    "firstMember=" +
+                    (members.Count == 0 ? -1 : _w._tabs.IndexOf(members.First())) +
+                    " probe=" + _w._tabs.IndexOf(moveProbe));
+                _w._tabs.Remove(moveProbe);
+                _w.RebuildTabStrip();
+                _w.MoveGroupToEnd(group);
+                Check("group can be moved to the end",
+                    _w._tabs.Last().GroupId == group.Id,
+                    "lastGroup=" + _w._tabs.Last().GroupId);
+
+                // 组内成员拖到组前，保持平铺，不进入原组。
+                _w.MoveTabToBoundary(extra, originalTab);
+                Check("group member can be dragged out to the group front",
+                    string.IsNullOrEmpty(extra.GroupId) &&
+                    _w._tabs.IndexOf(extra) < _w._tabs.IndexOf(originalTab),
+                    "extra=" + _w._tabs.IndexOf(extra) +
+                    " original=" + _w._tabs.IndexOf(originalTab));
+
                 _w.DisbandGroup(group);
-                Check("disband removes the group", _w._groups.Count == 0,
+                _w.DisbandGroup(group2);
+                Check("disband removes the groups", _w._groups.Count == 0,
                     "groups=" + _w._groups.Count);
                 Check("disband restores flat tabs",
                     _w._tabs.All(t => string.IsNullOrEmpty(t.GroupId)),
                     "grouped=" + _w._tabs.Count(t => !string.IsNullOrEmpty(t.GroupId)));
-                Check("group header disappears", _w._tabStripPanel != null &&
-                    !_w._tabStripPanel.Children.OfType<Border>().Any(b => Equals(b.Tag, "group")),
-                    "children=" + (_w._tabStripPanel == null ? -1 : _w._tabStripPanel.Children.Count));
+                Check("group headers disappear", groupHeaders().Count == 0,
+                    "children=" + (_w._tabStripPanel == null ? -1
+                        : _w._tabStripPanel.Children.Count));
+
+                // 清掉探针标签，后面的用例继续用最开始那个标签。
+                _w._tabs.Remove(extra);
+                _w._tabs.Remove(flat);
+                _w._tabs.Remove(flat2);
+                _w.RebuildTabStrip();
+
+                // ---- 重叠建组 ----
+                Check("overlap zone is the center 40% (horizontal)",
+                    MainWindow.IsGroupOverlap(new Point(50, 0), 100, 30, false) &&
+                    !MainWindow.IsGroupOverlap(new Point(10, 0), 100, 30, false) &&
+                    !MainWindow.IsGroupOverlap(new Point(90, 0), 100, 30, false),
+                    "center/left/right");
+                Check("vertical overlap uses the Y axis",
+                    MainWindow.IsGroupOverlap(new Point(0, 15), 30, 30, true) &&
+                    !MainWindow.IsGroupOverlap(new Point(0, 2), 30, 30, true),
+                    "center/top");
+
+                var pairA = new TabModel
+                {
+                    Title = "pair A",
+                    Url = "about:blank",
+                    IsStartPage = false
+                };
+                var pairMid = new TabModel
+                {
+                    Title = "pair middle",
+                    Url = "about:blank",
+                    IsStartPage = false
+                };
+                var pairB = new TabModel
+                {
+                    Title = "pair B",
+                    Url = "about:blank",
+                    IsStartPage = false
+                };
+                _w._tabs.Add(pairA);
+                _w._tabs.Add(pairMid);
+                _w._tabs.Add(pairB);
+                _w.RebuildTabStrip();
+                var groupsBefore = _w._groups.Count;
+                _w.CreateGroupFromPair(pairB, pairA);
+                var pairGroup = _w._groups.LastOrDefault();
+                Check("overlapping flat tabs create one new group",
+                    pairGroup != null && pairA.GroupId == pairGroup.Id &&
+                    pairB.GroupId == pairGroup.Id &&
+                    _w._groups.Count == groupsBefore + 1,
+                    "groups=" + _w._groups.Count);
+                Check("pair group is contiguous and keeps pair order",
+                    _w._tabs.IndexOf(pairA) + 1 == _w._tabs.IndexOf(pairB),
+                    "a=" + _w._tabs.IndexOf(pairA) +
+                    " b=" + _w._tabs.IndexOf(pairB));
+                _w.DisbandGroup(pairGroup);
+                _w._tabs.Remove(pairA);
+                _w._tabs.Remove(pairB);
+                _w._tabs.Remove(pairMid);
+                _w.RebuildTabStrip();
+
+                // 组内标签拖出来直接和新的平铺标签重叠：一步建新组。
+                var gKeep = new TabModel
+                {
+                    Title = "old keep",
+                    Url = "about:blank",
+                    IsStartPage = false
+                };
+                var gSource = new TabModel
+                {
+                    Title = "old move",
+                    Url = "about:blank",
+                    IsStartPage = false
+                };
+                var gTarget = new TabModel
+                {
+                    Title = "new mate",
+                    Url = "about:blank",
+                    IsStartPage = false
+                };
+                _w._tabs.Add(gKeep);
+                _w._tabs.Add(gSource);
+                _w._tabs.Add(gTarget);
+                _w.CreateGroupForTab(gKeep);
+                var oldGroup = _w._groups.Last();
+                _w.MoveTabIntoGroup(gSource, oldGroup);
+                _w.CreateGroupFromPair(gSource, gTarget);
+                var newGroup = _w._groups.Last();
+                Check("grouped tab overlapping a flat tab creates a new group in one step",
+                    newGroup != null && newGroup.Id != oldGroup.Id &&
+                    gSource.GroupId == newGroup.Id &&
+                    gTarget.GroupId == newGroup.Id,
+                    "new=" + (newGroup == null ? "null" : newGroup.Name));
+                Check("old group keeps its other member after the move",
+                    gKeep.GroupId == oldGroup.Id,
+                    "keep=" + gKeep.GroupId);
+                _w.DisbandGroup(oldGroup);
+                _w.DisbandGroup(newGroup);
+                _w._tabs.Remove(gKeep);
+                _w._tabs.Remove(gSource);
+                _w._tabs.Remove(gTarget);
+                _w.RebuildTabStrip();
+
+                // 关闭分组 = 关闭全部成员，和“解散”保留标签不同。
+                _w.NewTab();
+                var closeTab = _w._active;
+                _w.CreateGroupForTab(closeTab);
+                var closeGroup = _w._groups.LastOrDefault();
+                _w.CloseGroup(closeGroup);
+                Check("closing a group closes its tabs and removes the group",
+                    closeGroup != null &&
+                    !_w._tabs.Any(t => ReferenceEquals(t, closeTab)) &&
+                    _w._groups.All(g => g.Id != closeGroup.Id),
+                    "tabs=" + _w._tabs.Count + " groups=" + _w._groups.Count);
 
                 // ---- 上一批的常驻样式回归 ----
                 var resident = _w._tabs[0];
                 resident.Resident = true;
                 _w.RebuildTabStrip();
-                var rchip = _w._tabStripPanel == null ? null
-                    : _w._tabStripPanel.Children.OfType<Border>()
-                        .FirstOrDefault(b => ReferenceEquals(b.Tag, resident));
+                var rchip = TabItems(_w._tabStripPanel).OfType<Border>()
+                    .FirstOrDefault(b => ReferenceEquals(b.Tag, resident));
                 Check("resident tab has a visible marker",
                     rchip != null && rchip.BorderThickness.Left > 0,
                     rchip == null ? "no chip" : "left=" + rchip.BorderThickness.Left);
@@ -605,6 +1226,9 @@ namespace NanoEdge
                 bool f11Handled = false;
                 _w.OnThreadPreprocessMessage(ref f11, ref f11Handled);
                 Check("F11 is still a host shortcut", f11Handled, "handled=" + f11Handled);
+                // F11 检查会切进沉浸式；后面的 Popup/纵向布局断言要先回到正常外壳。
+                _w._immersive = false;
+                _w.ApplyLayout();
 
                 // ---- B1：内存面板 Popup 有 Owner、点外部能关 ----
                 _w.OpenMemoryPanel(true);
@@ -622,18 +1246,59 @@ namespace NanoEdge
                 _w._settings.VerticalExpanded = false;
                 _w.ApplyLayout();
                 _w.RebuildPopup();
-                var railFirst = _w._railPanel.Children.Count > 0
-                    ? _w._railPanel.Children[0] as FrameworkElement : null;
-                var popFirst = _w._popupPanel.Children.Count > 0
-                    ? _w._popupPanel.Children[0] as FrameworkElement : null;
+                // 弹层顶部现在有「标签页 + 图钉」标题行；比较标签顺序时要跳过它。
+                var railFirst = TabItems(_w._railPanel)
+                    .FirstOrDefault(f => f.Tag is TabModel);
+                var popFirst = TabItems(_w._popupPanel)
+                    .FirstOrDefault(f => f.Tag is TabModel);
                 Check("vertical popup starts at the same tab as the rail",
-                    railFirst != null && popFirst != null && railFirst.Tag is TabModel &&
+                    railFirst != null && popFirst != null &&
                     ReferenceEquals(railFirst.Tag, popFirst.Tag),
-                    "rail=" + (railFirst == null ? "null" : railFirst.Tag.ToString()) +
-                    " popup=" + (popFirst == null ? "null" : popFirst.Tag.ToString()));
-                Check("header row no longer offsets the popup",
-                    popFirst != null && popFirst.Tag is TabModel,
-                    popFirst == null ? "no item" : "tag=" + popFirst.Tag);
+                    "rail=" + (railFirst == null ? "null" : ((TabModel)railFirst.Tag).Title) +
+                    " popup=" + (popFirst == null ? "null" : ((TabModel)popFirst.Tag).Title));
+                var popupHeader = _w._popupContent == null || !(_w._popupContent.Child is Grid pg)
+                    ? null : pg.Children.OfType<Grid>()
+                        .FirstOrDefault(g => Grid.GetRow(g) == 0);
+                Check("rail and popup keep the same fixed header spacer",
+                    _w._railHeader != null && _w._railHeader.Height == 22 &&
+                    popupHeader != null && popupHeader.Height == 22,
+                    "railHeader=" + (_w._railHeader == null ? "null"
+                        : _w._railHeader.Height.ToString()) +
+                    " popupHeader=" + (popupHeader == null ? "null"
+                        : popupHeader.Height.ToString()));
+                var popPin = _w._popupPin;
+                Check("vertical popup has a floating pin button", popPin != null,
+                    popPin == null ? "no pin" : "pin=" + popPin.Tag);
+                var expandedBefore = _w._settings.VerticalExpanded;
+                _w.ToggleVerticalPin();
+                Check("pin toggles vertical expanded",
+                    _w._settings.VerticalExpanded != expandedBefore,
+                    "expanded=" + _w._settings.VerticalExpanded);
+                var pinSlash = _w._railPin == null || !(_w._railPin.Content is Grid pinGrid)
+                    ? null : pinGrid.Children.OfType<System.Windows.Shapes.Line>()
+                        .FirstOrDefault(t => Equals(t.Tag, "pin-slash"));
+                Check("fixed rail shows the pin-with-slash state",
+                    _w._railHeader != null &&
+                    _w._railHeader.Visibility == Visibility.Visible &&
+                    _w._railPin != null && _w._railPin.Visibility == Visibility.Visible &&
+                    pinSlash != null && pinSlash.Visibility == Visibility.Visible,
+                    "header=" + (_w._railHeader == null ? "null"
+                        : _w._railHeader.Visibility.ToString()) +
+                    " pin=" + (_w._railPin == null ? "null" : _w._railPin.Visibility.ToString()) +
+                    " slash=" + (pinSlash == null ? "null" : pinSlash.Visibility.ToString()));
+                _w.ToggleVerticalPin();
+                Check("pin restores hover mode",
+                    _w._settings.VerticalExpanded == expandedBefore,
+                    "expanded=" + _w._settings.VerticalExpanded);
+                Check("hover mode keeps the header spacer but hides the pin",
+                    _w._railHeader != null &&
+                    _w._railHeader.Visibility == Visibility.Visible &&
+                    _w._railPin != null && _w._railPin.Visibility == Visibility.Collapsed &&
+                    pinSlash != null && pinSlash.Visibility == Visibility.Collapsed,
+                    "header=" + (_w._railHeader == null ? "null"
+                        : _w._railHeader.Visibility.ToString()) +
+                    " pin=" + (_w._railPin == null ? "null" : _w._railPin.Visibility.ToString()) +
+                    " slash=" + (pinSlash == null ? "null" : pinSlash.Visibility.ToString()));
                 Check("popup panel has no extra outer margin",
                     _w._popupPanel != null && _w._popupPanel.Margin.Equals(new Thickness(0)),
                     _w._popupPanel == null ? "null" : _w._popupPanel.Margin.ToString());
@@ -1086,6 +1751,14 @@ namespace NanoEdge
                     mwSrc.Contains("IsSaneWindowCoord(Left)") &&
                     mwSrc.Contains("IsSaneWindowCoord(Top)"),
                     "guarded=" + mwSrc.Contains("IsSaneWindowCoord(Left)"));
+                Check("maximized/minimized states do not persist restore size",
+                    MainWindow.CanPersistNormalGeometry(WindowState.Normal) &&
+                    !MainWindow.CanPersistNormalGeometry(WindowState.Maximized) &&
+                    !MainWindow.CanPersistNormalGeometry(WindowState.Minimized),
+                    "normal/max/min expected true/false/false");
+                Check("SaveWindowBounds uses the state guard",
+                    mwSrc.Contains("CanPersistNormalGeometry(WindowState)"),
+                    "call=" + mwSrc.Contains("CanPersistNormalGeometry(WindowState)"));
                 Check("current session has no poisoned window coordinates",
                     double.IsNaN(_w._settings.WindowLeft) ||
                     MainWindow.IsSaneWindowCoord(_w._settings.WindowLeft),

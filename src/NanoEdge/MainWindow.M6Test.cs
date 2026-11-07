@@ -140,7 +140,7 @@ namespace NanoEdge
                 var tabsBefore = _w._tabs.Count;
                 try
                 {
-                    var startInfo = new ProcessStartInfo(exePath, ipcUrl)
+                    var startInfo = new ProcessStartInfo(exePath, "--test-mutex " + ipcUrl)
                     {
                         UseShellExecute = false,
                         CreateNoWindow = true
@@ -162,7 +162,7 @@ namespace NanoEdge
 
                     // SPEC 7.9：`--open-url=<url>` 形式也要能被第二实例转交。
                     var ipcUrl2 = "http://127.0.0.1:" + _port + "/ipc-prefixed";
-                    var second2 = Process.Start(new ProcessStartInfo(exePath, "--open-url=" + ipcUrl2)
+                    var second2 = Process.Start(new ProcessStartInfo(exePath, "--test-mutex --open-url=" + ipcUrl2)
                     {
                         UseShellExecute = false,
                         CreateNoWindow = true
