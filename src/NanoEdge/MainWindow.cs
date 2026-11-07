@@ -50,6 +50,7 @@ namespace NanoEdge
         private bool _groupDragInProgress;
         private DateTime _lastGroupDragUtc = DateTime.MinValue;
         private Grid _navigationRow;
+        private FrameworkElement _windowButtons;
         private Button _tabStripPrev, _tabStripNext;
         private ScrollViewer _railScroller, _popupScroller;
         private ScrollViewer _dragScrollVerticalTarget;
@@ -60,7 +61,14 @@ namespace NanoEdge
         private Point _lastChromeDownPoint;
         private bool _chromeDragArmed;
         private TabModel _secretReturnTab;   // Alt+` 从密封标签切回的那个普通标签
+        // _immersive 是「真全屏」的唯一状态位：外壳隐藏、A3 钩子让路、
+        // 几何不落盘都由它决定。_fullscreenBusy 只挡进出全屏途中的中间几何。
         private bool _immersive;
+        private bool _fullscreenBusy;
+        private WindowState _fsPrevState;
+        private Rect _fsPrevBounds;
+        private bool _fsPrevTopmost;
+        private ResizeMode _fsPrevResizeMode;
         private bool _shellReady;
         private string _screenshotPath;
         private bool _noPersist;
@@ -96,6 +104,7 @@ namespace NanoEdge
             _args = args;
             _screenshotPath = ArgValue("--screenshot");
             _noPersist = !string.IsNullOrEmpty(_screenshotPath) || HasArg("--menupreview") ||
+                         HasArg("--fullscreen") ||
                          HasArg("--memtest") || HasArg("--navtest") || HasArg("--m3ctest") ||
                          HasArg("--m4test") || HasArg("--m5test") || HasArg("--m6test") ||
                          HasArg("--m6btest") || HasArg("--m7test") || HasArg("--m8test") ||
@@ -217,16 +226,27 @@ namespace NanoEdge
                 SaveWindowBounds();
                 if (_memoryPanel != null && _memoryPanel.IsOpen) _memoryPanel.Reposition();
             };
-            Activated += (s, e) => { if (_governor != null) _governor.NotifyActivated(); };
+            Activated += (s, e) =>
+            {
+                if (_governor != null) _governor.NotifyActivated();
+                // 真全屏靠临时 Topmost 盖住任务栏；切回来时重新压上去。
+                if (_immersive && !_fullscreenBusy) Topmost = true;
+            };
             Deactivated += (s, e) =>
             {
                 if (_governor != null) _governor.NotifyDeactivated();
                 // 切到别的软件窗口，面板不该还浮在屏幕上。
                 if (_memoryPanel != null && _memoryPanel.IsOpen) _memoryPanel.Close();
+                // 失焦时撤掉 Topmost，别让全屏窗口一直盖着别的软件。
+                if (_immersive && !_fullscreenBusy) Topmost = false;
             };
             StateChanged += (s, e) =>
             {
                 if (_governor != null) _governor.NotifyMinimized(WindowState == WindowState.Minimized);
+                // 系统快捷键（Win+Up 等）在全屏里强行最大化时，退出全屏回到
+                // 进入前的状态，别留下「外壳隐藏 + 最大化」这种半截状态。
+                if (_immersive && !_fullscreenBusy && WindowState == WindowState.Maximized)
+                    ExitFullscreen();
                 if (WindowState == WindowState.Minimized && _memoryPanel != null)
                     _memoryPanel.Close();
             };
@@ -597,7 +617,7 @@ namespace NanoEdge
             if (HasArg("--memtest") || HasArg("--navtest") || HasArg("--m3ctest") ||
                 HasArg("--m4test") || HasArg("--m5test") || HasArg("--m6test") ||
                 HasArg("--m6btest") || HasArg("--m7test") || HasArg("--m8test") ||
-                HasArg("--fixtest") || HasArg("--menupreview"))
+                HasArg("--fixtest") || HasArg("--menupreview") || HasArg("--fullscreen"))
             {
                 NewTab();
                 return;
@@ -726,6 +746,9 @@ namespace NanoEdge
         private void SaveWindowBounds()
         {
             if (_settings == null || _noPersist) return;
+            // 真全屏的 rcMonitor 矩形不是用户的窗口尺寸，进出途中的中间状态
+            // 也不是；一律不落盘，否则下次启动会变成一整块屏幕的普通窗口。
+            if (_immersive || _fullscreenBusy) return;
             // 最大化/最小化时 ActualWidth/Height 不是用户设定的还原尺寸，
             // 写进去会把下次启动的"还原大小"永久记成满屏矩形。
             if (CanPersistNormalGeometry(WindowState))
@@ -835,9 +858,25 @@ namespace NanoEdge
                 grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(34) });
                 grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(40) });
 
+                // A1：三按钮和标签条同处第一行。用两列 Grid 而不是把按钮直接
+                // 叠在标签条上，标签条的 ScrollViewer 才不会延伸到按钮底下，
+                // 溢出箭头和「+」也仍留在标签区里。
+                var tabRow = new Grid
+                {
+                    Tag = "standard-tab-row",
+                    Background = new SolidColorBrush(Colors.Transparent)
+                };
+                tabRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                tabRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(108) });
                 var tabStripHost = MakeTabStrip();
-                Grid.SetRow(tabStripHost, 0);
-                grid.Children.Add(tabStripHost);
+                Grid.SetColumn(tabStripHost, 0);
+                tabRow.Children.Add(tabStripHost);
+                var windowButtons = MakeWindowButtons();
+                Grid.SetColumn(windowButtons, 1);
+                tabRow.Children.Add(windowButtons);
+                Grid.SetRow(tabRow, 0);
+                grid.Children.Add(tabRow);
+
                 var bar = BuildNavigationRow();
                 Grid.SetRow(bar, 1);
                 grid.Children.Add(bar);
@@ -854,7 +893,8 @@ namespace NanoEdge
 
         private FrameworkElement BuildNavigationRow()
         {
-            var bar = new Grid { Height = _settings.Layout == LayoutMode.Standard ? 40 : ChromeHeight };
+            var standard = _settings.Layout == LayoutMode.Standard;
+            var bar = new Grid { Height = standard ? 40 : ChromeHeight };
             _navigationRow = bar;
             bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(34) });   // layout
             bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(90) });  // nav
@@ -867,7 +907,9 @@ namespace NanoEdge
             bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(30) });  // theme
             bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(56) });  // memory
             bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(30) });  // menu
-            bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(108) }); // window
+            // A1：标准模式的窗口三按钮已搬到第一行标签行，导航栏不再留这一列。
+            if (!standard)
+                bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(108) }); // window
 
             var column = 0;
             Button layoutButton = null;
@@ -983,19 +1025,34 @@ namespace NanoEdge
             menuButton = IconButton("⋯", L.T("菜单"), () => ShowMainMenu(menuButton));
             bar.Children.Add(At(menuButton, column++));
 
-            var windowButtons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
+            if (!standard) bar.Children.Add(At(MakeWindowButtons(), column));
+
+            // 拖拽/双击统一由 BuildToolbar 的外层 grid 处理，这里只保留
+            // 命中背景，让导航行自己的空白也能被外层事件经过。
+            bar.Background = new SolidColorBrush(Colors.Transparent);
+            return bar;
+        }
+
+        // 窗口三按钮只在这里构造：紧凑/纵向落在导航栏最后一列，标准落在第一行
+        // 标签行右侧。两处共用同一套按钮，避免行为或文案走样。
+        private FrameworkElement MakeWindowButtons()
+        {
+            var windowButtons = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                HorizontalAlignment = HorizontalAlignment.Right,
+                VerticalAlignment = VerticalAlignment.Center,
+                Tag = "window-buttons",
+                Background = new SolidColorBrush(Colors.Transparent)
+            };
             windowButtons.Children.Add(IconButton("─", L.T("最小化"), () => WindowState = WindowState.Minimized));
             windowButtons.Children.Add(IconButton("□", L.T("最大化"), ToggleMaximize));
             var close = IconButton("×", L.T("关闭"), Close);
             close.MouseEnter += (s, e) => close.SetResourceReference(Button.ForegroundProperty, "DangerBrush");
             close.MouseLeave += (s, e) => close.SetResourceReference(Button.ForegroundProperty, "TextBrush");
             windowButtons.Children.Add(close);
-            bar.Children.Add(At(windowButtons, column));
-
-            // 拖拽/双击统一由 BuildToolbar 的外层 grid 处理，这里只保留
-            // 命中背景，让导航行自己的空白也能被外层事件经过。
-            bar.Background = new SolidColorBrush(Colors.Transparent);
-            return bar;
+            _windowButtons = windowButtons;
+            return windowButtons;
         }
 
         // DragMove 会打断 WPF 的点击计数，所以双击自己按时间窗和位移判断。
@@ -1092,13 +1149,46 @@ namespace NanoEdge
                 var mi = new MONITORINFO { Size = Marshal.SizeOf(typeof(MONITORINFO)) };
                 if (GetMonitorInfo(monitor, ref mi))
                 {
-                    var tl = PhysicalToDip(new Point(mi.Work.Left, mi.Work.Top), dpi);
-                    var br = PhysicalToDip(new Point(mi.Work.Right, mi.Work.Bottom), dpi);
-                    if (br.X > tl.X && br.Y > tl.Y) return new Rect(tl, br);
+                    var rect = MonitorRectFromNative(mi.Work.Left, mi.Work.Top,
+                        mi.Work.Right, mi.Work.Bottom, dpi);
+                    if (!rect.IsEmpty) return rect;
                 }
             }
             catch { }
             return SystemParameters.WorkArea;
+        }
+
+        // 原生矩形（物理像素）→ DIP。rcWork / rcMonitor 都走这里，混合 DPI、
+        // 负坐标的副屏也按同一套换算；抽成纯函数便于 --fixtest 断言。
+        internal static Rect MonitorRectFromNative(
+            int left, int top, int right, int bottom, DpiScale dpi)
+        {
+            var tl = PhysicalToDip(new Point(left, top), dpi);
+            var br = PhysicalToDip(new Point(right, bottom), dpi);
+            return br.X > tl.X && br.Y > tl.Y ? new Rect(tl, br) : Rect.Empty;
+        }
+
+        // 全屏用的整屏矩形（含任务栏区域），不是 rcWork。取「窗口当前所在屏」，
+        // 所以多显示器下按 F11 会铺满那一块屏，而不是主屏。
+        private Rect MonitorRectDip()
+        {
+            var dpi = VisualTreeHelper.GetDpi(this);
+            try
+            {
+                var hwnd = new WindowInteropHelper(this).Handle;
+                var monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                var mi = new MONITORINFO { Size = Marshal.SizeOf(typeof(MONITORINFO)) };
+                if (GetMonitorInfo(monitor, ref mi))
+                {
+                    var rect = MonitorRectFromNative(mi.Monitor.Left, mi.Monitor.Top,
+                        mi.Monitor.Right, mi.Monitor.Bottom, dpi);
+                    if (!rect.IsEmpty) return rect;
+                }
+            }
+            catch { }
+            // 拿不到显示器信息时退回主屏尺寸，至少仍是「一整块屏」而不是虚拟桌面。
+            return new Rect(0, 0, SystemParameters.PrimaryScreenWidth,
+                SystemParameters.PrimaryScreenHeight);
         }
 
         // 拖拽真正启动：超过 3px 阈值才进，单击/双击全程不进 DragMove 的模态循环。
@@ -3025,13 +3115,93 @@ namespace NanoEdge
 
         private void ToggleMaximize()
         {
+            // 全屏期间不与最大化/还原互踩：外壳已隐藏，状态由全屏状态机独占。
+            if (_immersive) return;
             WindowState = WindowState == WindowState.Maximized ? WindowState.Normal : WindowState.Maximized;
         }
 
+        // ---------- A2：F11 真全屏（按当前显示器 rcMonitor 整屏）----------
+
         private void ToggleImmersive()
         {
-            _immersive = !_immersive;
-            ApplyLayout();
+            if (_immersive) ExitFullscreen();
+            else EnterFullscreen();
+        }
+
+        // 所有浮层都是 Popup（独立 HWND），外壳 Collapsed 也盖不住它们。
+        // 顺手停掉会重新打开浮层的定时器，避免全屏里又弹出地址栏联想/内存面板。
+        private void CloseFloatingLayers()
+        {
+            foreach (var timer in new[] { _suggestTimer, _suggestCloseTimer,
+                                          _expandTimer, _collapseTimer,
+                                          _badgeHoverTimer, _badgeCloseTimer })
+                if (timer != null) timer.Stop();
+            try { if (_memoryPanel != null) _memoryPanel.Close(); } catch { }
+            try { CloseSuggestions(); } catch { }
+            if (_verticalPopup != null) _verticalPopup.IsOpen = false;
+            try { if (_toast != null) _toast.Hide(); } catch { }
+        }
+
+        private void EnterFullscreen()
+        {
+            // 必须在改 WindowState 之前取：从 Maximized 还原时窗口会先回到
+            // RestoreBounds，可能落到另一块屏，MonitorFromWindow 就选错屏了。
+            var monitor = MonitorRectDip();
+            _fsPrevState = WindowState;
+            // Maximized 时 Left/Top/Width/Height 是最大化矩形，真正要恢复的
+            // 是 RestoreBounds；否则退出全屏后会留下一个满屏的普通窗口。
+            _fsPrevBounds = WindowState == WindowState.Maximized && !RestoreBounds.IsEmpty
+                ? RestoreBounds : new Rect(Left, Top, Width, Height);
+            _fsPrevTopmost = Topmost;
+            _fsPrevResizeMode = ResizeMode;
+
+            _fullscreenBusy = true;
+            _immersive = true;   // A3 钩子与几何落盘同时让路
+            try
+            {
+                ApplyLayout();                     // 收起工具栏 / 状态栏 / rail
+                CloseFloatingLayers();             // 收起所有 Popup 浮层
+                WindowState = WindowState.Normal;  // Maximized 下改不了窗口矩形
+                ResizeMode = ResizeMode.NoResize;  // 边缘不能把全屏拖回普通尺寸
+                Width = monitor.Width;
+                Height = monitor.Height;
+                Left = monitor.Left;
+                Top = monitor.Top;
+                Topmost = true;                    // 盖住任务栏（含非自动隐藏）
+            }
+            finally { _fullscreenBusy = false; }
+        }
+
+        private void ExitFullscreen()
+        {
+            _fullscreenBusy = true;
+            try
+            {
+                Topmost = _fsPrevTopmost;
+                ResizeMode = _fsPrevResizeMode;
+                WindowState = WindowState.Normal;
+                var b = _fsPrevBounds;
+                if (b.Width > 100 && b.Height > 100 &&
+                    !double.IsNaN(b.Width) && !double.IsNaN(b.Height) &&
+                    !double.IsInfinity(b.Width) && !double.IsInfinity(b.Height))
+                {
+                    // 先把普通态矩形写回去，WPF 的 RestoreBounds 才不会被
+                    // 全屏矩形污染（之后用户点「向下还原」才拿得到原尺寸）。
+                    Width = b.Width;
+                    Height = b.Height;
+                    if (IsSaneWindowCoord(b.Left) && IsSaneWindowCoord(b.Top))
+                    {
+                        Left = b.Left;
+                        Top = b.Top;
+                    }
+                }
+                // 必须先退出全屏再还原 Maximized：A3 的 WM_GETMINMAXINFO
+                // 要重新生效，否则最大化会按 rcMonitor 撑满并盖住任务栏。
+                _immersive = false;
+                if (_fsPrevState == WindowState.Maximized) WindowState = WindowState.Maximized;
+                ApplyLayout();                     // 外壳恢复
+            }
+            finally { _fullscreenBusy = false; }
         }
 
         // ---------- tab lifecycle ----------
@@ -3613,8 +3783,11 @@ namespace NanoEdge
             if (key == Key.R && ctrl && !shift && !alt) return;
 
             // 只截带修饰键的组合和功能键，别吞掉正常打字。
+            // Esc 只在真全屏期间截：普通浏览时网页要用 Esc 关自己的弹层，
+            // 但全屏时外壳隐藏、WPF 收不到键，必须由消息泵层放行给宿主退出。
             if (modifiers == ModifierKeys.None &&
-                key != Key.F11 && key != Key.F12) return;
+                key != Key.F11 && key != Key.F12 &&
+                !(key == Key.Escape && _immersive)) return;
             if (HandleShortcut(key, modifiers, Key.None)) handled = true;
         }
 
@@ -3821,6 +3994,9 @@ namespace NanoEdge
             // A5：菜单样式预览用 Canvas 覆盖层（ContextMenu 是独立 HWND，截图抓不到）。
             if (HasArg("--menupreview")) BuildMenuPreview();
 
+            // A2：真全屏状态的截图证据；只用于 --screenshot 的预览进程。
+            if (HasArg("--fullscreen")) ToggleImmersive();
+
             if (!string.IsNullOrEmpty(_screenshotPath))
             {
                 var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(2600) };
@@ -3989,6 +4165,10 @@ namespace NanoEdge
             ref bool handled)
         {
             if (msg != WM_GETMINMAXINFO) return IntPtr.Zero;
+            // 真全屏按 rcMonitor 自己摆窗口，不走 A3 的 rcWork 最大化矩形；
+            // 否则全屏尺寸会被工作区限制，任务栏区域永远铺不满。
+            // 退出全屏时会先清 _immersive 再还原 Maximized，钩子必须及时回来。
+            if (_immersive) return IntPtr.Zero;
             var info = (MINMAXINFO)Marshal.PtrToStructure(lParam, typeof(MINMAXINFO));
             var monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
             var mi = new MONITORINFO { Size = Marshal.SizeOf(typeof(MONITORINFO)) };

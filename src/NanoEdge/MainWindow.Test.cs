@@ -1226,9 +1226,13 @@ namespace NanoEdge
                 bool f11Handled = false;
                 _w.OnThreadPreprocessMessage(ref f11, ref f11Handled);
                 Check("F11 is still a host shortcut", f11Handled, "handled=" + f11Handled);
-                // F11 检查会切进沉浸式；后面的 Popup/纵向布局断言要先回到正常外壳。
-                _w._immersive = false;
-                _w.ApplyLayout();
+                // F11 检查会真的切进全屏；后面的 Popup/纵向布局断言要先按
+                // 正常路径退出，直接把 _immersive 置 false 会把窗口留在整屏。
+                Check("F11 enters the fullscreen state", _w._immersive,
+                    "immersive=" + _w._immersive);
+                if (_w._immersive) _w.ToggleImmersive();
+                Check("F11 toggles back to the windowed state", !_w._immersive,
+                    "immersive=" + _w._immersive);
 
                 // ---- B1：内存面板 Popup 有 Owner、点外部能关 ----
                 _w.OpenMemoryPanel(true);
@@ -1513,9 +1517,9 @@ namespace NanoEdge
                 }
 
                 // 默认值必须落到真实的 UI 上，不能只改了模型。
-                // 前面 F11 断言把窗口切进了沉浸式（沉浸式下状态栏恒隐藏），
-                // 先复位，测的才是 ShowStatusBar 本身而不是 _immersive。
-                _w._immersive = false;
+                // 沉浸式下状态栏恒隐藏，测的必须是 ShowStatusBar 本身。
+                // 用正常退出路径复位，不能只翻布尔值（真全屏会改窗口几何）。
+                if (_w._immersive) _w.ToggleImmersive();
                 _w._settings.ShowStatusBar = false;
                 _w.ApplyLayout();
                 Check("status bar collapses when the setting is off",
@@ -1763,6 +1767,303 @@ namespace NanoEdge
                     double.IsNaN(_w._settings.WindowLeft) ||
                     MainWindow.IsSaneWindowCoord(_w._settings.WindowLeft),
                     "left=" + _w._settings.WindowLeft);
+
+                // ---- 批次 A / A1：标准两行把窗口三按钮搬到第一行 ----
+                // 放最后：这里会反复重建外壳、切窗口状态，不能影响前面的 UI 断言。
+                foreach (var a1Layout in new[] { LayoutMode.Compact, LayoutMode.Standard, LayoutMode.Vertical })
+                {
+                    _w._settings.Layout = a1Layout;
+                    _w.ApplyLayout();
+                    var a1Toolbar = _w._toolbarHost.Child as Grid;
+                    var a1Nav = _w._navigationRow;
+                    var a1Buttons = _w._windowButtons;
+                    var a1Parent = a1Buttons == null ? null : a1Buttons.Parent as Grid;
+                    var a1InNav = a1Parent != null && ReferenceEquals(a1Parent, a1Nav);
+                    var a1TabRow = a1Toolbar == null ? null
+                        : a1Toolbar.Children.OfType<Grid>()
+                            .FirstOrDefault(g => Equals(g.Tag, "standard-tab-row"));
+                    var a1BtnList = a1Buttons as StackPanel;
+                    var a1Btns = a1BtnList == null ? new List<Button>()
+                        : a1BtnList.Children.OfType<Button>().ToList();
+
+                    Check("three window buttons are present in " + a1Layout,
+                        a1Btns.Count == 3 &&
+                        (string)a1Btns[0].ToolTip == L.T("最小化") &&
+                        (string)a1Btns[1].ToolTip == L.T("最大化") &&
+                        (string)a1Btns[2].ToolTip == L.T("关闭"),
+                        "buttons=" + a1Btns.Count);
+                    Check("window buttons are right aligned in " + a1Layout,
+                        a1Buttons != null &&
+                        a1Buttons.HorizontalAlignment == HorizontalAlignment.Right,
+                        a1Buttons == null ? "no buttons" : "align=" + a1Buttons.HorizontalAlignment);
+                    Check("window buttons are excluded from caption drag in " + a1Layout,
+                        a1Btns.Count == 3 && MainWindow.IsChromeInteractive(a1Btns[0]),
+                        "interactive=true expected");
+
+                    if (a1Layout == LayoutMode.Standard)
+                    {
+                        Check("standard layout has two toolbar rows",
+                            a1Toolbar != null && a1Toolbar.RowDefinitions.Count == 2,
+                            a1Toolbar == null ? "no toolbar" : "rows=" + a1Toolbar.RowDefinitions.Count);
+                        Check("standard layout puts window buttons in the first row",
+                            a1TabRow != null && ReferenceEquals(a1Parent, a1TabRow) &&
+                            Grid.GetRow(a1TabRow) == 0 &&
+                            Grid.GetColumn(a1Buttons) == 1 && !a1InNav,
+                            "inTabRow=" + (a1TabRow != null && ReferenceEquals(a1Parent, a1TabRow)) +
+                            " row=" + (a1TabRow == null ? -1 : Grid.GetRow(a1TabRow)));
+                        Check("standard tab row reserves a fixed 108px button column",
+                            a1TabRow != null && a1TabRow.ColumnDefinitions.Count == 2 &&
+                            a1TabRow.ColumnDefinitions[0].Width.IsStar &&
+                            a1TabRow.ColumnDefinitions[1].Width.Value == 108,
+                            a1TabRow == null ? "no tab row" : "cols=" + a1TabRow.ColumnDefinitions.Count);
+                        Check("standard navigation row drops the window button column",
+                            a1Nav != null && a1Nav.ColumnDefinitions.Count == 6 &&
+                            !a1Nav.Children.OfType<FrameworkElement>()
+                                .Any(f => Equals(f.Tag, "window-buttons")),
+                            a1Nav == null ? "no nav" : "cols=" + a1Nav.ColumnDefinitions.Count);
+                        var a1StripHost = _w._tabStrip == null ? null
+                            : _w._tabStrip.Parent as FrameworkElement;
+                        Check("standard tab strip stays in the scrollable left column",
+                            a1TabRow != null && a1StripHost != null &&
+                            ReferenceEquals(a1StripHost.Parent, a1TabRow) &&
+                            Grid.GetColumn(a1StripHost) == 0 &&
+                            _w._tabStrip.HorizontalScrollBarVisibility == ScrollBarVisibility.Hidden &&
+                            _w._tabStrip.VerticalScrollBarVisibility == ScrollBarVisibility.Disabled,
+                            a1StripHost == null ? "no strip" : "col=" + Grid.GetColumn(a1StripHost));
+                        Check("standard tab row blank area still drags the window",
+                            a1TabRow != null && a1TabRow.Background != null &&
+                            !MainWindow.IsChromeInteractive(a1TabRow),
+                            a1TabRow == null ? "no tab row" : "bg=" + a1TabRow.Background);
+                        var a1StripKids = _w._tabStripPanel == null ? new List<UIElement>()
+                            : _w._tabStripPanel.Children.Cast<UIElement>().ToList();
+                        Check("standard layout keeps + right after the last tab",
+                            a1StripKids.Count >= 2 &&
+                            a1StripKids[a1StripKids.Count - 1] is Button &&
+                            Equals(((FrameworkElement)a1StripKids[a1StripKids.Count - 1]).Tag, "newtab") &&
+                            ((FrameworkElement)a1StripKids[a1StripKids.Count - 2]).Tag is TabModel,
+                            "items=" + a1StripKids.Count);
+                        Check("standard layout keeps the scroll chevrons",
+                            _w._tabStripPrev != null && _w._tabStripNext != null,
+                            "prev=" + (_w._tabStripPrev != null) + " next=" + (_w._tabStripNext != null));
+                    }
+                    else
+                    {
+                        Check(a1Layout + " layout keeps window buttons in the navigation row",
+                            a1InNav && Grid.GetColumn(a1Buttons) == 7 &&
+                            a1Nav.ColumnDefinitions.Count == 8,
+                            "inNav=" + a1InNav + " cols=" +
+                            (a1Nav == null ? -1 : a1Nav.ColumnDefinitions.Count));
+                        Check(a1Layout + " layout has no extra tab row",
+                            a1TabRow == null && a1Toolbar != null &&
+                            a1Toolbar.RowDefinitions.Count == 1,
+                            a1Toolbar == null ? "no toolbar" : "rows=" + a1Toolbar.RowDefinitions.Count);
+                    }
+                }
+
+                // 最大化下重建外壳，按钮仍由 Grid 列定位（不依赖写死的屏幕坐标）。
+                _w.WindowState = WindowState.Maximized;
+                await Task.Delay(250);
+                _w._settings.Layout = LayoutMode.Standard;
+                _w.ApplyLayout();
+                var a1MaxParent = _w._windowButtons == null ? null : _w._windowButtons.Parent as Grid;
+                Check("standard window buttons stay in row 0 when maximized",
+                    a1MaxParent != null && Equals(a1MaxParent.Tag, "standard-tab-row") &&
+                    Grid.GetRow(a1MaxParent) == 0 &&
+                    Grid.GetColumn(_w._windowButtons) == 1,
+                    "parent=" + (a1MaxParent == null ? "null" : (string)a1MaxParent.Tag));
+                _w.WindowState = WindowState.Normal;
+                _w._settings.Layout = LayoutMode.Compact;
+                _w.ApplyLayout();
+
+                // ---- 批次 A / A2：F11 真全屏状态机 ----
+                var mon100 = MainWindow.MonitorRectFromNative(0, 0, 1920, 1080, new DpiScale(1, 1));
+                Check("monitor rect is unchanged at 100% DPI",
+                    mon100.Width == 1920 && mon100.Height == 1080, "rect=" + mon100);
+                var mon125 = MainWindow.MonitorRectFromNative(0, 0, 2400, 1350, new DpiScale(1.25, 1.25));
+                Check("monitor rect converts to DIP at 125%",
+                    Math.Abs(mon125.Width - 1920) < 0.01 && Math.Abs(mon125.Height - 1080) < 0.01,
+                    "rect=" + mon125);
+                var mon150 = MainWindow.MonitorRectFromNative(-3840, -300, 0, 1860,
+                    new DpiScale(1.5, 1.5));
+                Check("mixed-DPI secondary monitor keeps its negative origin",
+                    Math.Abs(mon150.Left - (-2560)) < 0.01 &&
+                    Math.Abs(mon150.Top - (-200)) < 0.01 &&
+                    Math.Abs(mon150.Width - 2560) < 0.01 &&
+                    Math.Abs(mon150.Height - 1440) < 0.01,
+                    "rect=" + mon150);
+                Check("degenerate monitor rect is rejected",
+                    MainWindow.MonitorRectFromNative(10, 10, 10, 10, new DpiScale(1, 1)).IsEmpty,
+                    "empty expected");
+
+                var a2Monitor = _w.MonitorRectDip();
+                var a2Work = _w.WorkAreaDip();
+                Check("fullscreen rect is the whole monitor, not the work area",
+                    !a2Monitor.IsEmpty && a2Monitor.Width >= a2Work.Width - 1 &&
+                    a2Monitor.Height >= a2Work.Height - 1,
+                    "monitor=" + a2Monitor + " work=" + a2Work);
+
+                // Esc 平时必须留给网页；只有全屏期间才由宿主从消息泵层截下。
+                var a2Esc = KeyMsg(Key.Escape);
+                bool a2EscWindowed = false;
+                _w.OnThreadPreprocessMessage(ref a2Esc, ref a2EscWindowed);
+                Check("Escape is not swallowed while windowed", !a2EscWindowed,
+                    "handled=" + a2EscWindowed);
+
+                _w.WindowState = WindowState.Normal;
+                await Task.Delay(200);
+                var a2Before = new Rect(_w.Left, _w.Top, _w.Width, _w.Height);
+                var a2Topmost = _w.Topmost;
+                var a2Resize = _w.ResizeMode;
+                _w.OpenMemoryPanel(true);
+                _w._verticalPopup.IsOpen = true;
+                _w.ToggleImmersive();
+                await Task.Delay(250);
+
+                Check("F11 enters the true fullscreen state",
+                    _w._immersive && _w.WindowState == WindowState.Normal,
+                    "immersive=" + _w._immersive + " state=" + _w.WindowState);
+                Check("fullscreen window geometry matches rcMonitor",
+                    Math.Abs(_w.Width - a2Monitor.Width) < 3 &&
+                    Math.Abs(_w.Height - a2Monitor.Height) < 3 &&
+                    Math.Abs(_w.Left - a2Monitor.Left) < 3 &&
+                    Math.Abs(_w.Top - a2Monitor.Top) < 3,
+                    "window=" + _w.Left.ToString("0") + "," + _w.Top.ToString("0") + " " +
+                    _w.Width.ToString("0") + "x" + _w.Height.ToString("0") +
+                    " monitor=" + a2Monitor);
+                Check("fullscreen is topmost and not resizable",
+                    _w.Topmost && _w.ResizeMode == ResizeMode.NoResize,
+                    "topmost=" + _w.Topmost + " resize=" + _w.ResizeMode);
+                Check("fullscreen hides toolbar, status bar and rail",
+                    _w._toolbarHost.Visibility == Visibility.Collapsed &&
+                    _w._statusBar.Visibility == Visibility.Collapsed &&
+                    _w._rail.Visibility == Visibility.Collapsed &&
+                    _w._bodyGrid.ColumnDefinitions[0].Width.Value == 0,
+                    "toolbar=" + _w._toolbarHost.Visibility +
+                    " status=" + _w._statusBar.Visibility +
+                    " rail=" + _w._rail.Visibility);
+                Check("fullscreen closes every popup layer",
+                    !_w._verticalPopup.IsOpen &&
+                    (_w._memoryPanel == null || !_w._memoryPanel.IsOpen) &&
+                    (_w._suggestions == null || !_w._suggestions.IsOpen),
+                    "vertical=" + _w._verticalPopup.IsOpen +
+                    " memory=" + (_w._memoryPanel != null && _w._memoryPanel.IsOpen) +
+                    " suggest=" + (_w._suggestions != null && _w._suggestions.IsOpen));
+
+                // 真调一次钩子：全屏期间必须完全绕过 A3 的 rcWork 限制。
+                var a2Mmi = new MainWindow.MINMAXINFO();
+                var a2Hwnd = new WindowInteropHelper(_w).Handle;
+                var a2Ptr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(MainWindow.MINMAXINFO)));
+                try
+                {
+                    Marshal.StructureToPtr(a2Mmi, a2Ptr, false);
+                    bool a2HookFullscreen = false;
+                    _w.WorkAreaHook(a2Hwnd, MainWindow.WM_GETMINMAXINFO,
+                        IntPtr.Zero, a2Ptr, ref a2HookFullscreen);
+                    Check("fullscreen bypasses the A3 work-area hook", !a2HookFullscreen,
+                        "handled=" + a2HookFullscreen);
+                }
+                finally { Marshal.FreeHGlobal(a2Ptr); }
+
+                Check("fullscreen geometry is never persisted",
+                    mwSrc.Contains("if (_immersive || _fullscreenBusy) return;"),
+                    "guarded=" + mwSrc.Contains("if (_immersive || _fullscreenBusy) return;"));
+                Check("fullscreen uses rcMonitor rather than Maximized",
+                    mwSrc.Contains("mi.Monitor.Right, mi.Monitor.Bottom") &&
+                    !mwSrc.Contains("if (key == Key.F11) { WindowState = WindowState.Maximized"),
+                    "monitorRect=" + mwSrc.Contains("mi.Monitor.Right, mi.Monitor.Bottom"));
+                var a2StateInFullscreen = _w.WindowState;
+                _w.ToggleMaximize();
+                Check("maximize toggle is inert during fullscreen",
+                    _w._immersive && _w.WindowState == a2StateInFullscreen,
+                    "state=" + _w.WindowState + " immersive=" + _w._immersive);
+
+                // Esc 从消息泵层退出全屏，并还原进入前的矩形/状态。
+                var a2EscFull = KeyMsg(Key.Escape);
+                bool a2EscHandled = false;
+                _w.OnThreadPreprocessMessage(ref a2EscFull, ref a2EscHandled);
+                await Task.Delay(250);
+                Check("Escape is a host shortcut in fullscreen", a2EscHandled,
+                    "handled=" + a2EscHandled);
+                Check("Escape leaves fullscreen", !_w._immersive,
+                    "immersive=" + _w._immersive);
+                Check("exit restores the pre-fullscreen window bounds",
+                    _w.WindowState == WindowState.Normal &&
+                    Math.Abs(_w.Left - a2Before.Left) < 3 &&
+                    Math.Abs(_w.Top - a2Before.Top) < 3 &&
+                    Math.Abs(_w.Width - a2Before.Width) < 3 &&
+                    Math.Abs(_w.Height - a2Before.Height) < 3,
+                    "window=" + _w.Left.ToString("0") + "," + _w.Top.ToString("0") + " " +
+                    _w.Width.ToString("0") + "x" + _w.Height.ToString("0") +
+                    " before=" + a2Before);
+                Check("exit restores topmost and resize mode",
+                    _w.Topmost == a2Topmost && _w.ResizeMode == a2Resize,
+                    "topmost=" + _w.Topmost + " resize=" + _w.ResizeMode);
+                Check("exit restores the toolbar and status bar",
+                    _w._toolbarHost.Visibility == Visibility.Visible &&
+                    _w._statusBar.Visibility ==
+                        (_w._settings.ShowStatusBar ? Visibility.Visible : Visibility.Collapsed),
+                    "toolbar=" + _w._toolbarHost.Visibility +
+                    " status=" + _w._statusBar.Visibility);
+                bool a2HookAfter = false;
+                var a2Ptr2 = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(MainWindow.MINMAXINFO)));
+                try
+                {
+                    Marshal.StructureToPtr(new MainWindow.MINMAXINFO(), a2Ptr2, false);
+                    _w.WorkAreaHook(a2Hwnd, MainWindow.WM_GETMINMAXINFO,
+                        IntPtr.Zero, a2Ptr2, ref a2HookAfter);
+                }
+                finally { Marshal.FreeHGlobal(a2Ptr2); }
+                Check("A3 work-area hook is active again after exit", a2HookAfter,
+                    "handled=" + a2HookAfter);
+
+                // 从 Maximized 进入/退出：外壳、多显示器/DPI、A3 都不能被踩坏。
+                _w._settings.Layout = LayoutMode.Vertical;
+                _w.ApplyLayout();
+                _w.WindowState = WindowState.Maximized;
+                await Task.Delay(250);
+                var a2MaxWidth = _w.ActualWidth;
+                _w.ToggleImmersive();
+                await Task.Delay(250);
+                Check("F11 from maximized still fills the monitor",
+                    _w._immersive && Math.Abs(_w.Width - a2Monitor.Width) < 3 &&
+                    Math.Abs(_w.Height - a2Monitor.Height) < 3 &&
+                    _w._rail.Visibility == Visibility.Collapsed,
+                    "size=" + _w.Width.ToString("0") + "x" + _w.Height.ToString("0") +
+                    " rail=" + _w._rail.Visibility);
+                // 从 Maximized 进入后，用真正的 F11 消息泵路径退出（前面用的是 Esc）。
+                var a2F11Exit = KeyMsg(Key.F11);
+                bool a2F11ExitHandled = false;
+                _w.OnThreadPreprocessMessage(ref a2F11Exit, ref a2F11ExitHandled);
+                await Task.Delay(250);
+                Check("F11 also exits fullscreen from the message pump", a2F11ExitHandled,
+                    "handled=" + a2F11ExitHandled);
+                Check("exit returns to the maximized state",
+                    !_w._immersive && _w.WindowState == WindowState.Maximized &&
+                    _w._rail.Visibility == Visibility.Visible,
+                    "state=" + _w.WindowState + " immersive=" + _w._immersive +
+                    " rail=" + _w._rail.Visibility);
+                Check("restored maximize still respects the A3 work area",
+                    _w.ActualWidth <= a2Work.Width + 16 &&
+                    _w.ActualHeight <= a2Work.Height + 16,
+                    "window=" + _w.ActualWidth.ToString("0") + "x" +
+                    _w.ActualHeight.ToString("0") + " work=" + a2Work);
+                var a2Snapshot = _w._fsPrevBounds;
+                _w.WindowState = WindowState.Normal;
+                await Task.Delay(200);
+                Check("restore-down is not polluted by the fullscreen rect",
+                    a2Snapshot.Width > 100 && a2Snapshot.Height > 100 &&
+                    Math.Abs(_w.Width - a2Snapshot.Width) < 3 &&
+                    Math.Abs(_w.Height - a2Snapshot.Height) < 3 &&
+                    _w.Height < a2Monitor.Height,
+                    "snapshot=" + a2Snapshot + " now=" +
+                    _w.Width.ToString("0") + "x" + _w.Height.ToString("0"));
+                Check("maximized round trip used the pre-fullscreen restore bounds",
+                    a2MaxWidth > 0 && a2Snapshot.Width > 0 && !a2Snapshot.IsEmpty,
+                    "maxWidth=" + a2MaxWidth.ToString("0") + " snapshot=" + a2Snapshot);
+
+                _w._settings.Layout = LayoutMode.Compact;
+                _w.ApplyLayout();
+                Line("A1/A2 state machine covered by assertions; taskbar / multi-monitor / mixed-DPI feel needs manual check");
             }
 
             private static string RenderRealMenu(bool dark)

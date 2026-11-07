@@ -51,6 +51,7 @@ namespace NanoEdge
                     case "--m7test":
                     case "--m8test":
                     case "--menupreview":
+                    case "--fullscreen":
                     case "--test-mutex":
                         return true;
                 }
