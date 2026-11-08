@@ -11,7 +11,7 @@
     <AssemblyName>NanoEdge</AssemblyName>
     <RootNamespace>NanoEdge</RootNamespace>
     <!-- 版本号唯一来源：CI 用 tag 覆盖（-p:Version=x.y.z），本地构建用这里的值。 -->
-    <Version>0.1.4</Version>
+    <Version>0.1.5</Version>
     <!-- 信息版本只保留纯版本号，不拼 git 提交哈希（界面直接显示它）。 -->
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
