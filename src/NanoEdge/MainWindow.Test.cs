@@ -2287,6 +2287,385 @@ namespace NanoEdge
                         "https://pgadmin.example.com/*") &&
                     !DdlRestore.Matches("https://other.example/x",
                         "https://pgadmin.example.com/*"), "glob");
+
+                RunC6BookmarkWizardChecks();
+            }
+
+            // ---------- C6：书签导入向导 ----------
+            // 全部走临时目录；UserDataRootOverride 让发现逻辑不碰 %LOCALAPPDATA% 的真实数据。
+            // 截图方案：不新增命令行参数，直接在 fixtest 里用 RenderTargetBitmap 渲染向导卡片。
+            private void RunC6BookmarkWizardChecks()
+            {
+                var root = Root();
+                var temp = Path.Combine(Path.GetTempPath(), "nanoedge-c6");
+                if (Directory.Exists(temp)) Directory.Delete(temp, true);
+                Directory.CreateDirectory(temp);
+
+                var fixture = Path.Combine(temp, "UserData");
+                var chromeRoot = Path.Combine(fixture, "Google", "Chrome", "User Data");
+                var edgeRoot = Path.Combine(fixture, "Microsoft", "Edge", "User Data");
+                var chromiumRoot = Path.Combine(fixture, "Chromium", "User Data");
+
+                var chromeJson = "{\"roots\":{" +
+                    "\"bookmark_bar\":{\"type\":\"folder\",\"name\":\"书签栏\",\"children\":[" +
+                        "{\"type\":\"url\",\"name\":\"GitHub\",\"url\":\"https://github.com/\"}," +
+                        "{\"type\":\"url\",\"name\":\"Stack Overflow\",\"url\":\"https://stackoverflow.com/\"}," +
+                        "{\"type\":\"url\",\"name\":\"npm\",\"url\":\"https://www.npmjs.com/\"}," +
+                        "{\"type\":\"folder\",\"name\":\"开发\",\"children\":[" +
+                            "{\"type\":\"url\",\"name\":\"MDN\",\"url\":\"https://developer.mozilla.org/\"}," +
+                            "{\"type\":\"url\",\"name\":\"MDN 重复\",\"url\":\"https://developer.mozilla.org/\"}]}," +
+                        "{\"type\":\"url\",\"name\":\"空地址\",\"url\":\"\"}," +
+                        "{\"type\":\"url\",\"name\":\"脚本链接\",\"url\":\"javascript:alert(1)\"}," +
+                        "{\"type\":\"url\",\"name\":\"FTP\",\"url\":\"ftp://example.com/x\"}]}," +
+                    "\"other\":{\"type\":\"folder\",\"name\":\"其他书签\",\"children\":[" +
+                        "{\"type\":\"url\",\"name\":\"本地文件\",\"url\":\"file:///C:/tmp/readme.txt\"}]}," +
+                    "\"synced\":{\"type\":\"folder\",\"name\":\"已同步\",\"children\":[]}}}";
+                var simpleJson = "{\"roots\":{\"bookmark_bar\":{\"type\":\"folder\"," +
+                    "\"name\":\"书签栏\",\"children\":[" +
+                    "{\"type\":\"url\",\"name\":\"Example\",\"url\":\"https://example.com/\"}]}}}";
+                var compatJson = "{\"roots\":{\"bookmark_bar\":{\"type\":\"folder\"," +
+                    "\"name\":\"书签栏\",\"children\":[" +
+                    "{\"type\":\"url\",\"name\":\"Compat A\",\"url\":\"https://compat.example/a\"}," +
+                    "{\"type\":\"folder\",\"name\":\"开发\",\"children\":[" +
+                    "{\"type\":\"url\",\"name\":\"Compat B\",\"url\":\"https://compat.example/b\"}]}]}}}";
+
+                WriteFixture(Path.Combine(chromeRoot, "Default", "Bookmarks"), chromeJson);
+                WriteFixture(Path.Combine(chromeRoot, "Profile 2", "Bookmarks"), simpleJson);
+                WriteFixture(Path.Combine(chromeRoot, "Local State"),
+                    "{\"profile\":{\"info_cache\":{\"Default\":{\"name\":\"工作资料\"}," +
+                    "\"Profile 2\":{\"name\":\"\"}}}}");
+                Directory.CreateDirectory(Path.Combine(chromeRoot, "Crashpad"));   // 非 profile 目录
+                WriteFixture(Path.Combine(edgeRoot, "Profile 1", "Bookmarks"), simpleJson);
+                // Edge 的 Local State 缺失；Chromium 的 Local State 损坏、Bookmarks 是坏 JSON。
+                WriteFixture(Path.Combine(chromiumRoot, "Local State"), "not json at all");
+                WriteFixture(Path.Combine(chromiumRoot, "Default", "Bookmarks"), "{ this is not json");
+
+                var mainJson = Path.Combine(temp, "bookmarks.json");
+                var offJson = Path.Combine(temp, "bookmarks-off.json");
+                var shotJson = Path.Combine(temp, "bookmarks-shot.json");
+                var compatFile = Path.Combine(temp, "Bookmarks-compat.json");
+                File.WriteAllText(compatFile, compatJson, Encoding.UTF8);
+
+                var savedPath = BookmarkStore.FilePath;
+                var savedOverride = BookmarkStore.UserDataRootOverride;
+                var savedLang = L.Language;
+                var savedDark = Theme.IsDark;
+                try
+                {
+                    BookmarkStore.UserDataRootOverride = fixture;
+                    BookmarkStore.FilePath = mainJson;
+                    BookmarkStore.ResetForTest();
+
+                    // ---- 1. 发现：数量、排序、显示名回退、读取失败、非 profile 过滤 ----
+                    var profiles = BookmarkStore.DiscoverChromiumProfiles();
+                    Check("C6 discovery count and browser order",
+                        profiles.Count == 4 &&
+                        profiles[0].Browser == "Chrome" && profiles[0].ProfileDir == "Default" &&
+                        profiles[1].Browser == "Chrome" && profiles[1].ProfileDir == "Profile 2" &&
+                        profiles[2].Browser == "Edge" && profiles[2].ProfileDir == "Profile 1" &&
+                        profiles[3].Browser == "Chromium" && profiles[3].ProfileDir == "Default",
+                        "count=" + profiles.Count + " order=" +
+                        string.Join(" | ", profiles.Select(p => p.Browser + "/" + p.ProfileDir)));
+                    Check("C6 display name reads Local State then falls back",
+                        profiles[0].DisplayName == "工作资料" &&
+                        profiles[1].DisplayName == "Profile 2" &&
+                        profiles[2].DisplayName == "Profile 1" &&
+                        profiles[3].DisplayName == "Default",
+                        "names=" + string.Join(" | ", profiles.Select(p => p.DisplayName)));
+                    Check("C6 non-profile directories are filtered",
+                        profiles.All(p => p.ProfileDir != "Crashpad") &&
+                        profiles.All(p => File.Exists(p.FilePath)),
+                        "dirs=" + string.Join(",", profiles.Select(p => p.ProfileDir)));
+                    Check("C6 broken JSON marks the profile as read-failed",
+                        profiles[3].ReadFailed &&
+                        profiles[3].ErrorKind == ChromiumProfileError.Json &&
+                        profiles[3].Candidates.Count == 0,
+                        "kind=" + profiles[3].ErrorKind + " count=" + profiles[3].Count);
+                    Check("C6 healthy profiles have candidate counts",
+                        profiles[0].Count == 9 && profiles[1].Count == 1 && profiles[2].Count == 1,
+                        "counts=" + string.Join(",", profiles.Select(p => p.Count)));
+
+                    // ---- 2. 解析：folder 层级 / 非法 URL 可见 ----
+                    var candidates = profiles[0].Candidates;
+                    Check("C6 nested folder keeps the ' / ' hierarchy",
+                        candidates.Any(c => c.Folder == "书签栏") &&
+                        candidates.Any(c => c.Folder == "书签栏 / 开发") &&
+                        candidates.Any(c => c.Folder == "其他书签"),
+                        "folders=" + string.Join(" | ", candidates.Select(c => c.Folder).Distinct()));
+                    Check("C6 invalid urls are visible in the candidate list",
+                        candidates.Count == 9 && candidates.Count(c => !c.IsValid) == 3 &&
+                        candidates.Any(c => c.Url == "" && !c.IsValid) &&
+                        candidates.Any(c => c.Url.StartsWith("javascript:") && !c.IsValid) &&
+                        candidates.Any(c => c.Url.StartsWith("ftp:") && !c.IsValid) &&
+                        candidates.Any(c => c.Url.StartsWith("file:") && c.IsValid),
+                        "total=" + candidates.Count +
+                        " invalid=" + candidates.Count(c => !c.IsValid));
+
+                    // ---- 3. 跳过开关开/关两种预演结果（只读，不写库） ----
+                    var on = BookmarkStore.PreviewImport(candidates, true);
+                    var off = BookmarkStore.PreviewImport(candidates, false);
+                    Check("C6 preview with skip-existing ON",
+                        on.Total == 9 && on.Added == 5 && on.Skipped == 1 && on.Invalid == 3,
+                        "total=" + on.Total + " add=" + on.Added +
+                        " skip=" + on.Skipped + " invalid=" + on.Invalid);
+                    Check("C6 preview with skip-existing OFF",
+                        off.Total == 9 && off.Added == 6 && off.Skipped == 0 && off.Invalid == 3,
+                        "total=" + off.Total + " add=" + off.Added +
+                        " skip=" + off.Skipped + " invalid=" + off.Invalid);
+                    Check("C6 preview never writes the store",
+                        BookmarkStore.All().Count == 0 && !File.Exists(mainJson),
+                        "count=" + BookmarkStore.All().Count +
+                        " file=" + File.Exists(mainJson));
+
+                    // ---- 4. UI：取消不写库 ----
+                    var page = new BookmarksPage((u, n) => { }, m => { });
+                    page.OpenWizardForTest();
+                    Check("C6 wizard opens on step 1 with first source selected",
+                        page.WizardStepForTest == 1 && page.WizardVisibleForTest &&
+                        page.SourceCountForTest == 4 && page.SelectedIndexForTest == 0,
+                        "step=" + page.WizardStepForTest + " sources=" + page.SourceCountForTest);
+                    Check("C6 read-failed source is not shown as 0 bookmarks",
+                        page.SourceLabelForTest(3).Contains(L.T("读取失败")) &&
+                        !page.SourceLabelForTest(3).Contains(string.Format(L.T("{0} 条"), 0)),
+                        "label=" + page.SourceLabelForTest(3));
+                    page.NextForTest();
+                    Check("C6 step 2 preview matches the data-layer preview",
+                        page.WizardStepForTest == 2 && page.PreviewForTest != null &&
+                        page.PreviewForTest.Added == on.Added &&
+                        page.PreviewForTest.Skipped == on.Skipped &&
+                        page.PreviewForTest.Invalid == on.Invalid,
+                        "add=" + (page.PreviewForTest == null ? -1 : page.PreviewForTest.Added));
+                    Check("C6 preview shows at most five samples",
+                        page.PreviewSampleCountForTest == 5 &&
+                        candidates.Count(c => c.IsValid) == 6,
+                        "samples=" + page.PreviewSampleCountForTest +
+                        " valid=" + candidates.Count(c => c.IsValid));
+                    page.SetSkipExistingForTest(false);
+                    Check("C6 toggling skip-existing recomputes the same candidate list",
+                        page.PreviewForTest.Added == off.Added &&
+                        page.PreviewForTest.Skipped == off.Skipped &&
+                        !page.SkipExistingForTest,
+                        "add=" + page.PreviewForTest.Added);
+                    page.SetSkipExistingForTest(true);
+                    page.BackForTest();
+                    Check("C6 back returns to step 1", page.WizardStepForTest == 1,
+                        "step=" + page.WizardStepForTest);
+                    page.NextForTest();
+                    page.CancelForTest();
+                    Check("C6 cancel at any step does not write the store",
+                        page.WizardStepForTest == 0 && !page.WizardVisibleForTest &&
+                        BookmarkStore.All().Count == 0 && !File.Exists(mainJson),
+                        "step=" + page.WizardStepForTest +
+                        " count=" + BookmarkStore.All().Count +
+                        " file=" + File.Exists(mainJson));
+
+                    // ---- 5. 红线：预览「将新增」== 真正落库条数（走 UI 真实路径） ----
+                    page.OpenWizardForTest();
+                    page.NextForTest();
+                    var previewAdded = page.PreviewForTest.Added;
+                    var before = BookmarkStore.All().Count;
+                    page.CommitForTest();
+                    Check("C6 result page shows the real import numbers",
+                        page.WizardStepForTest == 3 && page.ResultForTest != null &&
+                        page.ResultForTest.Added == 5 && page.ResultForTest.Skipped == 1 &&
+                        page.ResultForTest.Invalid == 3 && page.ResultForTest.Failed == 0,
+                        "step=" + page.WizardStepForTest +
+                        " added=" + (page.ResultForTest == null ? -1 : page.ResultForTest.Added));
+                    Check("C6 preview add count equals the rows actually stored",
+                        previewAdded == page.ResultForTest.Added &&
+                        BookmarkStore.All().Count - before == previewAdded,
+                        "preview=" + previewAdded + " outcome=" + page.ResultForTest.Added +
+                        " delta=" + (BookmarkStore.All().Count - before));
+                    Check("C6 result page stays until Done is clicked",
+                        page.WizardVisibleForTest && page.WizardStepForTest == 3,
+                        "step=" + page.WizardStepForTest);
+                    Check("C6 only append, existing bookmarks are untouched",
+                        BookmarkStore.All().Count == 5 && File.Exists(mainJson),
+                        "count=" + BookmarkStore.All().Count);
+                    RenderWizard(page, Path.Combine(root, "out", "bm-wizard-result.png"));
+                    page.FinishForTest();
+                    Check("C6 Done returns to the bookmark list",
+                        page.WizardStepForTest == 0 && !page.WizardVisibleForTest,
+                        "step=" + page.WizardStepForTest);
+
+                    // ---- 6. bookmarks.json 结构不变 ----
+                    var parsedFile = new System.Web.Script.Serialization.JavaScriptSerializer()
+                        .Deserialize<Dictionary<string, object>>(File.ReadAllText(mainJson, Encoding.UTF8));
+                    var entries = parsedFile != null && parsedFile.ContainsKey("Entries")
+                        ? parsedFile["Entries"] as System.Collections.IList : null;
+                    var firstEntry = entries != null && entries.Count > 0
+                        ? entries[0] as Dictionary<string, object> : null;
+                    Check("C6 bookmarks.json keeps the original shape",
+                        parsedFile != null && parsedFile.Count == 1 &&
+                        entries != null && entries.Count == 5 &&
+                        firstEntry != null && firstEntry.Count == 4 &&
+                        firstEntry.ContainsKey("Url") && firstEntry.ContainsKey("Title") &&
+                        firstEntry.ContainsKey("Folder") && firstEntry.ContainsKey("AddedUtc"),
+                        "keys=" + (parsedFile == null ? "-" : string.Join(",", parsedFile.Keys)) +
+                        " rows=" + (entries == null ? -1 : entries.Count) +
+                        " fields=" + (firstEntry == null ? -1 : firstEntry.Count));
+
+                    // ---- 7. 二次导入同来源：全跳过，不产生重复 ----
+                    var again = BookmarkStore.ApplyImport(candidates, true);
+                    Check("C6 second import of the same source skips everything",
+                        again.Added == 0 && again.Skipped == 6 && again.Invalid == 3 &&
+                        BookmarkStore.All().Count == 5,
+                        "added=" + again.Added + " skipped=" + again.Skipped +
+                        " count=" + BookmarkStore.All().Count);
+
+                    // ---- 8. ImportChromiumFile 兼容面：签名与 added==2 语义不变 ----
+                    var compatAdded = BookmarkStore.ImportChromiumFile(compatFile);
+                    Check("C6 ImportChromiumFile keeps its added==2 semantics",
+                        compatAdded == 2 && BookmarkStore.All().Count == 7 &&
+                        BookmarkStore.All().Any(b => b.Folder.Contains("开发")),
+                        "added=" + compatAdded + " count=" + BookmarkStore.All().Count);
+
+                    // ---- 9. 关掉开关后的真实落库（独立干净库） ----
+                    BookmarkStore.FilePath = offJson;
+                    BookmarkStore.ResetForTest();
+                    var offOutcome = BookmarkStore.ApplyImport(candidates, false);
+                    var mdnRows = BookmarkStore.All()
+                        .Count(b => Urls.Same(b.Url, "https://developer.mozilla.org/"));
+                    Check("C6 skip-existing OFF really imports duplicates",
+                        offOutcome.Added == 6 && offOutcome.Skipped == 0 &&
+                        BookmarkStore.All().Count == 6 && mdnRows == 2,
+                        "added=" + offOutcome.Added + " count=" +
+                        BookmarkStore.All().Count + " mdnRows=" + mdnRows);
+
+                    // ---- 10. 读取失败：结果页常驻写清原因，不写库、不 Toast ----
+                    BookmarkStore.FilePath = mainJson;
+                    BookmarkStore.ResetForTest();
+                    page.OpenWizardForTest();
+                    page.SelectSourceForTest(3);
+                    page.NextForTest();
+                    var beforeFailure = BookmarkStore.All().Count;
+                    page.CommitForTest();
+                    Check("C6 read failure ends on the result page with a reason",
+                        page.WizardStepForTest == 3 && page.ResultForTest != null &&
+                        page.ResultForTest.Failed == 1 && page.ResultForTest.Added == 0 &&
+                        page.ResultErrorForTest.Contains(L.T("书签文件 JSON 损坏")),
+                        "failed=" + (page.ResultForTest == null ? -1 : page.ResultForTest.Failed) +
+                        " reason=" + page.ResultErrorForTest);
+                    Check("C6 read failure does not write the store",
+                        BookmarkStore.All().Count == beforeFailure,
+                        "count=" + BookmarkStore.All().Count);
+                    page.FinishForTest();
+
+                    // ---- 10b. 边界：Bookmarks 被占用 + Local State 无 info_cache ----
+                    var ioFixture = Path.Combine(temp, "UserData-locked");
+                    var ioRoot = Path.Combine(ioFixture, "Google", "Chrome", "User Data");
+                    var lockedFile = Path.Combine(ioRoot, "Default", "Bookmarks");
+                    WriteFixture(lockedFile, simpleJson);
+                    WriteFixture(Path.Combine(ioRoot, "Local State"),
+                        "{\"profile\":{\"last_used\":\"Default\"}}");   // 没有 info_cache
+                    BookmarkStore.UserDataRootOverride = ioFixture;
+                    using (var hold = new FileStream(lockedFile, FileMode.Open,
+                               FileAccess.Read, FileShare.None))
+                    {
+                        var lockedProfiles = BookmarkStore.DiscoverChromiumProfiles();
+                        Check("C6 locked Bookmarks + missing info_cache are handled",
+                            lockedProfiles.Count == 1 && lockedProfiles[0].ReadFailed &&
+                            lockedProfiles[0].ErrorKind == ChromiumProfileError.Io &&
+                            lockedProfiles[0].Count == 0 &&
+                            lockedProfiles[0].DisplayName == "Default",
+                            "count=" + lockedProfiles.Count +
+                            " kind=" + (lockedProfiles.Count == 1
+                                ? lockedProfiles[0].ErrorKind.ToString() : "-") +
+                            " name=" + (lockedProfiles.Count == 1
+                                ? lockedProfiles[0].DisplayName : "-"));
+                    }
+                    BookmarkStore.UserDataRootOverride = fixture;
+
+                    // ---- 11. 双语词条 + string.Format 占位符一致 ----
+                    L.Apply("en-US");
+                    Check("C6 wizard strings are translated",
+                        L.T("第 1 步：选择来源") == "Step 1: Choose a source" &&
+                        L.T("第 2 步：预览") == "Step 2: Preview" &&
+                        L.T("第 3 步：导入结果") == "Step 3: Result" &&
+                        L.T("跳过已存在的书签") == "Skip bookmarks that already exist" &&
+                        L.T("书签文件 JSON 损坏") == "Invalid bookmarks JSON" &&
+                        L.T("失败原因：") == "Reason: ",
+                        "lang=" + L.Language);
+                    Check("C6 format placeholders line up in both languages",
+                        string.Format(L.T("导入 {0} 条"), 3) == "Import 3 bookmarks" &&
+                        string.Format(L.T("示例（前 {0} 条）"), 5) == "Samples (first 5)" &&
+                        string.Format(L.T("{0} 条"), 9) == "9 bookmarks",
+                        "lang=" + L.Language);
+                    L.Apply(savedLang);
+
+                    // ---- 12. 截图：fixtest 内 RenderTargetBitmap 渲染页内向导卡片 ----
+                    BookmarkStore.FilePath = shotJson;
+                    BookmarkStore.ResetForTest();
+                    var shotPage = new BookmarksPage((u, n) => { }, m => { });
+                    shotPage.OpenWizardForTest();
+                    RenderWizard(shotPage, Path.Combine(root, "out", "bm-wizard-sources.png"));
+                    shotPage.NextForTest();
+                    Theme.Apply("dark");
+                    RenderWizard(shotPage, Path.Combine(root, "out", "bm-wizard.png"));
+                    // 未挂到可视化树的控件不会收到 Application.Resources 的变更通知，
+                    // 切主题后必须重新构造一页，渲染时才能取到亮色画刷。
+                    Theme.Apply("light");
+                    var lightPage = new BookmarksPage((u, n) => { }, m => { });
+                    lightPage.OpenWizardForTest();
+                    lightPage.NextForTest();
+                    RenderWizard(lightPage, Path.Combine(root, "out", "bm-wizard-light.png"));
+                    Theme.Apply("dark");
+                    L.Apply("en-US");
+                    var englishPage = new BookmarksPage((u, n) => { }, m => { });
+                    englishPage.OpenWizardForTest();
+                    englishPage.NextForTest();
+                    RenderWizard(englishPage, Path.Combine(root, "out", "bm-wizard-en.png"));
+                    L.Apply(savedLang);
+                    Check("C6 wizard screenshots written",
+                        File.Exists(Path.Combine(root, "out", "bm-wizard.png")) &&
+                        File.Exists(Path.Combine(root, "out", "bm-wizard-sources.png")) &&
+                        File.Exists(Path.Combine(root, "out", "bm-wizard-result.png")) &&
+                        File.Exists(Path.Combine(root, "out", "bm-wizard-light.png")) &&
+                        File.Exists(Path.Combine(root, "out", "bm-wizard-en.png")) &&
+                        FilesDiffer(Path.Combine(root, "out", "bm-wizard.png"),
+                                    Path.Combine(root, "out", "bm-wizard-light.png")),
+                        "out/bm-wizard.png + 4 more (dark/light differ)");
+                }
+                finally
+                {
+                    BookmarkStore.FilePath = savedPath;
+                    BookmarkStore.UserDataRootOverride = savedOverride;
+                    BookmarkStore.ResetForTest();
+                    L.Apply(savedLang);
+                    Theme.Apply(savedDark ? "dark" : "light");
+                }
+            }
+
+            private static bool FilesDiffer(string a, string b)
+            {
+                return File.Exists(a) && File.Exists(b) &&
+                       !File.ReadAllBytes(a).SequenceEqual(File.ReadAllBytes(b));
+            }
+
+            private static void WriteFixture(string path, string content)
+            {
+                var directory = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
+                File.WriteAllText(path, content, Encoding.UTF8);
+            }
+
+            // 向导浮层在 BookmarksPage 的可视树内，RenderTargetBitmap 能直接抓到（不用 Popup）。
+            private static void RenderWizard(FrameworkElement page, string path)
+            {
+                const double width = 980;
+                const double height = 620;
+                page.Width = width;
+                page.Height = height;
+                page.Measure(new Size(width, height));
+                page.Arrange(new Rect(0, 0, width, height));
+                page.UpdateLayout();
+                var bitmap = new RenderTargetBitmap((int)width, (int)height, 96, 96, PixelFormats.Pbgra32);
+                bitmap.Render(page);
+                var encoder = new PngBitmapEncoder();
+                encoder.Frames.Add(BitmapFrame.Create(bitmap));
+                var directory = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
+                using (var stream = File.Create(path)) encoder.Save(stream);
             }
 
             private static string RenderRealMenu(bool dark)

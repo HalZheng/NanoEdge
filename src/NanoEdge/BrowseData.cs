@@ -63,6 +63,48 @@ namespace NanoEdge
         public string Folder = "";
     }
 
+    // ---------- C6 书签导入向导的数据模型 ----------
+
+    // 一个被发现的 Chrome / Edge / Chromium profile。发现阶段就把候选解析好缓存，
+    // 预览和落库都复用同一份 Candidates —— 红线：预览「将新增」== 真正落库条数。
+    public sealed class ChromiumProfile
+    {
+        public string Browser = "";       // "Chrome" / "Edge" / "Chromium"
+        public string ProfileDir = "";    // 目录名，如 "Default" / "Profile 1"
+        public string DisplayName = "";   // Local State 里的 name，读不到就用 ProfileDir
+        public string FilePath = "";      // Bookmarks 文件的完整路径
+        public ChromiumProfileError ErrorKind;
+        public string ErrorDetail = "";   // 原始异常消息（诊断用，不参与 UI 文案翻译）
+        public List<BookmarkCandidate> Candidates = new List<BookmarkCandidate>();
+
+        public bool ReadFailed { get { return ErrorKind != ChromiumProfileError.None; } }
+        public int Count { get { return Candidates.Count; } }
+        public string Label { get { return Browser + " · " + DisplayName; } }
+    }
+
+    public enum ChromiumProfileError { None, Io, Json }
+
+    // 一条待导入候选。非法 URL 也保留在列表里（IsValid=false），让预览能显示「无效」；
+    // 旧版是在落库时静默丢掉，用户完全看不见。
+    public sealed class BookmarkCandidate
+    {
+        public string Title = "";
+        public string Url = "";
+        public string Folder = "";
+        public bool IsValid { get { return BookmarkStore.IsImportableUrl(Url); } }
+    }
+
+    // 预览 / 结果页共用的数字口径。
+    public sealed class ImportOutcome
+    {
+        public int Total;
+        public int Added;
+        public int Skipped;
+        public int Invalid;
+        public int Failed;
+        public string Error = "";
+    }
+
     // 浏览历史。去重按 URL（保留最近访问时间与累计次数），容量 5000 条 / 90 天。
     // 落盘做 3s 节流：导航很频繁，每次写整份 JSON 不划算；退出时 Flush。
     public static class HistoryStore
@@ -263,6 +305,13 @@ namespace NanoEdge
             catch (Exception ex) { Diagnostics.Log("bookmarks load failed: " + ex.Message); }
         }
 
+        // 自测用：把静态缓存清回未加载状态，配合临时 FilePath 造干净的书签库。
+        internal static void ResetForTest()
+        {
+            Entries.Clear();
+            _loaded = false;
+        }
+
         private static void Save()
         {
             try { Json.Write(FilePath, new BookmarkFile { Entries = Entries.ToList() }); }
@@ -283,7 +332,7 @@ namespace NanoEdge
             public int Total;
         }
 
-        // Chrome / Edge / Chromium 的 "Bookmarks"（JSON）。遍历各 profile，合并去重。
+        // 旧的一键全量导入：UI 已不再调用，保留给自测的兼容面，行为一字不改。
         public static ImportResult ImportChromiumProfiles()
         {
             var result = new ImportResult();
@@ -297,23 +346,11 @@ namespace NanoEdge
             return result;
         }
 
+        // 兼容面：--navtest 断言 added == 2，签名和返回值语义保持不变。
+        // 内部改成「只读解析 + 一次落库」，去重规则与向导完全一致。
         public static int ImportChromiumFile(string path)
         {
-            try
-            {
-                var text = File.ReadAllText(path, Encoding.UTF8);
-                var root = new JavaScriptSerializer { MaxJsonLength = 64 * 1024 * 1024 }
-                    .Deserialize<Dictionary<string, object>>(text);
-                object rootsObj;
-                if (root == null || !root.TryGetValue("roots", out rootsObj)) return 0;
-
-                var added = 0;
-                var roots = rootsObj as Dictionary<string, object>;
-                if (roots == null) return 0;
-                foreach (var pair in roots)
-                    added += WalkChromiumNode(pair.Value as Dictionary<string, object>, "");
-                return added;
-            }
+            try { return ApplyImport(ParseChromiumFile(path), true).Added; }
             catch (Exception ex)
             {
                 Diagnostics.Log("chromium import failed: " + ex.Message);
@@ -321,17 +358,141 @@ namespace NanoEdge
             }
         }
 
-        private static int WalkChromiumNode(Dictionary<string, object> node, string folder)
+        // ---------- C6：发现 / 解析 / 预演 / 落库 ----------
+
+        // 自测注入点：指向临时目录，替代 %LOCALAPPDATA%。测试绝不读用户真实 Chrome/Edge 数据。
+        internal static string UserDataRootOverride { get; set; }
+        private const int MaxChromiumJsonLength = 64 * 1024 * 1024;
+
+        private static string UserDataRoot()
         {
-            if (node == null) return 0;
-            var added = 0;
+            return string.IsNullOrEmpty(UserDataRootOverride)
+                ? Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData)
+                : UserDataRootOverride;
+        }
+
+        // 发现 Chrome → Edge → Chromium 三个根下确实带 Bookmarks 文件的 profile；
+        // Default 排在每个浏览器的最前面。读取失败的 profile 也保留并标记，不显示成 0 条。
+        public static List<ChromiumProfile> DiscoverChromiumProfiles()
+        {
+            var found = new List<ChromiumProfile>();
+            var local = UserDataRoot();
+            var roots = new[]
+            {
+                new { Browser = "Chrome",   Path = Path.Combine(local, "Google", "Chrome", "User Data") },
+                new { Browser = "Edge",     Path = Path.Combine(local, "Microsoft", "Edge", "User Data") },
+                new { Browser = "Chromium", Path = Path.Combine(local, "Chromium", "User Data") }
+            };
+            foreach (var root in roots)
+            {
+                if (!Directory.Exists(root.Path)) continue;
+                string[] dirs;
+                try { dirs = Directory.GetDirectories(root.Path); }
+                catch { continue; }
+
+                var profiles = new List<ChromiumProfile>();
+                foreach (var dir in dirs)
+                {
+                    var file = Path.Combine(dir, "Bookmarks");
+                    if (!File.Exists(file)) continue;   // Crashpad / 缓存等非 profile 目录
+                    var dirName = Path.GetFileName(dir);
+                    var profile = new ChromiumProfile
+                    {
+                        Browser = root.Browser,
+                        ProfileDir = dirName,
+                        DisplayName = ReadDisplayName(root.Path, dirName),
+                        FilePath = file
+                    };
+                    try { profile.Candidates = ParseChromiumFile(file); }
+                    catch (IOException ex)
+                    {
+                        profile.ErrorKind = ChromiumProfileError.Io;
+                        profile.ErrorDetail = ex.Message;
+                    }
+                    catch (UnauthorizedAccessException ex)
+                    {
+                        profile.ErrorKind = ChromiumProfileError.Io;
+                        profile.ErrorDetail = ex.Message;
+                    }
+                    catch (Exception ex)
+                    {
+                        // JavaScriptSerializer 对坏 JSON 抛的是通用异常，归到「JSON 损坏」。
+                        profile.ErrorKind = ChromiumProfileError.Json;
+                        profile.ErrorDetail = ex.Message;
+                    }
+                    profiles.Add(profile);
+                }
+                found.AddRange(profiles
+                    .OrderBy(p => string.Equals(p.ProfileDir, "Default",
+                        StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+                    .ThenBy(p => p.ProfileDir, StringComparer.OrdinalIgnoreCase));
+            }
+            return found;
+        }
+
+        // Local State 的 profile.info_cache[目录名].name；缺失 / 损坏 / 无 info_cache
+        // 都回退成目录名（这只是显示名，书签文件本身仍可用，不算读取失败）。
+        private static string ReadDisplayName(string userDataRoot, string dirName)
+        {
+            try
+            {
+                var state = Path.Combine(userDataRoot, "Local State");
+                if (!File.Exists(state)) return dirName;
+                var text = File.ReadAllText(state, Encoding.UTF8);
+                var root = new JavaScriptSerializer { MaxJsonLength = MaxChromiumJsonLength }
+                    .Deserialize<Dictionary<string, object>>(text);
+                if (root == null) return dirName;
+                object profileObj;
+                if (!root.TryGetValue("profile", out profileObj)) return dirName;
+                var profile = profileObj as Dictionary<string, object>;
+                if (profile == null) return dirName;
+                object cacheObj;
+                if (!profile.TryGetValue("info_cache", out cacheObj)) return dirName;
+                var cache = cacheObj as Dictionary<string, object>;
+                if (cache == null) return dirName;
+                object entryObj;
+                if (!cache.TryGetValue(dirName, out entryObj)) return dirName;
+                var entry = entryObj as Dictionary<string, object>;
+                if (entry == null) return dirName;
+                var name = GetString(entry, "name");
+                return string.IsNullOrWhiteSpace(name) ? dirName : name;
+            }
+            catch { return dirName; }
+        }
+
+        // 只读解析：不写库。空 URL / javascript: 之类也进列表，由 IsValid 标记，
+        // 这样预览能把「无效」算给用户看，而不是落库时悄悄丢掉。
+        public static List<BookmarkCandidate> ParseChromiumFile(string path)
+        {
+            var list = new List<BookmarkCandidate>();
+            var text = File.ReadAllText(path, Encoding.UTF8);
+            var root = new JavaScriptSerializer { MaxJsonLength = MaxChromiumJsonLength }
+                .Deserialize<Dictionary<string, object>>(text);
+            object rootsObj;
+            if (root == null || !root.TryGetValue("roots", out rootsObj)) return list;
+            var roots = rootsObj as Dictionary<string, object>;
+            if (roots == null) return list;
+            foreach (var pair in roots)
+                WalkChromiumNode(pair.Value as Dictionary<string, object>, "", list);
+            return list;
+        }
+
+        // folder 拼接与旧版逐字一致：" / " 拼层级，书签页按 Folder 分组的语义不变。
+        private static void WalkChromiumNode(Dictionary<string, object> node, string folder,
+            List<BookmarkCandidate> output)
+        {
+            if (node == null) return;
             var type = GetString(node, "type");
             var name = GetString(node, "name");
 
             if (type == "url")
             {
-                var url = GetString(node, "url");
-                if (!string.IsNullOrEmpty(url) && AddImported(name, url, folder)) added++;
+                output.Add(new BookmarkCandidate
+                {
+                    Title = name,
+                    Url = GetString(node, "url"),
+                    Folder = folder
+                });
             }
 
             object childrenObj;
@@ -344,10 +505,9 @@ namespace NanoEdge
                         ? (folder.Length == 0 ? name : folder + " / " + name)
                         : folder;
                     foreach (var child in children)
-                        added += WalkChromiumNode(child as Dictionary<string, object>, next);
+                        WalkChromiumNode(child as Dictionary<string, object>, next, output);
                 }
             }
-            return added;
         }
 
         private static string GetString(Dictionary<string, object> node, string key)
@@ -356,27 +516,92 @@ namespace NanoEdge
             return node.TryGetValue(key, out value) && value != null ? value.ToString() : "";
         }
 
+        // 从 AddImported 前移过来的 URL 合法性判断：只认 http / https / file。
+        public static bool IsImportableUrl(string url)
+        {
+            if (string.IsNullOrEmpty(url)) return false;
+            return url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
+                   url.StartsWith("https://", StringComparison.OrdinalIgnoreCase) ||
+                   url.StartsWith("file:", StringComparison.OrdinalIgnoreCase);
+        }
+
+        // 预览和落库唯一共用的分类逻辑：同一份候选 + 同一套 skipExisting / Urls.Same。
+        // 别在两处各算一遍，否则「将新增」会和真正落库条数对不上。
+        private sealed class ImportPlan
+        {
+            public int Total;
+            public int Skipped;
+            public int Invalid;
+            public List<BookmarkCandidate> ToAdd = new List<BookmarkCandidate>();
+
+            public ImportOutcome ToOutcome()
+            {
+                return new ImportOutcome
+                {
+                    Total = Total,
+                    Added = ToAdd.Count,
+                    Skipped = Skipped,
+                    Invalid = Invalid
+                };
+            }
+        }
+
+        private static ImportPlan PlanImport(IEnumerable<BookmarkCandidate> candidates, bool skipExisting)
+        {
+            var plan = new ImportPlan();
+            var existing = skipExisting ? All().Select(e => e.Url).ToList() : null;
+            var pending = new List<string>();   // 本批次内已选中的，避免批内重复
+            foreach (var candidate in candidates ?? Enumerable.Empty<BookmarkCandidate>())
+            {
+                plan.Total++;
+                if (candidate == null || !candidate.IsValid) { plan.Invalid++; continue; }
+                if (skipExisting)
+                {
+                    var url = candidate.Url;
+                    if (existing.Any(u => Urls.Same(u, url)) ||
+                        pending.Any(u => Urls.Same(u, url)))
+                    {
+                        plan.Skipped++;
+                        continue;
+                    }
+                    pending.Add(url);
+                }
+                plan.ToAdd.Add(candidate);
+            }
+            return plan;
+        }
+
+        // 预演：只读，绝不写库。
+        public static ImportOutcome PreviewImport(IEnumerable<BookmarkCandidate> candidates, bool skipExisting)
+        {
+            return PlanImport(candidates, skipExisting).ToOutcome();
+        }
+
+        // 落库：只追加，不 Remove / 不清空现有书签；最后一次性 Save()。
+        public static ImportOutcome ApplyImport(IEnumerable<BookmarkCandidate> candidates, bool skipExisting)
+        {
+            var plan = PlanImport(candidates, skipExisting);
+            var outcome = plan.ToOutcome();
+            if (plan.ToAdd.Count == 0) return outcome;
+            EnsureLoaded();
+            foreach (var candidate in plan.ToAdd)
+                Entries.Add(new BookmarkEntry
+                {
+                    Title = string.IsNullOrWhiteSpace(candidate.Title)
+                        ? Urls.Host(candidate.Url) : candidate.Title.Trim(),
+                    Url = candidate.Url,
+                    Folder = candidate.Folder ?? "",
+                    AddedUtc = DateTime.UtcNow
+                });
+            Save();
+            return outcome;
+        }
+
+        // 只给旧 ImportChromiumProfiles 用；UI 已改用 DiscoverChromiumProfiles，
+        // 留一个薄包装避免把「遍历哪些文件」的口径复制两份。
         private static IEnumerable<string> ChromiumBookmarkFiles()
         {
-            var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            var roots = new[]
-            {
-                Path.Combine(local, "Google", "Chrome", "User Data"),
-                Path.Combine(local, "Microsoft", "Edge", "User Data"),
-                Path.Combine(local, "Chromium", "User Data")
-            };
-            foreach (var root in roots)
-            {
-                if (!Directory.Exists(root)) continue;
-                string[] dirs;
-                try { dirs = Directory.GetDirectories(root); }
-                catch { continue; }
-                foreach (var dir in dirs)
-                {
-                    var file = Path.Combine(dir, "Bookmarks");
-                    if (File.Exists(file)) yield return file;
-                }
-            }
+            return DiscoverChromiumProfiles().Select(p => p.FilePath);
         }
 
         // Netscape 书签 HTML（Chrome/Edge/Firefox 的导出格式）。文件夹用 <H3> + <DL> 嵌套，
@@ -449,10 +674,8 @@ namespace NanoEdge
 
         private static bool AddImported(string title, string url, string folder)
         {
-            if (string.IsNullOrEmpty(url)) return false;
-            if (!url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
-                !url.StartsWith("https://", StringComparison.OrdinalIgnoreCase) &&
-                !url.StartsWith("file:", StringComparison.OrdinalIgnoreCase)) return false;
+            // HTML 导入与向导共用同一套 URL 合法性判断（规则从 C6 前移到 IsImportableUrl）。
+            if (!IsImportableUrl(url)) return false;
             if (Contains(url)) return false;
 
             Entries.Add(new BookmarkEntry

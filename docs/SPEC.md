@@ -6,7 +6,7 @@
 |---|---|
 | 版本 | **v1.3（三态内存模型）** |
 | 日期 | 2026-11-04 |
-| 状态 | 决策已冻结；v1.3 三态内存模型；M1 / M2 / M3-a/b/c / **M4** / **M5（简化版）** / **M6-a（发布收尾）** / **M6-b（双语 + 设置）** / **M7（对照补齐）** / **M8（脚本能力）已实现**（0.7 / 0.8+0.9 / 0.10 / 0.11 / 0.12 / 0.14 / 0.15 / 0.16 / 0.17 / 0.18 / 0.19）；**M3-d 因无测试环境跳过**（0.13）；**P0 17 项全部完成** |
+| 状态 | 决策已冻结；v1.3 三态内存模型；M1 / M2 / M3-a/b/c / **M4** / **M5（简化版）** / **M6-a（发布收尾）** / **M6-b（双语 + 设置）** / **M7（对照补齐）** / **M8（脚本能力）** / **C6（书签导入向导）已实现**（0.7 / 0.8+0.9 / 0.10 / 0.11 / 0.12 / 0.14 / 0.15 / 0.16 / 0.17 / 0.18 / 0.19 / 0.20）；**M3-d 因无测试环境跳过**（0.13）；**P0 17 项全部完成** |
 | 目标平台 | Windows 10 1809+ / Windows 11，x64 |
 | 代号 | NanoEdge |
 
@@ -568,6 +568,36 @@
 **指标影响**：+36,352 字节。运行期 `@require` 只在导入时发请求；注入字符串最多多出「10 × 5MB」，实际脚本通常几十 KB；`GM_listValues` 纯内存遍历，无额外进程。
 
 **本批未做**：`GM_download` / `@resource` / `GM_registerMenuCommand` / `@noframes`（对照报告判定收益低）；`@require` 的运行时热更新；`unsafeWindow` 的隔离世界（那是架构变更，不做）。
+
+---
+
+### 0.20 C6：书签导入向导（2026-11-08 20:50）
+
+**背景**：M3-b（0.11）的「从 Chrome/Edge 导入」是一键扫描所有 profile、边解析边落盘，用户既不知道会读哪几个 profile、也不知道会导进来什么，结果只有一句 Toast。用户已定「这批只做书签，不碰历史」，所以 HANDOFF 批次 C 的两个前置决策（History SQLite 方案、是否拆批）本批都不需要。本批不加能力，只把**写库推迟到用户确认之后**，并在确认前把信息摊开。
+
+产物 **1,168,896 字节（较 0.1.4 本地构建 +32,256 字节）**，0 警告 0 错误。
+
+| 项 | 落地 |
+|---|---|
+| 发现 | `DiscoverChromiumProfiles()` 返回 `ChromiumProfile`（`Browser` / `ProfileDir` / `DisplayName` / `FilePath` / `ErrorKind` / `Candidates`）；排序 Chrome→Edge→Chromium、Default 在前，只认目录下确实有 `Bookmarks` 文件的 profile；显示名读 `User Data\Local State` 的 `profile.info_cache[目录名].name`，缺失 / 损坏 / 无 `info_cache` 回退目录名 |
+| 解析 | `ParseChromiumFile(path)` 只读，返回含非法项的 `BookmarkCandidate`（`Title` / `Url` / `Folder` / `IsValid`）；URL 合法性判断从落库前移到解析（只认 http/https/file），让「无效」在预览里可见；folder 仍用 ` / ` 拼层级，语义不变 |
+| 红线 | `PlanImport(candidates, skipExisting)` 是唯一分类逻辑，`PreviewImport`（只读）与 `ApplyImport`（落库、一次 `Save()`）都调它，UI 预览与落库共用同一份候选列表 —— 「将新增」必然等于真正落库条数 |
+| 三步向导 | 页内浮层（`Content` 外包 Grid，非 Popup / 非新 Window）：① `RadioButton` 选一个来源 ② 四个数字 + 前 5 条示例 + 「跳过已存在的书签」开关（默认开） ③ 结果常驻，点「完成」返回列表并刷新 |
+| 兼容面 | `ImportChromiumFile(path)` 签名与 `added==2` 语义不变（`--navtest` 依赖）；`ImportChromiumProfiles()` 一字未改、UI 不再调用；`bookmarks.json` 结构不变 |
+| 双语 | 新增 28 条中英文案，中文原文当 key，`string.Format` 占位符两边一致 |
+
+**实现判断**
+
+1. **不新增命令行参数**：截图选「在 `--fixtest` 里 `RenderTargetBitmap` 渲染向导卡片出图」，因此 `Program.IsSelfTest()` / `MainWindow._noPersist` / `RestoreSession()` 三处登记都不用动，零污染用户会话的风险。
+2. **Local State 失败不等于读取失败**：它只影响显示名，回退目录名即可；只有 `Bookmarks` 本身读不到（`IOException`）或 JSON 损坏才把该 profile 标成「读取失败」并在结果页常驻写清原因，不用一闪而过的 Toast。
+3. **只追加**：向导不调用 `BookmarkStore.Remove`、不清空现有书签；任何一步取消都不写库，只有点「导入 N 条」才落盘。
+4. **单选 + 一个开关**：一次只导一个来源，预览和结果数字最清楚；去重沿用 `Urls.Same`，关掉开关即允许重复条目，不做三选一策略、不做扁平化。
+
+**实测（`--fixtest` 275/275 PASS，报告 `out/fix-report.txt`）**：新增 32 条 C6 断言，覆盖发现数量 / 排序、显示名回退、非 profile 目录过滤、坏 JSON 与文件独占两类读取失败、folder 层级、非法 URL 可见、跳过开关开（5/1/3）/ 关（6/0/3）、预览 == 落库、取消不写库、二次导入全跳过、结果页数字、`added==2` 兼容、`bookmarks.json` 结构不变、双语与占位符、暗 / 亮截图不同。全量 10 组逐个独立进程合计 **650 项 PASS**；`--memtest` 为既有 flaky（0.1.4 基线同样复现，未修）。
+
+截图：`out/bm-wizard.png`（预览 · 暗，主图）、`bm-wizard-sources.png`、`bm-wizard-result.png`、`bm-wizard-light.png`、`bm-wizard-en.png`。
+
+**本批未做**：历史记录 / History SQLite / 时间范围 / 按类型筛选（**下一批，不是遗漏**）；三种重复策略、扁平化文件夹、多 profile 合并、拖拽文件、云同步；新设置项、新数据文件、新 Window / Popup / XAML / 第三方依赖；改版本号、打 tag、发布（0.1.4 之后未发版）。
 
 ---
 
@@ -1379,10 +1409,10 @@ HKCU\Software\RegisteredApplications                    -> NanoEdge = ...\Capabi
 
 **书签导入（两种格式都支持）**
 
-1. **Chrome / Edge 的 `Bookmarks`（JSON）**：自动扫描 `%LOCALAPPDATA%\Google\Chrome\User Data\*\Bookmarks`、`Microsoft\Edge\User Data\*\Bookmarks`、`Chromium`，递归 `roots → children`，文件夹路径用 ` / ` 拼接。
-2. **Netscape 书签 HTML**：Chrome/Edge/Firefox 的导出格式，一次正则扫描维护 `<H3>` + `<DL>` 文件夹栈（思路参考 ZZZ 的 `ImportHtmlAsync`）。
+1. **Chrome / Edge 的 `Bookmarks`（JSON）**：扫描 `%LOCALAPPDATA%\Google\Chrome\User Data\*\Bookmarks`、`Microsoft\Edge\User Data\*\Bookmarks`、`Chromium`，递归 `roots → children`，文件夹路径用 ` / ` 拼接。**C6 起不再是「一键全量导入」，改为三步页内向导：一次只导一个选中的 profile，确认前只预览不落盘**（详见 7.14）。
+2. **Netscape 书签 HTML**：Chrome/Edge/Firefox 的导出格式，一次正则扫描维护 `<H3>` + `<DL>` 文件夹栈（思路参考 ZZZ 的 `ImportHtmlAsync`）；这条路径仍是一次性导入，不走向导。
 
-导入统一过滤非 http(s)/file 的条目，并按归一化 URL 去重（`Urls.Same` 用 `Uri.Compare` 忽略大小写、默认端口、末尾斜杠差异 —— 这也修掉了 `github.com` 与 `github.com/` 被当成两条的老问题）。
+导入统一过滤非 http(s)/file 的条目，并按归一化 URL 去重（`Urls.Same` 用 `Uri.Compare` 忽略大小写、默认端口、末尾斜杠差异 —— 这也修掉了 `github.com` 与 `github.com/` 被当成两条的老问题）；Chrome/Edge 向导里的去重由「跳过已存在的书签」开关控制（默认开，可关）。
 
 ### 7.11 缩放（M3-c 已实现）
 
@@ -1437,6 +1467,28 @@ HKCU\Software\RegisteredApplications                    -> NanoEdge = ...\Capabi
 **安全**：备份文件是纯文本，但恢复的脚本能读改页面、借登录态发请求；确认卡列出权限并提示只恢复可信来源。`Target` 由备份方填写并随文件传递，宿主不硬编码任何公司域名。
 
 **明确不做**：拖拽文件自动还原（收益不抵 WebView2 HwndHost 的窗口级拖文件处理成本）；通用附件协议（v1 只有 `pg4-ddl` 一种）；云同步、自动更新、备份加密。
+
+### 7.14 书签导入向导（C6，2026-11-08）
+
+**目标**：把 7.10 的「一键全量导入」改成「选来源 → 看预览 → 确认并看结果」，把写库推迟到用户确认之后。入口仍是 `nano://bookmarks` 的「从 Chrome/Edge 导入」按钮，点开后在**页面内**展开，不弹新窗口。
+
+| 维度 | 做法 |
+|---|---|
+| 容器 | `Content` 外包一层 Grid，卡片放同层 Border；**不是 Popup**（独立 HWND 抓不到）、不是新 Window、不引入 XAML，因此 `RenderTargetBitmap` 能截图。overlay 建一次复用，`Refresh()` 只清 `Body.Children` 不清浮层；切步骤只换卡片内容 |
+| 主题 | 所有控件 `SetResourceReference` 到既有 Theme 键，不硬编码颜色；切主题 / 语言不重建 UI |
+| 第 1 步 | 一行一个 `RadioButton`，显示浏览器名 + profile 显示名 + 书签条数 + 文件路径（小字 / ToolTip），默认选第一个；一个都没找到时显示「没找到…」并提示可改用「导入 HTML」，不报错、不写库 |
+| 第 2 步 | 来源名 + 四个数字（总数 / 将新增 / 将跳过 / 无效）+ 前 5 条有效示例（标题 / 域名 / 文件夹）+「跳过已存在的书签」开关（默认开）；按钮：上一步 / 取消 / 导入 N 条 |
+| 第 3 步 | 新增 / 跳过 / 无效 / 失败四个数字，**页面常驻**；读取失败写清原因（文件被占用 / JSON 损坏），不用 Toast 代替；「完成」返回书签列表并刷新 |
+| 数据层 | `DiscoverChromiumProfiles` / `ParseChromiumFile`（只读）/ `PreviewImport`（只读）/ `ApplyImport`（一次 `Save()`）；`PlanImport` 是预览与落库唯一共用的分类逻辑 |
+| 注入 | `UserDataRootOverride` 只用于自测把根路径指向临时 fixture，绝不读用户真实 Chrome/Edge 数据 |
+| 兼容 | `ImportChromiumFile(path)` 保留签名与 `added==2` 语义；`ImportChromiumProfiles()` 保留但 UI 不再调用；`bookmarks.json` 结构不变 |
+| 双语 | 中文原文当 key + `L.T(...)`；`string.Format` 占位符两边一致 |
+
+**正确性红线**：预览的「将新增」必须等于点导入后真正落库的条数。两个数字用同一份候选列表与同一套 `skipExisting` / `Urls.Same` 规则，不在预览和落库里各算一遍（`--fixtest` 实测 `preview=5 / outcome=5 / delta=5`）。
+
+**错误处理**：`Bookmarks` 被浏览器占用（`IOException`）、JSON 损坏、`Local State` 缺失 / 损坏 / 无 `info_cache` 全部 catch；前两者把该 profile 标成「读取失败」并常驻显示原因（不显示成 0 条、不让整个向导崩），后者只回退显示名为目录名。`Directory.GetDirectories(root)` 扫进来的非 profile 目录用「存在 `Bookmarks` 文件」过滤；大文件沿用 `MaxJsonLength = 64MB`。
+
+**明确不做**：历史导入 / History SQLite（**下一批，不是遗漏**）；三种重复策略、扁平化文件夹、多 profile 合并导入、拖拽文件、云同步；新设置项、新数据文件、新命令行参数；改 `bookmarks.json` 结构。
 
 ## 8. 数据模型（草图）
 
