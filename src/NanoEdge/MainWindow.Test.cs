@@ -2064,6 +2064,229 @@ namespace NanoEdge
                 _w._settings.Layout = LayoutMode.Compact;
                 _w.ApplyLayout();
                 Line("A1/A2 state machine covered by assertions; taskbar / multi-monitor / mixed-DPI feel needs manual check");
+
+                // ---- C5 用户脚本元数据：解析 / 回写 / 导出往返 ----
+                // 纯本地断言，不碰用户的脚本存储；只有一份 .user.js 样例写到 out/。
+                var c5 = "// ==UserScript==\r\n" +
+                         "// @name         Old Name\r\n" +
+                         "// @namespace    c5.demo\r\n" +
+                         "// @version      1.0\r\n" +
+                         "// @description  keep me\r\n" +
+                         "// @match        https://old.example/*\r\n" +
+                         "// @grant        GM_setValue\r\n" +
+                         "// @run-at       document-start\r\n" +
+                         "// @include      /regex-literal/\r\n" +
+                         "// @exclude      https://old.example/admin/*\r\n" +
+                         "// @connect      api.example.com\r\n" +
+                         "// @match        http://localhost/*\r\n" +
+                         "// @weird-key    unknown-metadata\r\n" +
+                         "// ==/UserScript==\r\n" +
+                         "console.log('body');\r\n";
+                var c5Original = ScriptParser.Parse(c5);
+                Check("C5 parse baseline name", c5Original.Name == "Old Name", c5Original.Name);
+                Check("C5 parse baseline two @match lines", c5Original.Matches.Count == 2,
+                    string.Join(" | ", c5Original.Matches));
+
+                var c5Edit = new ScriptMetadataEdit
+                {
+                    Name = "New Name",
+                    Version = "3.2",
+                    Matches = new List<string>
+                    {
+                        "https://a.example/*", "https://b.example/*", "http://localhost:8080/*"
+                    },
+                    Excludes = new List<string>
+                    {
+                        "https://a.example/admin/*", "https://b.example/login/*"
+                    }
+                };
+                string c5Error;
+                var c5Written = ScriptParser.RewriteMetadata(c5, c5Edit, out c5Error);
+                Check("C5 rewrite succeeds", c5Written != null, c5Error);
+                if (c5Written != null)
+                {
+                    var c5Reparsed = ScriptParser.Parse(c5Written);
+                    Check("C5 name/version read back",
+                        c5Reparsed.Name == "New Name" && c5Reparsed.Version == "3.2",
+                        c5Reparsed.Name + " v" + c5Reparsed.Version);
+                    Check("C5 multi-line @match order",
+                        c5Reparsed.Matches.SequenceEqual(c5Edit.Matches),
+                        string.Join(" | ", c5Reparsed.Matches));
+                    Check("C5 multi-line @exclude order",
+                        c5Reparsed.Excludes.SequenceEqual(c5Edit.Excludes),
+                        string.Join(" | ", c5Reparsed.Excludes));
+                    Check("C5 header alignment prefix is kept",
+                        c5Written.Contains("// @name         New Name"), "prefix");
+                    Check("C5 CRLF line endings preserved",
+                        c5Written.Contains("\r\n") && !c5Written.Replace("\r\n", "").Contains("\n"),
+                        "crlf=" + c5Written.Split(new[] { "\r\n" }, StringSplitOptions.None).Length);
+                    Check("C5 header markers kept",
+                        c5Written.Contains("// ==UserScript==") &&
+                        c5Written.Contains("// ==/UserScript=="), "markers");
+                    Check("C5 script body untouched",
+                        c5Written.Contains("console.log('body');"), "body");
+
+                    Func<string, List<string>> c5OtherHeaders = code =>
+                        code.Replace("\r\n", "\n").Split('\n')
+                            .Where(l =>
+                            {
+                                var m = ScriptParser.MetaLine.Match(l);
+                                if (!m.Success) return false;
+                                var k = m.Groups[1].Value.ToLowerInvariant();
+                                return k != "name" && k != "version" && k != "match" && k != "exclude";
+                            })
+                            .Select(l => l.TrimEnd('\r')).ToList();
+                    var c5Before = c5OtherHeaders(c5);
+                    var c5After = c5OtherHeaders(c5Written);
+                    Check("C5 other // @ headers kept verbatim and in order",
+                        c5Before.Count == 7 && c5Before.SequenceEqual(c5After),
+                        "before=" + c5Before.Count + " after=" + c5After.Count);
+                    Check("C5 unknown metadata key survives",
+                        c5Written.Contains("// @weird-key    unknown-metadata"), "weird-key");
+                    Check("C5 @include regex literal is untouched",
+                        c5Written.Contains("// @include      /regex-literal/") &&
+                        c5Reparsed.Includes.SequenceEqual(c5Original.Includes),
+                        string.Join(" | ", c5Reparsed.Includes));
+                    Check("C5 @grant / @run-at still parsed",
+                        c5Reparsed.Grants.SequenceEqual(c5Original.Grants) &&
+                        c5Reparsed.RunAt == "document-start" &&
+                        c5Reparsed.Namespace == "c5.demo" &&
+                        c5Reparsed.Description == "keep me",
+                        "grant=" + string.Join(",", c5Reparsed.Grants) + " runAt=" + c5Reparsed.RunAt);
+
+                    // 导出即 ScriptStore.SaveCode 写出的 <id>.user.js 内容：再次导入必须还原元数据。
+                    var c5ExportPath = Path.Combine(Root(), "out", "c5-export.user.js");
+                    try
+                    {
+                        Directory.CreateDirectory(Path.GetDirectoryName(c5ExportPath));
+                        File.WriteAllText(c5ExportPath, c5Written, Encoding.UTF8);
+                        var c5Exported = File.ReadAllText(c5ExportPath, Encoding.UTF8);
+                        var c5Imported = ScriptParser.Parse(c5Exported);
+                        Check("C5 exported .user.js re-imports with the same metadata",
+                            c5Imported.Name == "New Name" && c5Imported.Version == "3.2" &&
+                            c5Imported.Matches.SequenceEqual(c5Edit.Matches) &&
+                            c5Imported.Excludes.SequenceEqual(c5Edit.Excludes) &&
+                            c5Imported.Grants.SequenceEqual(c5Original.Grants) &&
+                            c5Imported.RunAt == c5Original.RunAt &&
+                            c5Imported.Namespace == c5Original.Namespace &&
+                            c5Imported.Description == c5Original.Description,
+                            "name=" + c5Imported.Name + " version=" + c5Imported.Version);
+                        string c5SecondError;
+                        Check("C5 rewrite is idempotent on an exported file",
+                            ScriptParser.RewriteMetadata(c5Exported, c5Edit, out c5SecondError) == c5Exported,
+                            c5SecondError);
+                    }
+                    catch (Exception ex) { Check("C5 export round trip", false, ex.Message); }
+                }
+
+                var c5Cleared = ScriptParser.RewriteMetadata(c5,
+                    new ScriptMetadataEdit { Matches = new List<string>(), Excludes = new List<string>() },
+                    out c5Error);
+                Check("C5 empty list removes every @match/@exclude line",
+                    c5Cleared != null && !c5Cleared.Contains("// @match") &&
+                    !c5Cleared.Contains("// @exclude"), c5Error);
+                Check("C5 untouched fields leave the source byte-for-byte",
+                    ScriptParser.RewriteMetadata(c5, new ScriptMetadataEdit(), out c5Error) == c5,
+                    "no field edited");
+                var c5Hand = c5.Replace("// @name         Old Name", "// @name         Hand Edited");
+                var c5HandOut = ScriptParser.RewriteMetadata(c5Hand, new ScriptMetadataEdit(), out c5Error);
+                Check("C5 hand-edited // @ line survives a save with no field edits",
+                    c5HandOut == c5Hand && ScriptParser.Parse(c5HandOut).Name == "Hand Edited",
+                    "name=" + ScriptParser.Parse(c5HandOut).Name);
+
+                var c5NoExclude = "// ==UserScript==\n// @name    Bare\n// @version 1.0\n" +
+                                  "// @grant   GM_info\n// ==/UserScript==\n";
+                var c5Added = ScriptParser.RewriteMetadata(c5NoExclude,
+                    new ScriptMetadataEdit
+                    {
+                        Matches = new List<string> { "https://y.example/*" },
+                        Excludes = new List<string> { "https://x.example/*" }
+                    }, out c5Error);
+                Check("C5 missing keys are added before the end marker",
+                    c5Added != null &&
+                    c5Added.IndexOf("// @match", StringComparison.Ordinal) <
+                    c5Added.IndexOf("// ==/UserScript==", StringComparison.Ordinal) &&
+                    c5Added.IndexOf("// @exclude", StringComparison.Ordinal) <
+                    c5Added.IndexOf("// ==/UserScript==", StringComparison.Ordinal) &&
+                    ScriptParser.Parse(c5Added).Excludes.Count == 1, c5Error);
+                Check("C5 LF source stays LF",
+                    c5Added != null && !c5Added.Contains("\r\n"), "newline");
+
+                var c5Bare = "var a = 1;\n// @name    Loose\n// @grant   GM_info\n";
+                var c5BareOut = ScriptParser.RewriteMetadata(c5Bare,
+                    new ScriptMetadataEdit { Name = "Loose 2", Version = "9.9" }, out c5Error);
+                Check("C5 scripts without a header block still rewrite",
+                    c5BareOut != null && ScriptParser.Parse(c5BareOut).Name == "Loose 2" &&
+                    ScriptParser.Parse(c5BareOut).Version == "9.9", c5Error);
+
+                Check("C5 rejects a newline injected into @name",
+                    ScriptParser.RewriteMetadata(c5,
+                        new ScriptMetadataEdit { Name = "X\n// @grant none" }, out c5Error) == null &&
+                    c5Error.Length > 0, c5Error);
+                Check("C5 rejects an empty name",
+                    ScriptParser.RewriteMetadata(c5, new ScriptMetadataEdit { Name = "  " },
+                        out c5Error) == null, c5Error);
+                Check("C5 rejects an empty version",
+                    ScriptParser.RewriteMetadata(c5, new ScriptMetadataEdit { Version = "" },
+                        out c5Error) == null, c5Error);
+                Check("C5 rejects a newline inside a match rule",
+                    ScriptParser.RewriteMetadata(c5,
+                        new ScriptMetadataEdit { Matches = new List<string> { "a\nb" } },
+                        out c5Error) == null, c5Error);
+
+                // 新 UI 字符串必须双语都有；单独探针，跑完立刻恢复语言。
+                var c5SavedLang = L.Language;
+                L.Apply("en-US");
+                Check("C5 metadata strings are translated",
+                    L.T("元数据") == "Metadata" && L.T("版本") == "Version" &&
+                    L.T("名称不能为空，脚本未保存") == "Name cannot be empty; script not saved" &&
+                    L.T("元数据写回失败，脚本未保存：") ==
+                        "Metadata write-back failed; script not saved: ",
+                    "lang=" + L.Language);
+                Check("C5 import card strings are translated",
+                    L.T("@include 规则") == "@include rules" &&
+                    L.T("名称不能为空，脚本未导入") == "Name cannot be empty; script not imported" &&
+                    L.T("版本不能为空，脚本未导入") == "Version cannot be empty; script not imported" &&
+                    L.T("元数据写回失败，脚本未导入：") ==
+                        "Metadata write-back failed; script not imported: " &&
+                    L.T("不改则保持脚本原样；改动会在导入时写回 // @ 头，其它元数据不动。")
+                        .StartsWith("Leave unchanged", StringComparison.Ordinal) &&
+                    L.T("例如：https://example.com/*（一行一条）")
+                        .StartsWith("e.g.", StringComparison.Ordinal) &&
+                    L.T("例如：https://example.com/admin/*（一行一条）")
+                        .StartsWith("e.g.", StringComparison.Ordinal),
+                    "lang=" + L.Language);
+                Check("backup/restore strings are translated",
+                    L.T("整体备份") == "Backup all" &&
+                    L.T("恢复备份") == "Restore backup" &&
+                    L.T("先清空现有脚本再恢复") == "Clear existing scripts first" &&
+                    L.T("不支持的备份格式") == "Unsupported backup format" &&
+                    L.T("DDL 快照会在下次打开或刷新目标站点后自动重建。")
+                        .StartsWith("The DDL snapshot", StringComparison.Ordinal),
+                    "lang=" + L.Language);
+                L.Apply(c5SavedLang);
+
+                // ---- 备份格式校验（纯函数，不写用户数据） ----
+                ScriptBundle badBundle;
+                string badError;
+                Check("bundle rejects empty input",
+                    !ScriptBundleFile.TryParse("", out badBundle, out badError) &&
+                    badError.Length > 0, badError);
+                Check("bundle rejects an unknown format",
+                    !ScriptBundleFile.TryParse("{\"Format\":99,\"Scripts\":[]}",
+                        out badBundle, out badError), badError);
+                Check("bundle rejects an empty script body",
+                    !ScriptBundleFile.TryParse("{\"Format\":1,\"Scripts\":[{\"Code\":\"\"}]}",
+                        out badBundle, out badError), badError);
+                Check("bundle rejects an unknown attachment kind",
+                    !ScriptBundleFile.TryParse(
+                        "{\"Format\":1,\"Scripts\":[],\"Attachments\":[{\"Kind\":\"x\"}]}",
+                        out badBundle, out badError), badError);
+                Check("DDL target glob matches only the intended site",
+                    DdlRestore.Matches("https://pgadmin.example.com/sqleditor/panel/1",
+                        "https://pgadmin.example.com/*") &&
+                    !DdlRestore.Matches("https://other.example/x",
+                        "https://pgadmin.example.com/*"), "glob");
             }
 
             private static string RenderRealMenu(bool dark)

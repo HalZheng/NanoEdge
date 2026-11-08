@@ -381,6 +381,16 @@ namespace NanoEdge
             Content = _root;
 
             _browser = new BrowserHost(_tabHost, _settings);
+            // 恢复备份后，已经打开的目标站点页面可以立刻试一次，不必等下次刷新。
+            DdlRestore.PendingChanged += () =>
+            {
+                foreach (var tab in _tabs.ToList())
+                {
+                    var core = _browser.Core(tab);
+                    if (core == null) continue;
+                    var unused = DdlRestore.TryInjectAsync(core, core.Source);
+                }
+            };
             _browser.TitleChanged += t =>
             {
                 HistoryStore.UpdateTitle(t.Url, t.Title);

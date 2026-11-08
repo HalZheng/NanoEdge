@@ -1414,6 +1414,30 @@ HKCU\Software\RegisteredApplications                    -> NanoEdge = ...\Capabi
 
 `Ctrl+J` 之所以新开标签而不是替换当前标签：7.10 的内部页会 `Dispose()` 当前 WebView2，正在下载的页面不该被这个动作打断。
 
+### 7.13 用户脚本整体备份与恢复（0.1.4 新增）
+
+**目标**：公司内部把「单 exe + 一个备份文件」交给同事，对方在 `nano://scripts` 点一次「恢复备份」即可拿到整套注入脚本（含每种类型的多站点匹配规则），不逐条重配。
+
+| 维度 | 做法 |
+|---|---|
+| 格式 | 单个 UTF-8 无 BOM 的 `.json`：`Format=1` / `App` / `CreatedUtc` / `Scripts[]` / `Attachments[]`；不引入压缩库，exe 体积不变 |
+| 脚本条目 | `Name/Namespace/Version` 仅用于展示，**身份以 `Code` 解析出的 `@namespace` + `@name` 为准**（本地随机 `Id` 换机无意义）；`Code` 是完整 `.user.js` 源码，`Requires[]` 存已固化的依赖正文 |
+| 不含 | GM 运行值（`script-values.json`）、按站点临时禁用（本来就是内存态）、浏览器设置 / 会话 / Cookie、WebView2 用户数据目录 |
+| 恢复语义 | 默认**合并**：同名更新、异名新增；确认卡给「先清空现有脚本再恢复」开关（默认关）用于完全还原 |
+| 确认 | 恢复前必须过确认卡：新增 / 覆盖数、脚本名、权限清单、DDL 附件与目标站点；不允许静默写入 |
+| 生效 | 沿用 7.3：脚本改动只在下次导航或刷新后生效，UI 写明，不假装热更新 |
+| 入口 | `nano://scripts` 的两个按钮「整体备份」「恢复备份」；不做拖拽文件还原 |
+
+**DDL 附件（v1 只支持 `pg4-assist`）**：`Attachments[]` 里 `Kind="pg4-ddl"`，带 `Name`（文件名）、`Text`（DDL 源文本）、`Target`（目标站点 glob）。不搬 IndexedDB——`pg4-assist` 的快照存在网页 IndexedDB、配置在 localStorage，按 origin 隔离且混有登录态，直接复制用户数据目录不可用；而它已暴露 `window.__pg4.importDdlText(文本, 名称, 文件名)`，喂回源文本即可重建，所以备份只带**原始 DDL 文本**，不带解析结果。
+
+- 恢复时把文本固化成 `%APPDATA%\NanoEdge\ddl-pending.json`，只登记文件名、文本、目标站点和一次性 `Token`；**不进 GM 值、不进 `.user.js`**——7.3 的 GM 值与脚本源码会整包注入每个页面，几 MB 的 DDL 会拖慢所有标签。
+- 触发时机：`CoreWebView2.NavigationCompleted` 且 URL 命中 `Target` 时，宿主注入一段自包含 JS：等 `window.__pg4` 就绪（40 × 250ms 重试）→ `core.listSnapshots()` 按 `name + bytes` 幂等检查 → `importDdlText()` 重新解析并激活 → 带 `Token` 发 `ddlDone` 回执。回执校验通过才清 pending，页面伪造不了。
+- 已打开的匹配页面在恢复后通过 `DdlRestore.PendingChanged` 立刻试一次；没就绪就静默留到下次导航，不弹错误。备份时未填目标站点则只打包文本并提示，不自动重建。
+
+**安全**：备份文件是纯文本，但恢复的脚本能读改页面、借登录态发请求；确认卡列出权限并提示只恢复可信来源。`Target` 由备份方填写并随文件传递，宿主不硬编码任何公司域名。
+
+**明确不做**：拖拽文件自动还原（收益不抵 WebView2 HwndHost 的窗口级拖文件处理成本）；通用附件协议（v1 只有 `pg4-ddl` 一种）；云同步、自动更新、备份加密。
+
 ## 8. 数据模型（草图）
 
 ```csharp

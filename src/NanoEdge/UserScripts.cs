@@ -49,6 +49,16 @@ namespace NanoEdge
         }
     }
 
+    // 批次 B / C5：脚本管理页可编辑的四个元数据字段。
+    // null 表示「这次没改这个字段」，回写时必须原样保留源码里对应的 // @ 行。
+    public sealed class ScriptMetadataEdit
+    {
+        public string Name;
+        public string Version;
+        public List<string> Matches;
+        public List<string> Excludes;
+    }
+
     // 元数据解析 + 匹配规则编译。C# 只产出「JS 正则源码字符串」，真正拿 location.href
     // 去匹配的是注入到页面里的引导器，这样规则只有一份实现，不用在 C#/JS 两边各写一遍。
     public static class ScriptParser
@@ -60,11 +70,14 @@ namespace NanoEdge
             "GM_info", "unsafeWindow"
         };
 
+        // Parse 与回写共用同一条规则，保证写进去的值能被原样读回来。
+        internal static readonly Regex MetaLine =
+            new Regex(@"^\s*//\s*@([\w-]+)\s+(.+?)\s*$", RegexOptions.Multiline);
+
         public static UserScript Parse(string code)
         {
             var script = new UserScript { Code = code ?? "" };
-            var meta = new Regex(@"^\s*//\s*@([\w-]+)\s+(.+?)\s*$", RegexOptions.Multiline);
-            foreach (Match m in meta.Matches(script.Code))
+            foreach (Match m in MetaLine.Matches(script.Code))
             {
                 var key = m.Groups[1].Value.ToLowerInvariant();
                 var value = m.Groups[2].Value.Trim();
@@ -97,6 +110,130 @@ namespace NanoEdge
             if (string.IsNullOrWhiteSpace(script.Namespace)) script.Namespace = "local";
             if (string.IsNullOrWhiteSpace(script.Version)) script.Version = "1.0";
             return script;
+        }
+
+        // 把可编辑字段写回 // @ 头（C5）。约束：
+        //  1) 只动 name/version/match/exclude；其它 // @ 行（@grant / @run-at / @include /
+        //     @require / @namespace / 未知键）连同顺序、缩进、对齐空白全部原样保留；
+        //  2) 同一键的多行合并到它第一次出现的位置，一行一个值；原本没有的键补在头块结束标记前；
+        //  3) 与 Parse 共用 MetaLine，写回后重新解析必须能还原这四个字段；
+        //  4) 值里的换行一律拒绝，避免用名称/版本伪造出新的 // @ 行；
+        //  5) 字段为 null 时不参与，用户直接改源码里的 // @ 行不会被结构化字段覆盖。
+        // 失败返回 null 并给出原因，调用方必须把原因显示给用户。
+        public static string RewriteMetadata(string code, ScriptMetadataEdit edit, out string error)
+        {
+            error = "";
+            if (code == null || edit == null)
+            {
+                error = L.T("元数据写回失败：内容为空");
+                return null;
+            }
+
+            var name = NormalizeScalar(edit.Name);
+            var version = NormalizeScalar(edit.Version);
+            var matches = NormalizeList(edit.Matches);
+            var excludes = NormalizeList(edit.Excludes);
+            if ((edit.Name != null && name == null) || (edit.Version != null && version == null))
+            {
+                error = L.T("名称和版本不能为空，也不能包含换行");
+                return null;
+            }
+            if ((edit.Matches != null && matches == null) || (edit.Excludes != null && excludes == null))
+            {
+                error = L.T("匹配和排除规则不能包含换行");
+                return null;
+            }
+
+            var wanted = new Dictionary<string, List<string>>();
+            if (edit.Name != null) wanted["name"] = new List<string> { name };
+            if (edit.Version != null) wanted["version"] = new List<string> { version };
+            if (edit.Matches != null) wanted["match"] = matches;
+            if (edit.Excludes != null) wanted["exclude"] = excludes;
+            if (wanted.Count == 0) return code;   // 只改了源码框：一个字节都不动
+
+            var newline = code.IndexOf("\r\n", StringComparison.Ordinal) >= 0 ? "\r\n" : "\n";
+            var lines = code.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+            var output = new List<string>();
+            var written = new HashSet<string>();
+
+            foreach (var line in lines)
+            {
+                var m = MetaLine.Match(line);
+                var key = m.Success ? m.Groups[1].Value.ToLowerInvariant() : null;
+                if (key == null || !wanted.ContainsKey(key)) { output.Add(line); continue; }
+                if (!written.Add(key)) continue;   // 该键其余旧行整体丢弃
+                var prefix = line.Substring(0, m.Groups[2].Index);
+                foreach (var value in wanted[key]) output.Add(prefix + value);
+            }
+
+            // 源码里原本没有的键：按 name/version/match/exclude 顺序一次性补齐。
+            var extra = new List<string>();
+            foreach (var key in new[] { "name", "version", "match", "exclude" })
+            {
+                if (written.Contains(key) || !wanted.ContainsKey(key)) continue;
+                foreach (var value in wanted[key]) extra.Add(DefaultPrefix(key) + value);
+            }
+            if (extra.Count > 0) output.InsertRange(InsertionPoint(output), extra);
+
+            var result = string.Join(newline, output.ToArray());
+            var check = Parse(result);
+            var consistent =
+                (!wanted.ContainsKey("name") || check.Name == wanted["name"][0]) &&
+                (!wanted.ContainsKey("version") || check.Version == wanted["version"][0]) &&
+                (!wanted.ContainsKey("match") || check.Matches.SequenceEqual(wanted["match"])) &&
+                (!wanted.ContainsKey("exclude") || check.Excludes.SequenceEqual(wanted["exclude"]));
+            if (!consistent)
+            {
+                error = L.T("写回后重新解析不一致");
+                return null;
+            }
+            return result;
+        }
+
+        private static string NormalizeScalar(string value)
+        {
+            if (value == null) return null;
+            var text = value.Trim();
+            if (text.Length == 0 || text.IndexOfAny(new[] { '\r', '\n' }) >= 0) return null;
+            return text;
+        }
+
+        private static List<string> NormalizeList(List<string> values)
+        {
+            if (values == null) return null;
+            var result = new List<string>();
+            foreach (var raw in values)
+            {
+                if (raw == null) continue;
+                var text = raw.Trim();
+                if (text.Length == 0) continue;
+                if (text.IndexOfAny(new[] { '\r', '\n' }) >= 0) return null;
+                result.Add(text);
+            }
+            return result;
+        }
+
+        // 新增行沿用项目里 // @ 头的对齐风格。
+        private static string DefaultPrefix(string key)
+        {
+            switch (key)
+            {
+                case "name": return "// @name         ";
+                case "version": return "// @version      ";
+                case "match": return "// @match        ";
+                default: return "// @exclude      ";
+            }
+        }
+
+        private static int InsertionPoint(List<string> lines)
+        {
+            for (var i = 0; i < lines.Count; i++)
+                if (Regex.IsMatch(lines[i], @"^\s*//\s*==/UserScript==\s*$")) return i;
+            for (var i = lines.Count - 1; i >= 0; i--)
+                if (MetaLine.IsMatch(lines[i])) return i + 1;
+            for (var i = 0; i < lines.Count; i++)
+                if (Regex.IsMatch(lines[i], @"^\s*//\s*==UserScript==\s*$")) return i + 1;
+            return 0;
         }
 
         public static List<string> MatchRegexes(UserScript script)

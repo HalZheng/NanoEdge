@@ -9,6 +9,7 @@ using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 using System.Windows;
+using System.Windows.Controls;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using Microsoft.Web.WebView2.Core;
@@ -84,6 +85,11 @@ namespace NanoEdge
                 Directory.CreateDirectory(ScriptStore.Folder);
                 ScriptStore.Persist = true;
                 ScriptStore.Reload();
+
+                // 备份/恢复的待导入状态也落在临时目录，别碰用户真实数据。
+                DdlRestore.PendingPath = Path.Combine(_temp, "ddl-pending.json");
+                DdlRestore.LastTargetPath = Path.Combine(_temp, "ddl-target.txt");
+                DdlRestore.Clear();
 
                 StartServer();
                 _base = "http://127.0.0.1:" + _port;
@@ -404,7 +410,8 @@ __m4.readMissing = GM_getValue('nope', 'fallback');");
                     InternalPages.Normalize("nano://whatever") == InternalPages.Start,
                     InternalPages.Normalize("nano://whatever"));
 
-                var scriptsPage = new ScriptsPage(m => { }, () => siteKey);
+                var c5Messages = new List<string>();
+                var scriptsPage = new ScriptsPage(m => c5Messages.Add(m), () => siteKey);
                 Check("scripts page is pure WPF",
                     InternalPages.Create("nano://scripts", _w._settings, (u, n) => { }, m => { },
                         () => siteKey) is ScriptsPage, "type=ScriptsPage");
@@ -437,13 +444,111 @@ __m4.readMissing = GM_getValue('nope', 'fallback');");
                     ScriptStore.DisabledSites.Count == 0,
                     "disabled=" + ScriptStore.DisabledSites.Count);
 
-                // 编辑器（等宽 + 行号）
+                // 编辑器（等宽 + 行号 + C5 可编辑元数据）
                 var editTarget = ScriptStore.All().First(s => s.Name == "M4 start");
                 scriptsPage.BeginEdit(editTarget);
-                RenderPage(scriptsPage, Path.Combine(_root, "out", "m4-scripts-editor.png"), 980, 620);
+                RenderPage(scriptsPage, Path.Combine(_root, "out", "m4-scripts-editor.png"), 1200, 780);
                 Check("editor rendered with line numbers",
                     File.Exists(Path.Combine(_root, "out", "m4-scripts-editor.png")),
                     "out/m4-scripts-editor.png");
+                Check("C5 editor exposes the current name",
+                    scriptsPage.MetaNameForTest == "M4 start",
+                    "field=" + scriptsPage.MetaNameForTest);
+
+                // ---------- 11a. C5：改四个字段 → 回写 // @ 头 → 导出 → 再导入 ----------
+                Func<string, List<string>> c5Headers = code =>
+                    (code ?? "").Replace("\r\n", "\n").Split('\n')
+                        .Where(l =>
+                        {
+                            var m = ScriptParser.MetaLine.Match(l);
+                            if (!m.Success) return false;
+                            var k = m.Groups[1].Value.ToLowerInvariant();
+                            return k != "name" && k != "version" && k != "match" && k != "exclude";
+                        }).ToList();
+                var c5OldHeaders = c5Headers(editTarget.Code);
+
+                scriptsPage.SetMetadataForTest("M4 renamed", "4.5",
+                    "https://c5.example/*\nhttp://127.0.0.1:*/c5/*",
+                    "https://c5.example/admin/*");
+                RenderPage(scriptsPage, Path.Combine(_root, "out", "m4-scripts-meta.png"), 1200, 780);
+                Check("C5 metadata editor rendered",
+                    File.Exists(Path.Combine(_root, "out", "m4-scripts-meta.png")),
+                    "out/m4-scripts-meta.png");
+                scriptsPage.SaveEditorForTest();
+
+                // 重新打开编辑器：字段与源码头都必须已经是保存后的值。
+                scriptsPage.BeginEdit(editTarget);
+                RenderPage(scriptsPage, Path.Combine(_root, "out", "m4-scripts-meta-saved.png"), 1200, 780);
+                Check("C5 saved editor shows the rewritten // @ header",
+                    File.Exists(Path.Combine(_root, "out", "m4-scripts-meta-saved.png")) &&
+                    (scriptsPage.EditorCodeForTest ?? "").Contains("// @name         M4 renamed") &&
+                    (scriptsPage.EditorCodeForTest ?? "").Contains("https://c5.example/*"),
+                    "out/m4-scripts-meta-saved.png");
+
+                Check("C5 save rewrites the four // @ fields in the source",
+                    editTarget.Code.Contains("M4 renamed") && editTarget.Code.Contains("4.5") &&
+                    editTarget.Code.Contains("https://c5.example/*") &&
+                    editTarget.Code.Contains("http://127.0.0.1:*/c5/*") &&
+                    editTarget.Code.Contains("https://c5.example/admin/*") &&
+                    !editTarget.Code.Contains("M4 start"),
+                    "head=" + editTarget.Code.Split('\n')[1]);
+                Check("C5 store metadata refreshed after save",
+                    editTarget.Name == "M4 renamed" && editTarget.Version == "4.5" &&
+                    editTarget.Matches.Count == 2 && editTarget.Excludes.Count == 1,
+                    editTarget.Name + " v" + editTarget.Version +
+                    " matches=" + editTarget.Matches.Count + " excludes=" + editTarget.Excludes.Count);
+                Check("C5 other // @ headers kept verbatim and in order",
+                    c5OldHeaders.Count > 0 && c5OldHeaders.SequenceEqual(c5Headers(editTarget.Code)),
+                    "before=" + c5OldHeaders.Count + " after=" + c5Headers(editTarget.Code).Count);
+                Check("C5 list refreshed after save",
+                    scriptsPage.RenderedRowCount == ScriptStore.All().Count,
+                    "rows=" + scriptsPage.RenderedRowCount + " store=" + ScriptStore.All().Count);
+
+                var c5File = File.ReadAllText(editTarget.FilePath, Encoding.UTF8);
+                Check("C5 .user.js on disk equals the rewritten source",
+                    c5File == editTarget.Code, "file=" + editTarget.FilePath);
+                var c5FromFile = ScriptParser.Parse(c5File);
+                Check("C5 exported .user.js re-imports with the same metadata",
+                    c5FromFile.Name == "M4 renamed" && c5FromFile.Version == "4.5" &&
+                    c5FromFile.Matches.SequenceEqual(editTarget.Matches) &&
+                    c5FromFile.Excludes.SequenceEqual(editTarget.Excludes),
+                    "name=" + c5FromFile.Name + " v" + c5FromFile.Version);
+
+                var c5CountBefore = ScriptStore.All().Count;
+                scriptsPage.StageImport(c5File, "c5-exported.user.js");
+                Check("C5 import card shows the edited name",
+                    (scriptsPage.LastImportSummary ?? "").Contains("M4 renamed"),
+                    (scriptsPage.LastImportSummary ?? "").Replace("\n", " / "));
+                scriptsPage.ConfirmImport();
+                var c5Reimported = ScriptStore.All().FirstOrDefault(
+                    s => s.Name == "M4 renamed" && !ReferenceEquals(s, editTarget));
+                Check("C5 re-imported script keeps all four fields",
+                    c5Reimported != null && c5Reimported.Version == "4.5" &&
+                    c5Reimported.Matches.SequenceEqual(editTarget.Matches) &&
+                    c5Reimported.Excludes.SequenceEqual(editTarget.Excludes),
+                    c5Reimported == null ? "not found" : c5Reimported.Name);
+                if (c5Reimported != null) scriptsPage.RemoveScript(c5Reimported);
+                Check("C5 re-import cleanup keeps the store count",
+                    ScriptStore.All().Count == c5CountBefore,
+                    "count=" + ScriptStore.All().Count);
+
+                // 只改源码、字段没动 → 源码里的 // @ 行不能被旧字段值覆盖回去。
+                var c5Hand = editTarget.Code.Replace("M4 renamed", "M4 hand-edited");
+                scriptsPage.BeginEdit(editTarget);
+                scriptsPage.SetCodeForTest(c5Hand);
+                scriptsPage.SaveEditorForTest();
+                Check("C5 hand-editing the source is not overwritten by stale fields",
+                    editTarget.Code == c5Hand && editTarget.Name == "M4 hand-edited",
+                    "name=" + editTarget.Name);
+
+                // 失败必须有可见反馈，且不落盘。
+                scriptsPage.BeginEdit(editTarget);
+                c5Messages.Clear();
+                scriptsPage.SetMetadataForTest("", null, null, null);
+                scriptsPage.SaveEditorForTest();
+                Check("C5 empty name shows a visible error and does not save",
+                    c5Messages.Any(m => m.Contains("名称")) && editTarget.Code == c5Hand,
+                    "messages=" + string.Join(" / ", c5Messages));
 
                 // 导入确认：先展示 @grant，确认前不入库
                 var beforeImport = ScriptStore.All().Count;
@@ -465,7 +570,7 @@ GM_setValue('imported', true);";
                     (scriptsPage.LastImportSummary ?? "").Contains("GM_setValue") &&
                     (scriptsPage.LastImportSummary ?? "").Contains("GM_xmlhttpRequest"),
                     (scriptsPage.LastImportSummary ?? "").Replace("\n", " / "));
-                RenderPage(scriptsPage, Path.Combine(_root, "out", "m4-import.png"), 980, 620);
+                RenderPage(scriptsPage, Path.Combine(_root, "out", "m4-import.png"), 1200, 780);
                 Check("import confirmation rendered",
                     File.Exists(Path.Combine(_root, "out", "m4-import.png")), "out/m4-import.png");
 
@@ -482,6 +587,295 @@ GM_setValue('imported', true);";
                     ScriptStore.All().Count == beforeImport &&
                     (imported == null || !File.Exists(imported.FilePath)),
                     "count=" + ScriptStore.All().Count);
+
+                // ---------- 11c. C5：导入确认卡直接配置元数据 ----------
+                var c5CardCode = "// ==UserScript==\r\n" +
+                                 "// @name         Card Original\r\n" +
+                                 "// @namespace    c5.card\r\n" +
+                                 "// @version      0.1\r\n" +
+                                 "// @match        https://old.example/*\r\n" +
+                                 "// @grant        GM_setValue\r\n" +
+                                 "// @run-at       document-start\r\n" +
+                                 "// @include      /regex-literal/\r\n" +
+                                 "// @exclude      https://old.example/admin/*\r\n" +
+                                 "// ==/UserScript==\r\n" +
+                                 "console.log('card');\r\n";
+                var c5CardBefore = ScriptStore.All().Count;
+                scriptsPage.StageImport(c5CardCode, "c5-card.user.js");
+                Check("C5 import card prefills the parsed name",
+                    scriptsPage.ImportNameForTest == "Card Original",
+                    "field=" + scriptsPage.ImportNameForTest);
+                Check("C5 import card still waits for confirmation",
+                    scriptsPage.HasPendingImport && ScriptStore.All().Count == c5CardBefore,
+                    "count=" + ScriptStore.All().Count);
+
+                scriptsPage.SetImportMetadataForTest("Card Renamed", "2.0",
+                    "https://a.example/*\nhttps://b.example/*",
+                    "https://a.example/admin/*\nhttps://b.example/login/*");
+                RenderPage(scriptsPage, Path.Combine(_root, "out", "m4-import-meta.png"), 1200, 780);
+                Check("C5 editable import card rendered",
+                    File.Exists(Path.Combine(_root, "out", "m4-import-meta.png")),
+                    "out/m4-import-meta.png");
+
+                scriptsPage.ConfirmImport();
+                var c5Card = ScriptStore.All().FirstOrDefault(s => s.Name == "Card Renamed");
+                Check("C5 import card edits are stored",
+                    c5Card != null && c5Card.Version == "2.0" &&
+                    c5Card.Matches.Count == 2 && c5Card.Excludes.Count == 2,
+                    c5Card == null ? "not found" : c5Card.Name + " v" + c5Card.Version +
+                    " matches=" + c5Card.Matches.Count + " excludes=" + c5Card.Excludes.Count);
+                Check("C5 import card writes the // @ header into the .user.js file",
+                    c5Card != null && File.Exists(c5Card.FilePath) &&
+                    File.ReadAllText(c5Card.FilePath, Encoding.UTF8) == c5Card.Code &&
+                    c5Card.Code.Contains("// @name         Card Renamed") &&
+                    c5Card.Code.Contains("https://a.example/*") &&
+                    !c5Card.Code.Contains("Card Original"),
+                    c5Card == null ? "no script" : "file=" + c5Card.FilePath);
+                Check("C5 import card keeps @grant / @run-at / @namespace / @include",
+                    c5Card != null && c5Card.Namespace == "c5.card" &&
+                    c5Card.RunAt == "document-start" &&
+                    c5Card.Grants.Count == 1 && c5Card.Grants[0] == "GM_setValue" &&
+                    c5Card.Includes.SequenceEqual(new[] { "/regex-literal/" }),
+                    c5Card == null ? "no script" : "grant=" + string.Join(",", c5Card.Grants));
+                if (c5Card != null) scriptsPage.RemoveScript(c5Card);
+
+                // 字段没改 → 原样导入，一个字节都不动。
+                scriptsPage.StageImport(c5CardCode, "c5-untouched.user.js");
+                scriptsPage.ConfirmImport();
+                var c5Untouched = ScriptStore.All().FirstOrDefault(s => s.Name == "Card Original");
+                Check("C5 untouched import card keeps the source byte-for-byte",
+                    c5Untouched != null && c5Untouched.Code == c5CardCode,
+                    c5Untouched == null ? "not found" :
+                        "same=" + (c5Untouched.Code == c5CardCode));
+                if (c5Untouched != null) scriptsPage.RemoveScript(c5Untouched);
+
+                // 名称清空：可见反馈、不入库、保留待导入状态可以改完再点。
+                scriptsPage.StageImport(c5CardCode, "c5-invalid.user.js");
+                c5Messages.Clear();
+                scriptsPage.SetImportMetadataForTest("", null, null, null);
+                scriptsPage.ConfirmImport();
+                Check("C5 empty name on the import card is rejected",
+                    c5Messages.Any(m => m.Contains("名称")) &&
+                    ScriptStore.All().Count == c5CardBefore && scriptsPage.HasPendingImport,
+                    "messages=" + string.Join(" / ", c5Messages));
+                scriptsPage.CloseOverlayForTest();
+                Check("C5 import card cleanup keeps the store count",
+                    ScriptStore.All().Count == c5CardBefore,
+                    "count=" + ScriptStore.All().Count);
+
+                // ---------- 11d. 删除确认按钮必须留在行内且点得到 ----------
+                Button deleteBtn = null;
+                WalkVisual(scriptsPage, o =>
+                {
+                    var b = o as Button;
+                    if (b != null && Equals(b.ToolTip, L.T("删除脚本"))) deleteBtn = b;
+                });
+                Check("row delete button exists", deleteBtn != null,
+                    deleteBtn == null ? "not found" : "width=" + deleteBtn.ActualWidth);
+                if (deleteBtn != null)
+                {
+                    deleteBtn.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+                    scriptsPage.Measure(new Size(1200, 780));
+                    scriptsPage.Arrange(new Rect(0, 0, 1200, 780));
+                    scriptsPage.UpdateLayout();
+                    RenderPage(scriptsPage, Path.Combine(_root, "out", "m4-delete-confirm.png"), 1200, 780);
+                    var rowGrid = deleteBtn.Parent as Grid;
+                    var origin = rowGrid == null ? new Point(-1, -1)
+                        : deleteBtn.TransformToVisual(rowGrid).Transform(new Point(0, 0));
+                    Check("confirm button stays inside the row and is wide enough to click",
+                        Equals(deleteBtn.Content, L.T("再点一次")) &&
+                        Grid.GetColumnSpan(deleteBtn) >= 2 &&
+                        deleteBtn.ActualWidth >= 70 &&
+                        rowGrid != null && origin.X >= 0 &&
+                        origin.X + deleteBtn.ActualWidth <= rowGrid.ActualWidth + 1,
+                        "content=" + deleteBtn.Content + " width=" + deleteBtn.ActualWidth +
+                        " span=" + Grid.GetColumnSpan(deleteBtn) +
+                        " x=" + origin.X.ToString("0") +
+                        " rowWidth=" + (rowGrid == null ? -1 : rowGrid.ActualWidth));
+                    Check("delete confirmation screenshot written",
+                        File.Exists(Path.Combine(_root, "out", "m4-delete-confirm.png")),
+                        "out/m4-delete-confirm.png");
+                }
+
+                // ---------- 11e. 空匹配/排除框的格式示例 placeholder ----------
+                var plainCode = "// ==UserScript==\n// @name    No Matches\n" +
+                                "// @version 1.0\n// ==/UserScript==\nconsole.log('x');";
+                scriptsPage.StageImport(plainCode, "c5-plain.user.js");
+                var hints = TaggedTextBlocks(scriptsPage, "meta-placeholder");
+                Check("empty match/exclude boxes show format hints",
+                    hints.Count == 2 && hints.All(h => h.Visibility == Visibility.Visible),
+                    "count=" + hints.Count +
+                    " visible=" + hints.Count(h => h.Visibility == Visibility.Visible));
+                Check("placeholder text contains a format example",
+                    hints.Count == 2 && hints.All(h => (h.Text ?? "").Contains("https://")),
+                    hints.Count == 0 ? "none" : hints[0].Text);
+                RenderPage(scriptsPage, Path.Combine(_root, "out", "m4-import-placeholder.png"), 1200, 780);
+                Check("placeholder screenshot written",
+                    File.Exists(Path.Combine(_root, "out", "m4-import-placeholder.png")),
+                    "out/m4-import-placeholder.png");
+                scriptsPage.SetImportMetadataForTest(null, null, "https://x.example/*", null);
+                var hintsAfter = TaggedTextBlocks(scriptsPage, "meta-placeholder");
+                Check("placeholder hides once the box has content",
+                    hintsAfter.Count == 2 &&
+                    hintsAfter.Count(h => h.Visibility == Visibility.Visible) == 1,
+                    "visible=" + hintsAfter.Count(h => h.Visibility == Visibility.Visible));
+                scriptsPage.CloseOverlayForTest();
+
+                // ---------- 11f. 整体备份 / 恢复 ----------
+                var bundleBefore = ScriptStore.All().Count;
+                const string ddlText = "CREATE TABLE public.demo (id int);";
+                var bundle = ScriptBundleFile.FromStore(new[]
+                {
+                    new ScriptBundleAttachment
+                    {
+                        Kind = ScriptBundleFile.DdlKind,
+                        Name = "schema.sql",
+                        Text = ddlText,
+                        Target = _base + "/page*"
+                    }
+                });
+                Check("bundle captures every script and the DDL attachment",
+                    bundle.Scripts.Count == bundleBefore && bundle.Attachments.Count == 1,
+                    "scripts=" + bundle.Scripts.Count + " attachments=" + bundle.Attachments.Count);
+                ScriptBundle parsedBundle;
+                string bundleError;
+                Check("bundle json round-trips",
+                    ScriptBundleFile.TryParse(ScriptBundleFile.ToJson(bundle),
+                        out parsedBundle, out bundleError) &&
+                    parsedBundle.Scripts.Count == bundleBefore &&
+                    parsedBundle.Attachments.Count == 1 &&
+                    parsedBundle.Attachments[0].Text == ddlText,
+                    bundleError);
+                var mergePlan = ScriptBundleFile.Plan(parsedBundle, false);
+                Check("default restore merges (no duplicates)",
+                    mergePlan.Added == 0 && mergePlan.Updated == bundleBefore,
+                    "added=" + mergePlan.Added + " updated=" + mergePlan.Updated);
+                var clearPlan = ScriptBundleFile.Plan(parsedBundle, true);
+                Check("clear-first restore adds everything",
+                    clearPlan.Added == bundleBefore && clearPlan.Updated == 0,
+                    "added=" + clearPlan.Added + " updated=" + clearPlan.Updated);
+
+                scriptsPage.StageBundleForTest(parsedBundle, "c5-bundle.json");
+                RenderPage(scriptsPage, Path.Combine(_root, "out", "m4-bundle-restore.png"), 1200, 780);
+                Check("restore confirmation card rendered",
+                    File.Exists(Path.Combine(_root, "out", "m4-bundle-restore.png")),
+                    "out/m4-bundle-restore.png");
+                scriptsPage.CommitRestoreForTest();
+                Check("merged restore keeps the store count",
+                    ScriptStore.All().Count == bundleBefore,
+                    "count=" + ScriptStore.All().Count);
+
+                var pending = DdlRestore.Load();
+                Check("DDL pending state is written after restore",
+                    pending != null && pending.Text == ddlText &&
+                    pending.Target == _base + "/page*" &&
+                    !string.IsNullOrEmpty(pending.Token),
+                    pending == null ? "no pending" : "name=" + pending.Name);
+                Check("DDL target only matches the intended site",
+                    pending != null &&
+                    DdlRestore.Matches(_base + "/page?v=1", pending.Target) &&
+                    !DdlRestore.Matches("https://other.example/x", pending.Target),
+                    "target=" + (pending == null ? "-" : pending.Target));
+                var ddlScript = pending == null ? "" : DdlRestore.BuildScript(pending);
+                Check("DDL inject script waits for __pg4, de-dupes and reports back",
+                    ddlScript.Contains("__pg4") && ddlScript.Contains("listSnapshots") &&
+                    ddlScript.Contains("importDdlText") && ddlScript.Contains("ddlDone") &&
+                    pending != null && ddlScript.Contains(pending.Token),
+                    "len=" + ddlScript.Length);
+                DdlRestore.Complete("forged-token");
+                Check("forged ddlDone does not clear pending",
+                    DdlRestore.Load() != null, "still pending");
+                DdlRestore.Complete(pending == null ? "" : pending.Token);
+                Check("valid ddlDone clears pending",
+                    DdlRestore.Load() == null, "cleared");
+
+                scriptsPage.ShowBackupCardForTest();
+                RenderPage(scriptsPage, Path.Combine(_root, "out", "m4-bundle-backup.png"), 1200, 780);
+                Check("backup card rendered",
+                    File.Exists(Path.Combine(_root, "out", "m4-bundle-backup.png")),
+                    "out/m4-bundle-backup.png");
+                scriptsPage.CloseOverlayForTest();
+
+                // ---------- 11g. 真实闭环：导出文件 → 读回恢复 → 页面重建 → 回执 → 幂等 ----------
+                const string chainDdl = "CREATE TABLE public.chain_demo (id int, note text);";
+                var chainBundle = ScriptBundleFile.FromStore(new[]
+                {
+                    new ScriptBundleAttachment
+                    {
+                        Kind = ScriptBundleFile.DdlKind,
+                        Name = "chain.sql",
+                        Text = chainDdl,
+                        Target = _base + "/ddl-page*"
+                    }
+                });
+                var chainPath = Path.Combine(_root, "out", "m4-bundle-chain.json");
+                File.WriteAllText(chainPath, ScriptBundleFile.ToJson(chainBundle),
+                    new UTF8Encoding(false));
+                var chainBytes = new FileInfo(chainPath).Length;
+                Check("real backup file written", File.Exists(chainPath) && chainBytes > 100,
+                    "bytes=" + chainBytes + " path=" + chainPath);
+
+                ScriptBundle chainRead;
+                string chainError;
+                Check("backup file re-read into a bundle",
+                    ScriptBundleFile.TryParse(File.ReadAllText(chainPath, Encoding.UTF8),
+                        out chainRead, out chainError) &&
+                    chainRead.Scripts.Count == bundleBefore &&
+                    chainRead.Attachments.Count == 1 &&
+                    chainRead.Attachments[0].Text == chainDdl,
+                    chainError);
+
+                var chainPage = new ScriptsPage(m => { }, () => "");
+                chainPage.StageBundleForTest(chainRead, "m4-bundle-chain.json");
+                chainPage.CommitRestoreForTest();
+                Check("restore from file wrote the pending DDL state",
+                    DdlRestore.Load() != null && DdlRestore.HasPending,
+                    "pending=" + DdlRestore.HasPending);
+
+                var chainTab = await OpenPageAsync(_base + "/ddl-page?v=1");
+                var chainCore = _w._browser.Core(chainTab);
+                Check("DDL probe page has a live WebView2", chainCore != null, "core");
+                var rebuilt = await WaitForAsync(() => DdlRestore.Load() == null, 12000);
+                Check("ddlDone receipt cleared the pending state", rebuilt,
+                    "pending=" + (DdlRestore.Load() == null ? "cleared" : "still there"));
+                if (chainCore != null)
+                {
+                    var calls = Num(await chainCore.ExecuteScriptAsync("String(window.__ddlCalls||0)"));
+                    var count = Num(await chainCore.ExecuteScriptAsync(
+                        "String(JSON.parse(localStorage.getItem('__neDdlSnapshots')||'[]').length)"));
+                    var len = Num(await chainCore.ExecuteScriptAsync(
+                        "String((JSON.parse(localStorage.getItem('__neDdlSnapshots')||'[]')[0]||{}).bytes||0)"));
+                    Check("page imported the DDL exactly once",
+                        calls == "1" && count == "1" && len == chainDdl.Length.ToString(),
+                        "calls=" + calls + " snapshots=" + count + " bytes=" + len);
+                    var status = await chainCore.ExecuteScriptAsync(
+                        "document.getElementById('ddl-status').textContent");
+                    Check("page shows the rebuilt snapshot",
+                        (status ?? "").Contains("chain.sql"), status ?? "");
+                    await CapturePreviewAsync(chainTab,
+                        Path.Combine(_root, "out", "m4-bundle-chain-page.png"));
+                    Check("DDL chain page screenshot written",
+                        File.Exists(Path.Combine(_root, "out", "m4-bundle-chain-page.png")),
+                        "out/m4-bundle-chain-page.png");
+                }
+
+                // 回执丢了但 pending 还在：同一页面再注入一次，必须被幂等检查挡住。
+                DdlRestore.Save(new DdlPending
+                {
+                    Name = "chain.sql",
+                    Text = chainDdl,
+                    Target = _base + "/ddl-page*",
+                    Token = "chain-idempotent"
+                });
+                var idempotent = await WaitForAsync(() => DdlRestore.Load() == null, 8000);
+                if (chainCore != null)
+                {
+                    var calls2 = Num(await chainCore.ExecuteScriptAsync("String(window.__ddlCalls||0)"));
+                    Check("second inject is a no-op (idempotent)",
+                        idempotent && calls2 == "1",
+                        "calls=" + calls2 + " cleared=" + idempotent);
+                }
+                DdlRestore.Clear();
 
                 // 主菜单入口 → 真实窗口
                 _w.OpenScripts();
@@ -745,6 +1139,13 @@ GM_setValue('imported', true);";
                             return;
                         }
 
+                        // 备份恢复链路：模拟 pg4-assist 的 __pg4 接口，验证 DDL 自动重建。
+                        if (path.StartsWith("/ddl-page", StringComparison.OrdinalIgnoreCase))
+                        {
+                            Write(stream, "200 OK", "text/html; charset=utf-8", DdlPage());
+                            return;
+                        }
+
                         if (path.StartsWith("/page", StringComparison.OrdinalIgnoreCase) ||
                             path.StartsWith("/excluded", StringComparison.OrdinalIgnoreCase) ||
                             path.StartsWith("/include", StringComparison.OrdinalIgnoreCase) ||
@@ -775,6 +1176,37 @@ GM_setValue('imported', true);";
                 stream.Write(head, 0, head.Length);
                 stream.Write(bytes, 0, bytes.Length);
                 stream.Flush();
+            }
+
+            // 只实现链路需要的两个接口：listSnapshots() 做幂等，importDdlText() 重建。
+            // 快照放 localStorage，刷新后仍在，能验证重复注入不会重复导入。
+            private static string DdlPage()
+            {
+                return "<!doctype html><html><head><meta charset=\"utf-8\">" +
+                       "<title>DDL restore probe</title><script>" +
+                       "var KEY='__neDdlSnapshots';window.__ddlCalls=0;" +
+                       "function loadSnaps(){try{return JSON.parse(localStorage.getItem(KEY)||'[]');}catch(e){return [];}}" +
+                       "function saveSnaps(l){try{localStorage.setItem(KEY,JSON.stringify(l));}catch(e){}}" +
+                       "var core={" +
+                       "listSnapshots:function(){return Promise.resolve(loadSnaps());}," +
+                       "importDdlText:function(text,name,fileName){" +
+                       "var l=loadSnaps();l.push({name:name,bytes:text.length,text:text});saveSnaps(l);" +
+                       "window.__ddlCalls=(window.__ddlCalls||0)+1;" +
+                       "var el=document.getElementById('ddl-status');" +
+                       "if(el){el.textContent='imported '+name+' ('+text.length+' B)';}" +
+                       "return Promise.resolve({meta:{name:name}});}" +
+                       "};window.__pg4={core:core,importDdlText:core.importDdlText};" +
+                       "</script></head><body style=\"margin:0;padding:18px;background:#111;" +
+                       "color:#eee;font:14px 'Segoe UI',sans-serif\">" +
+                       "<h1 style=\"font-size:18px;margin:0 0 12px 0\">NanoEdge · DDL 快照重建链路</h1>" +
+                       "<div id=\"ddl-status\" style=\"font-size:16px;padding:8px 0\">waiting…</div>" +
+                       "<p style=\"color:#888;font-size:12px\">模拟 pg4-assist 的 __pg4 接口</p>" +
+                       "</body></html>";
+            }
+
+            private static string Num(string raw)
+            {
+                return (raw ?? "").Trim('"');
             }
 
             private static string Page(string path)
@@ -837,6 +1269,26 @@ GM_setValue('imported', true);";
                     File.WriteAllText(path, _report.ToString(), Encoding.UTF8);
                 }
                 catch { }
+            }
+
+            private static void WalkVisual(DependencyObject root, Action<DependencyObject> visit)
+            {
+                if (root == null) return;
+                visit(root);
+                var count = VisualTreeHelper.GetChildrenCount(root);
+                for (var i = 0; i < count; i++)
+                    WalkVisual(VisualTreeHelper.GetChild(root, i), visit);
+            }
+
+            private static List<TextBlock> TaggedTextBlocks(DependencyObject root, string tag)
+            {
+                var result = new List<TextBlock>();
+                WalkVisual(root, o =>
+                {
+                    var block = o as TextBlock;
+                    if (block != null && Equals(block.Tag, tag)) result.Add(block);
+                });
+                return result;
             }
 
             private static void RenderPage(FrameworkElement page, string path, double width, double height)

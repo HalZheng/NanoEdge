@@ -373,6 +373,10 @@ namespace NanoEdge
                 NavigationDone?.Invoke(tab, core.Source, e.IsSuccess);
                 // 兜底：占位图/晚到的图标靠短重试补齐，不额外发网络请求。
                 if (e.IsSuccess) await FetchFaviconWithRetryAsync(core, tab);
+                // 备份恢复后的 DDL 快照：有待导入状态且命中目标站点才尝试重建。
+                // 平时 HasPending=false，导航完成路径零额外开销。
+                if (e.IsSuccess && DdlRestore.HasPending)
+                    await DdlRestore.TryInjectAsync(core, core.Source);
             };
 
             // SPEC 4.3 豁免来源：这些标志由内核事件维护，不靠轮询。

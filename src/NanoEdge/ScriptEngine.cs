@@ -195,6 +195,10 @@ window.__NE__.schedule(D.runAt, run);
                 case "xhr":
                     var unused = XhrAsync(core, msg);
                     break;
+                case "ddlDone":
+                    // 只清「待重建」标记，不执行敏感操作；token 由宿主注入脚本自带。
+                    DdlRestore.Complete(Str(msg, "token"));
+                    break;
             }
         }
 

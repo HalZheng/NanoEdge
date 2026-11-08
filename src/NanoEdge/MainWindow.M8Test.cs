@@ -210,6 +210,23 @@ document.addEventListener('DOMContentLoaded', function () {
                     imported != null && RequireFiles(imported).Length == 2,
                     imported == null ? "no script" : string.Join(",", RequireFiles(imported)));
 
+                // C5：只改元数据、没动 @require 时不能重新联网下载，已固化的本地正文继续用。
+                // 故意不改名，后面第 3 节还要按原名字查重载后的脚本。
+                scriptsPage.BeginEdit(imported);
+                scriptsPage.SetMetadataForTest(null, "2.0", null, null);
+                scriptsPage.SaveEditorForTest();
+                Check("C5 metadata-only save does not re-download @require",
+                    CountRequests("/lib1.js") == 1 && CountRequests("/lib2.js") == 1,
+                    string.Join(" | ", SnapshotRequests()));
+                Check("C5 @require bodies survive a metadata-only save",
+                    imported.RequireCode.Count == 2 &&
+                    imported.RequireCode.All(c => !string.IsNullOrEmpty(c)) &&
+                    RequireFiles(imported).Length == 2,
+                    "codes=" + imported.RequireCode.Count);
+                Check("C5 version is written back into the // @ header",
+                    imported.Version == "2.0" && (imported.Code ?? "").Contains("2.0"),
+                    "version=" + imported.Version);
+
                 // ---------- 3. 重启（重载索引）后依赖仍在 ----------
                 ScriptStore.Reload();
                 var reloaded = ScriptStore.All().FirstOrDefault(s => s.Name == "M8 require + gm");
