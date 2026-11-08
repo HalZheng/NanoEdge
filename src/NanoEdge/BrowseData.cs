@@ -657,6 +657,9 @@ namespace NanoEdge
             }
         }
 
+        // 导出 Netscape HTML：把 BookmarkEntry.Folder 的 " / " 层级还原成 <H3> + <DL> 嵌套。
+        // 旧版是平铺的，Chrome/Edge 导入带来的文件夹分组在「导出 → 再导入」后全丢；
+        // 这里只改写出格式，不改导入逻辑、不改 bookmarks.json 结构、不加新 UI。
         public static void ExportNetscapeHtml(string path)
         {
             var html = new StringBuilder();
@@ -665,11 +668,63 @@ namespace NanoEdge
             html.AppendLine("<TITLE>NanoEdge Bookmarks</TITLE>");
             html.AppendLine("<H1>NanoEdge Bookmarks</H1>");
             html.AppendLine("<DL><p>");
-            foreach (var item in All())
-                html.AppendLine("    <DT><A HREF=\"" + WebUtility.HtmlEncode(item.Url) + "\">" +
-                                WebUtility.HtmlEncode(item.Title) + "</A>");
+            WriteNetscapeFolder(html, BuildNetscapeFolderTree(All()), 1);
             html.AppendLine("</DL><p>");
             File.WriteAllText(path, html.ToString(), Encoding.UTF8);
+        }
+
+        private sealed class NetscapeFolderNode
+        {
+            public string Name = "";
+            public readonly List<NetscapeFolderNode> Folders = new List<NetscapeFolderNode>();
+            public readonly List<BookmarkEntry> Links = new List<BookmarkEntry>();
+        }
+
+        private static NetscapeFolderNode BuildNetscapeFolderTree(IEnumerable<BookmarkEntry> items)
+        {
+            var root = new NetscapeFolderNode();
+            foreach (var item in items)
+            {
+                // Folder 是导入时用 " / " 拼出来的单字符串，按同一分隔符拆回层级。
+                // Ordinal 比较：大小写不同的文件夹保持成两个，忠实于原数据。
+                var segments = (item.Folder ?? "")
+                    .Split(new[] { " / " }, StringSplitOptions.None)
+                    .Where(s => !string.IsNullOrWhiteSpace(s))
+                    .Select(s => s.Trim())
+                    .ToArray();
+                var node = root;
+                foreach (var segment in segments)
+                {
+                    var child = node.Folders.FirstOrDefault(f =>
+                        string.Equals(f.Name, segment, StringComparison.Ordinal));
+                    if (child == null)
+                    {
+                        child = new NetscapeFolderNode { Name = segment };
+                        node.Folders.Add(child);
+                    }
+                    node = child;
+                }
+                node.Links.Add(item);
+            }
+            return root;
+        }
+
+        private static void WriteNetscapeFolder(StringBuilder html, NetscapeFolderNode node, int depth)
+        {
+            var indent = new string(' ', depth * 4);
+            foreach (var link in node.Links)
+            {
+                var title = string.IsNullOrWhiteSpace(link.Title) ? Urls.Host(link.Url) : link.Title;
+                html.AppendLine(indent + "<DT><A HREF=\"" + WebUtility.HtmlEncode(link.Url) + "\">" +
+                                WebUtility.HtmlEncode(title) + "</A>");
+            }
+            foreach (var folder in node.Folders)
+            {
+                html.AppendLine(indent + "<DT><H3>" + WebUtility.HtmlEncode(folder.Name) + "</H3>");
+                html.AppendLine(indent + "<DL><p>");
+                WriteNetscapeFolder(html, folder, depth + 1);
+                html.AppendLine(indent + "</DL><p>");
+            }
         }
 
         private static bool AddImported(string title, string url, string folder)

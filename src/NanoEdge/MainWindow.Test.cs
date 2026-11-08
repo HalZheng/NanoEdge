@@ -2289,6 +2289,7 @@ namespace NanoEdge
                         "https://pgadmin.example.com/*"), "glob");
 
                 RunC6BookmarkWizardChecks();
+                RunNetscapeFolderRoundTripChecks();
             }
 
             // ---------- C6：书签导入向导 ----------
@@ -2633,6 +2634,98 @@ namespace NanoEdge
                     BookmarkStore.ResetForTest();
                     L.Apply(savedLang);
                     Theme.Apply(savedDark ? "dark" : "light");
+                }
+            }
+
+            // ---------- C6 后续：导出 HTML 保留文件夹层级 ----------
+            // 全部走临时目录与产品代码，验证「导出 → 再导入」后 Folder / Title / URL 不丢。
+            private void RunNetscapeFolderRoundTripChecks()
+            {
+                var temp = Path.Combine(Path.GetTempPath(), "nanoedge-export");
+                if (Directory.Exists(temp)) Directory.Delete(temp, true);
+                Directory.CreateDirectory(temp);
+
+                var sourceJson = Path.Combine(temp, "source.json");
+                var roundTripJson = Path.Combine(temp, "roundtrip.json");
+                var htmlPath = Path.Combine(temp, "bookmarks.html");
+                var chromePath = Path.Combine(temp, "Bookmarks");
+
+                // 用 Chromium JSON 造带嵌套 Folder 的源数据（走产品代码，不手塞内部集合）。
+                // 标题 / 文件夹 / URL 里都放特殊字符，验证 HtmlEncode ↔ HtmlDecode 往返。
+                var json = "{\"roots\":{\"bookmark_bar\":{\"type\":\"folder\",\"name\":\"书签栏\"," +
+                    "\"children\":[" +
+                    "{\"type\":\"url\",\"name\":\"GitHub\",\"url\":\"https://github.com/\"}," +
+                    "{\"type\":\"folder\",\"name\":\"开发\",\"children\":[" +
+                    "{\"type\":\"url\",\"name\":\"MDN\",\"url\":\"https://developer.mozilla.org/\"}," +
+                    "{\"type\":\"folder\",\"name\":\"前端 & 工具\",\"children\":[" +
+                    "{\"type\":\"url\",\"name\":\"A<B> & Q\",\"url\":\"https://example.com/?a=1&b=2\"}]}]}]}," +
+                    "\"other\":{\"type\":\"folder\",\"name\":\"其他书签\",\"children\":[" +
+                    "{\"type\":\"url\",\"name\":\"本地\",\"url\":\"file:///C:/tmp/readme.txt\"}]}}}";
+                WriteFixture(chromePath, json);
+
+                var savedPath = BookmarkStore.FilePath;
+                try
+                {
+                    BookmarkStore.FilePath = sourceJson;
+                    BookmarkStore.ResetForTest();
+                    var imported = BookmarkStore.ImportChromiumFile(chromePath);
+                    BookmarkStore.Toggle("https://ungrouped.example/", "未分组");   // Folder = ""
+                    var originals = BookmarkStore.All()
+                        .Select(b => new { b.Url, b.Title, b.Folder }).ToList();
+                    Check("export: source library has nested folders and an ungrouped row",
+                        imported == 4 && originals.Count == 5 &&
+                        originals.Any(x => x.Folder == "") &&
+                        originals.Any(x => x.Folder == "书签栏") &&
+                        originals.Any(x => x.Folder == "书签栏 / 开发") &&
+                        originals.Any(x => x.Folder == "书签栏 / 开发 / 前端 & 工具") &&
+                        originals.Any(x => x.Folder == "其他书签"),
+                        "imported=" + imported + " total=" + originals.Count +
+                        " folders=" + string.Join(" | ", originals.Select(x => x.Folder).Distinct()));
+
+                    var beforeBytes = File.ReadAllBytes(sourceJson);
+                    BookmarkStore.ExportNetscapeHtml(htmlPath);
+                    var html = File.ReadAllText(htmlPath, Encoding.UTF8);
+                    Check("export: HTML contains the nested H3 hierarchy",
+                        html.Contains("<!DOCTYPE NETSCAPE-Bookmark-file-1>") &&
+                        html.Contains("<H3>书签栏</H3>") && html.Contains("<H3>开发</H3>") &&
+                        html.Contains("<H3>前端 &amp; 工具</H3>") &&
+                        html.Contains("<H3>其他书签</H3>") &&
+                        html.Contains("</DL><p>") &&
+                        System.Text.RegularExpressions.Regex.Matches(html, "<H3").Count == 4,
+                        "bytes=" + new FileInfo(htmlPath).Length);
+                    Check("export: special characters are HTML-encoded",
+                        html.Contains("A&lt;B&gt; &amp; Q") &&
+                        html.Contains("https://example.com/?a=1&amp;b=2"),
+                        "escaped");
+                    Check("export: bookmarks.json is byte-identical after the export",
+                        File.ReadAllBytes(sourceJson).SequenceEqual(beforeBytes),
+                        "bytes=" + beforeBytes.Length);
+
+                    // 往返：换一个干净的库读回来，逐条比对 Url / Title / Folder。
+                    BookmarkStore.FilePath = roundTripJson;
+                    BookmarkStore.ResetForTest();
+                    var added = BookmarkStore.ImportNetscapeHtml(htmlPath);
+                    var restored = BookmarkStore.All();
+                    Check("export: round-trip keeps every bookmark",
+                        added == 5 && restored.Count == 5,
+                        "added=" + added + " count=" + restored.Count);
+                    Check("export: round-trip restores nested folder paths",
+                        originals.All(o => restored.Any(r => r.Url == o.Url && r.Folder == o.Folder)),
+                        "restored=" + string.Join(" | ", restored.Select(r => r.Folder).Distinct()));
+                    Check("export: round-trip restores titles and URLs with special chars",
+                        originals.All(o => restored.Any(r => r.Url == o.Url && r.Title == o.Title)) &&
+                        restored.Any(r => r.Url == "https://example.com/?a=1&b=2" &&
+                                          r.Title == "A<B> & Q"),
+                        "titles=" + string.Join(" | ", restored.Select(r => r.Title)));
+                    Check("export: ungrouped bookmark stays ungrouped",
+                        restored.Any(r => r.Url == "https://ungrouped.example/" &&
+                                          string.IsNullOrEmpty(r.Folder)),
+                        "ungrouped");
+                }
+                finally
+                {
+                    BookmarkStore.FilePath = savedPath;
+                    BookmarkStore.ResetForTest();
                 }
             }
 
