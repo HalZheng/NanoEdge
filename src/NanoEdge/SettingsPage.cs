@@ -12,7 +12,7 @@ namespace NanoEdge
     // 语言切换要重建内部页视图，不能由页面自己干。
     public sealed class SettingsPage : UserControl
     {
-        public event Action<string> Changed;              // theme | layout | memory | language | status | privacy | search
+        public event Action<string> Changed;              // theme | layout | memory | language | weblanguage | status | privacy | search
         public event Action OpenDataFolderRequested;
         public event Action SetDefaultBrowserRequested;
 
@@ -21,6 +21,9 @@ namespace NanoEdge
         private readonly StackPanel _body;
         private readonly Canvas _dropdownLayer = new Canvas();
         private TextBlock _memoryHint;
+        private bool _capturing;
+        private Button _hotkeyButton;
+        private TextBlock _hotkeyHint;
 
         public SettingsPage(AppSettings settings)
         {
@@ -73,6 +76,8 @@ namespace NanoEdge
 
             SizeChanged += (s, e) => UpdateWidth();
             UpdateWidth();
+            PreviewKeyDown += OnCaptureKeyDown;
+            Unloaded += (s, e) => StopCapture();
             Build();
         }
 
@@ -101,13 +106,23 @@ namespace NanoEdge
                     _settings.Theme = index == 0 ? "dark" : index == 1 ? "light" : "system";
                     Raise("theme");
                 })));
-            _body.Children.Add(Row(L.T("语言"),
-                L.T("切换后界面立即重建，网页内容不受影响；跟随系统按 Windows 显示语言判断"),
-                Segments(new[] { "中文", "English", L.T("跟随系统") },
+            // 两项语言分开：前者只翻外壳，后者决定网站检测到的语言版本。
+            _body.Children.Add(Row(L.T("界面语言"),
+                L.T("只改菜单、设置页和按钮上的字，网页内容不受影响；跟随系统按 Windows 显示语言判断"),
+                Segments(new[] { L.T("中文"), "English", L.T("跟随系统") },
                     LanguageIndex(_settings.Language), index =>
                 {
                     _settings.Language = index == 0 ? "zh-CN" : index == 1 ? "en-US" : "system";
                     Raise("language");
+                })));
+            _body.Children.Add(Row(L.T("网页语言"),
+                L.T("网站据此判断默认给你哪一版；已打开的页面刷新后生效，不影响上面的界面语言"),
+                Segments(new[] { L.T("中文"), "English", L.T("跟随系统") },
+                    WebLanguageIndex(_settings.WebLanguage), index =>
+                {
+                    _settings.WebLanguage = index == 0 ? WebLanguage.Chinese
+                        : index == 1 ? WebLanguage.English : WebLanguage.System;
+                    Raise("weblanguage");
                 })));
 
             // ---------- 布局 ----------
@@ -168,6 +183,9 @@ namespace NanoEdge
                     _settings.SecretNotifications = on;
                     Raise("privacy");
                 })));
+            _body.Children.Add(Row(L.T("切换密封标签快捷键"),
+                L.T("点一下按钮，再按下想用的组合键；至少带 Ctrl / Shift / Alt 中的一个"),
+                HotkeyPicker()));
 
             // ---------- 关于 ----------
             _body.Children.Add(Section(L.T("关于")));
@@ -205,6 +223,17 @@ namespace NanoEdge
             return 0;
         }
 
+        // 与界面语言同样的三档，但读的是另一个持久化字段，自测可分别断言。
+        internal static int WebLanguageIndex(string language)
+        {
+            switch (WebLanguage.Normalize(language))
+            {
+                case WebLanguage.Chinese: return 0;
+                case WebLanguage.English: return 1;
+                default: return 2;
+            }
+        }
+
         private string MemoryHintText()
         {
             switch (_settings.Memory.Preset)
@@ -223,6 +252,91 @@ namespace NanoEdge
             // 落盘交给 MainWindow（它同时负责应用改动），页面只改值 + 通知。
             var handler = Changed;
             if (handler != null) handler(kind);
+        }
+
+        // ---------- 密封标签切换键录入 ----------
+
+        // 自测用：直接拿录入按钮，省掉遍历还没加载的可视化树。
+        internal Button HotkeyButtonForTest { get { return _hotkeyButton; } }
+
+        private FrameworkElement HotkeyPicker()
+        {
+            var stack = new StackPanel
+            {
+                Orientation = Orientation.Vertical,
+                HorizontalAlignment = HorizontalAlignment.Right
+            };
+            _hotkeyButton = (Button)TextButton(Hotkey.Display(_settings.SecretHotkey), null);
+            _hotkeyButton.MinWidth = 132;
+            _hotkeyButton.HorizontalAlignment = HorizontalAlignment.Right;
+            _hotkeyButton.Click += (s, e) =>
+            {
+                if (_capturing) { StopCapture(); return; }
+                _capturing = true;
+                _hotkeyButton.Content = L.T("请按下组合键…");
+                _hotkeyHint.Text = L.T("需要 Ctrl / Shift / Alt 中的至少一个，Esc 取消");
+                _hotkeyButton.Focus();
+            };
+
+            _hotkeyHint = new TextBlock
+            {
+                FontSize = 10,
+                MaxWidth = 230,
+                Margin = new Thickness(0, 4, 0, 0),
+                HorizontalAlignment = HorizontalAlignment.Right,
+                TextWrapping = TextWrapping.Wrap
+            };
+            _hotkeyHint.SetResourceReference(TextBlock.ForegroundProperty, "MutedBrush");
+
+            stack.Children.Add(_hotkeyButton);
+            stack.Children.Add(_hotkeyHint);
+            return stack;
+        }
+
+        private void OnCaptureKeyDown(object sender, KeyEventArgs e)
+        {
+            if (!_capturing) return;
+
+            // 录入期间所有按键都留给自己，别让宿主快捷键顺手执行掉这个组合。
+            e.Handled = true;
+            var real = Hotkey.NormalizeKey(e.Key, e.SystemKey);
+            if (real == Key.Escape) { StopCapture(); return; }
+
+            var spec = Hotkey.Capture(e.Key, Keyboard.Modifiers, e.SystemKey);
+            if (spec == null)
+            {
+                var mods = Keyboard.Modifiers & Hotkey.Supported;
+                _hotkeyHint.Text = Hotkey.IsReserved(mods, real)
+                    ? L.T("这个组合已被其它功能占用")
+                    : L.T("请按住 Ctrl / Shift / Alt 再按一个键");
+                return;
+            }
+
+            _settings.SecretHotkey = spec;
+            StopCapture();
+            _hotkeyHint.Text = L.T("已更新：") + Hotkey.Display(spec);
+            Raise("hotkey");
+        }
+
+        private void StopCapture()
+        {
+            _capturing = false;
+            if (_hotkeyButton != null) _hotkeyButton.Content = Hotkey.Display(_settings.SecretHotkey);
+            if (_hotkeyHint != null) _hotkeyHint.Text = "";
+        }
+
+        // 宿主在两条快捷键入口都要先问一声：录入状态下不能分发快捷键。
+        internal static bool IsCapturing(DependencyObject element)
+        {
+            while (element != null)
+            {
+                var page = element as SettingsPage;
+                // 焦点在页面内的控件上，页面必然是可见的；切走标签后焦点也随之转移，
+                // 不需要额外判 IsVisible（会给未挂载到窗口的自测控件造成假阴性）。
+                if (page != null) return page._capturing;
+                element = VisualTreeHelper.GetParent(element);
+            }
+            return false;
         }
 
         // ---------- 通用控件 ----------
@@ -399,7 +513,7 @@ namespace NanoEdge
             };
             button.SetResourceReference(Control.BackgroundProperty, "HoverBrush");
             button.SetResourceReference(Control.ForegroundProperty, "TextBrush");
-            button.Click += (s, e) => action();
+            button.Click += (s, e) => { if (action != null) action(); };
             return button;
         }
     }

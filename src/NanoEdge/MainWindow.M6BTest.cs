@@ -93,6 +93,8 @@ namespace NanoEdge
                     "sections ok");
                 Check("zh page shows the memory numbers",
                     zhTexts.Any(t => t != null && t.Contains("700MB")), "700MB");
+                Check("zh page has the secret tab hotkey row",
+                    zhTexts.Contains("切换密封标签快捷键"), "row ok");
                 Check("zh settings page rendered",
                     File.Exists(Path.Combine(_root, "out", "m6b-settings-zh.png")), "out/m6b-settings-zh.png");
 
@@ -105,6 +107,8 @@ namespace NanoEdge
                 Check("en page has Appearance / Layout / Memory sections",
                     enTexts.Contains("Appearance") && enTexts.Contains("Layout") && enTexts.Contains("Memory"),
                     "sections ok");
+                Check("en page has the secret tab hotkey row",
+                    enTexts.Contains("Secret tab switch shortcut"), "row ok");
                 var leaked = LeakedChinese(enTexts);
                 Check("en settings page has no untranslated Chinese", leaked.Count == 0,
                     leaked.Count == 0 ? "none" : string.Join(" | ", leaked.Take(6)));

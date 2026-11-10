@@ -18,7 +18,7 @@ namespace NanoEdge
     // nano://scripts：用户脚本管理页（SPEC 7.3）。
     // 与历史/书签/下载一样是纯 WPF 内部页：打开它不创建 WebView2，renderer 增量为 0。
     // 列表 + 编辑器都在这一个控件里，编辑器用整页浮层（不是 Popup，因为页内没有 HwndHost 要盖）。
-    public sealed class ScriptsPage : InternalPage
+    public sealed partial class ScriptsPage : InternalPage
     {
         private static readonly FontFamily MonoFont =
             new FontFamily("Consolas, Cascadia Mono, Courier New");
@@ -422,6 +422,7 @@ namespace NanoEdge
             };
             _numbers.SetResourceReference(TextBox.ForegroundProperty, "MutedBrush");
 
+            InitPgAdminSection(script, isNew);
             var card = BuildEditorCard(isNew);
             ShowOverlayCard(card, true);
             UpdateLineNumbers();
@@ -471,9 +472,13 @@ namespace NanoEdge
             Grid.SetRow(header, 0);
             card.Children.Add(header);
 
-            var metadata = BuildMetadataPanel();
-            Grid.SetRow(metadata, 1);
-            card.Children.Add(metadata);
+            // 元数据 + pgAdmin 重登区块同占第 1 行，不改后面几行的编号，
+            // 代码框仍然吃 Star 高度。
+            var upper = new StackPanel();
+            upper.Children.Add(BuildMetadataPanel());
+            upper.Children.Add(BuildPgAdminBlock(isNew));
+            Grid.SetRow(upper, 1);
+            card.Children.Add(upper);
 
             var meta = new TextBlock
             {
@@ -1557,6 +1562,7 @@ namespace NanoEdge
             _importMatches = null;
             _importExcludes = null;
             _importInitName = _importInitVersion = _importInitMatches = _importInitExcludes = "";
+            ResetPgAdminSection();
             _lineCount = -1;
             if (_overlayCard != null) _overlayCard.Child = null;
             if (_overlay != null) _overlay.Visibility = Visibility.Collapsed;

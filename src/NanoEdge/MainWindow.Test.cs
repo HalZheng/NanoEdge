@@ -1328,6 +1328,12 @@ namespace NanoEdge
                     _w.ActualWidth <= work.Width + 16 && _w.ActualHeight <= work.Height + 16,
                     "window=" + _w.ActualWidth.ToString("0") + "x" + _w.ActualHeight.ToString("0") +
                     " work=" + work.Width.ToString("0") + "x" + work.Height.ToString("0"));
+                // 修复不能只把超宽压回去、却留下比工作区小一圈的窗口；
+                // 上下界一起卡住「严丝合缝」。16px 是 WindowChrome 的隐形边框。
+                Check("maximized window fills the work area without a gap",
+                    _w.ActualWidth >= work.Width - 16 && _w.ActualHeight >= work.Height - 16,
+                    "window=" + _w.ActualWidth.ToString("0") + "x" + _w.ActualHeight.ToString("0") +
+                    " work=" + work.Width.ToString("0") + "x" + work.Height.ToString("0"));
                 _w.WindowState = WindowState.Normal;
 
                 // ---- 第八轮：最大化时拖顶栏先还原，再继续跟随鼠标 ----
@@ -1450,6 +1456,8 @@ namespace NanoEdge
                     "show=" + defaults.ShowStatusBar);
                 Check("language defaults to system", defaults.Language == "system",
                     "lang=" + defaults.Language);
+                Check("website language defaults to system (separate field)",
+                    defaults.WebLanguage == "system", "web=" + defaults.WebLanguage);
                 Check("theme follow-system stays a separate setting", defaults.Theme == "dark",
                     "theme=" + defaults.Theme);
 
@@ -1533,14 +1541,18 @@ namespace NanoEdge
                 _w._settings.ShowStatusBar = false;
                 _w.ApplyLayout();
 
-                // 新增的用户可见文案必须有英文词条，英文界面不能掉回中文。
-                const string languageHint = "切换后界面立即重建，网页内容不受影响；跟随系统按 Windows 显示语言判断";
+                // 两项语言的用户可见文案都必须有英文词条，英文界面不能掉回中文。
+                // 0.20 把「语言」拆成「界面语言 / 网页语言」，断言跟着换成当前两条 hint。
+                var languageHints = new[]
+                {
+                    "只改菜单、设置页和按钮上的字，网页内容不受影响；跟随系统按 Windows 显示语言判断",
+                    "网站据此判断默认给你哪一版；已打开的页面刷新后生效，不影响上面的界面语言"
+                };
                 var savedLang = L.Language;
                 L.Apply("en-US");
-                var translated = L.T(languageHint);
-                Check("new language hint has an English entry",
-                    translated != languageHint && !string.IsNullOrEmpty(translated),
-                    "en=" + translated);
+                var missing = languageHints.Where(h => L.T(h) == h).ToList();
+                Check("both language hints have English entries", missing.Count == 0,
+                    missing.Count == 0 ? "2/2 translated" : "missing=" + string.Join(" | ", missing));
                 L.Apply(savedLang);
 
                 // ---- 第十一轮：A5 暗色菜单露白 ----
@@ -1874,6 +1886,152 @@ namespace NanoEdge
                 _w.WindowState = WindowState.Normal;
                 _w._settings.Layout = LayoutMode.Compact;
                 _w.ApplyLayout();
+
+                // ---- A3 回归：多显示器最大化（主屏基准 + 最终矩形兜底）----
+                // MINMAXINFO 的 ptMaxSize/ptMaxPosition 是「主屏基准」，窗口管理器
+                // 会按主屏与窗口所在屏的尺寸差自动补偿；把副屏的绝对 rcWork 塞进去
+                // 会在更大的扩展屏上被二次放大（宽度出屏、高度错开任务栏）。
+                var pMon = new MainWindow.NativeRect { Left = 0, Top = 0, Right = 1920, Bottom = 1080 };
+                var pWork = new MainWindow.NativeRect { Left = 0, Top = 0, Right = 1920, Bottom = 1040 };
+                var sMon = new MainWindow.NativeRect { Left = 1920, Top = 0, Right = 4480, Bottom = 1440 };
+                var sWork = new MainWindow.NativeRect { Left = 1920, Top = 0, Right = 4480, Bottom = 1400 };
+
+                MainWindow.NativePoint mmiPos, mmiSize;
+                MainWindow.ComputeMinMaxWorkArea(pMon, pWork, pMon, pWork,
+                    out mmiPos, out mmiSize);
+                Check("primary monitor maximizes to its own work area",
+                    mmiSize.X == 1920 && mmiSize.Y == 1040 &&
+                    mmiPos.X == 0 && mmiPos.Y == 0,
+                    "size=" + mmiSize.X + "x" + mmiSize.Y +
+                    " pos=" + mmiPos.X + "," + mmiPos.Y);
+
+                MainWindow.ComputeMinMaxWorkArea(pMon, pWork, sMon, sWork,
+                    out mmiPos, out mmiSize);
+                Check("secondary monitor does NOT get its absolute rcWork as ptMaxSize",
+                    mmiSize.X == 1920 && mmiSize.Y == 1040 &&
+                    mmiSize.X != sWork.Right - sWork.Left,
+                    "ptMaxSize=" + mmiSize.X + "x" + mmiSize.Y +
+                    " targetWork=" + (sWork.Right - sWork.Left) + "x" +
+                    (sWork.Bottom - sWork.Top));
+                Check("secondary max position stays relative to its own monitor",
+                    mmiPos.X == 0 && mmiPos.Y == 0,
+                    "pos=" + mmiPos.X + "," + mmiPos.Y);
+
+                // 主屏在右、扩展屏在左（负坐标）：ptMaxPosition 必须带上主屏原点。
+                var rightMon = new MainWindow.NativeRect { Left = 2560, Top = 0, Right = 4480, Bottom = 1440 };
+                var rightWork = new MainWindow.NativeRect { Left = 2560, Top = 0, Right = 4480, Bottom = 1400 };
+                var leftMon = new MainWindow.NativeRect { Left = -1920, Top = -200, Right = 0, Bottom = 880 };
+                var leftWork = new MainWindow.NativeRect { Left = -1920, Top = -200, Right = 0, Bottom = 840 };
+                MainWindow.ComputeMinMaxWorkArea(rightMon, rightWork, leftMon, leftWork,
+                    out mmiPos, out mmiSize);
+                Check("negative-coordinate secondary keeps the primary origin offset",
+                    mmiPos.X == 2560 && mmiPos.Y == 0 &&
+                    mmiSize.X == 1920 && mmiSize.Y == 1400,
+                    "pos=" + mmiPos.X + "," + mmiPos.Y +
+                    " size=" + mmiSize.X + "x" + mmiSize.Y);
+
+                // 第二层：系统算出的最终矩形不合规时钉回目标屏 rcWork。
+                MainWindow.WINDOWPOS wpFixed;
+                var wpTooWide = new MainWindow.WINDOWPOS
+                { X = sWork.Left, Y = sWork.Top, Cx = 3200, Cy = 1800, Flags = 0x0010 };
+                bool wpChanged = MainWindow.TryFixMaximizedWindowPos(
+                    wpTooWide, sWork, out wpFixed);
+                Check("oversized maximize rect is pinned to the secondary work area",
+                    wpChanged && wpFixed.X == sWork.Left && wpFixed.Y == sWork.Top &&
+                    wpFixed.Cx == 2560 && wpFixed.Cy == 1400,
+                    "changed=" + wpChanged + " fixed=" + wpFixed.X + "," + wpFixed.Y +
+                    " " + wpFixed.Cx + "x" + wpFixed.Cy);
+
+                var wpAligned = new MainWindow.WINDOWPOS
+                { X = sWork.Left, Y = sWork.Top, Cx = 2568, Cy = 1408, Flags = 0 };
+                Check("already aligned maximize rect is left alone",
+                    !MainWindow.TryFixMaximizedWindowPos(wpAligned, sWork, out wpFixed),
+                    "slack=8px for WindowChrome border");
+
+                var wpRestore = new MainWindow.WINDOWPOS
+                { X = 200, Y = 100, Cx = 1280, Cy = 800, Flags = 0 };
+                Check("restore-down rect is never pinned back to maximized",
+                    !MainWindow.TryFixMaximizedWindowPos(wpRestore, sWork, out wpFixed),
+                    "restore=" + wpRestore.Cx + "x" + wpRestore.Cy);
+
+                var wpNoSize = new MainWindow.WINDOWPOS
+                { X = 0, Y = 0, Cx = 3200, Cy = 1800, Flags = 0x0001 };
+                Check("SWP_NOSIZE is respected",
+                    !MainWindow.TryFixMaximizedWindowPos(wpNoSize, sWork, out wpFixed),
+                    "flags=" + wpNoSize.Flags);
+
+                var wpMoveFlag = new MainWindow.WINDOWPOS
+                { X = 0, Y = 0, Cx = 3200, Cy = 1800, Flags = 0x0002 };
+                MainWindow.TryFixMaximizedWindowPos(wpMoveFlag, sWork, out wpFixed);
+                Check("SWP_NOMOVE is cleared so the work-area origin takes effect",
+                    (wpFixed.Flags & 0x0002) == 0 && wpFixed.X == sWork.Left,
+                    "flags=" + wpFixed.Flags + " x=" + wpFixed.X);
+
+                Check("maximize hook handles WM_WINDOWPOSCHANGING",
+                    mwSrc.Contains("WM_WINDOWPOSCHANGING") &&
+                    mwSrc.Contains("TryFixMaximizedWindowPos"),
+                    "hook=" + mwSrc.Contains("WM_WINDOWPOSCHANGING"));
+                Check("MINMAXINFO uses the primary monitor as its baseline",
+                    mwSrc.Contains("MONITOR_DEFAULTTOPRIMARY") &&
+                    mwSrc.Contains("ComputeMinMaxWorkArea"),
+                    "primary=" + mwSrc.Contains("MONITOR_DEFAULTTOPRIMARY"));
+
+                // 真实 hwnd + 真实消息钩子：塞一个「补偿后超宽超高」的 WINDOWPOS，
+                // 钩子必须把它钉回窗口所在屏的 rcWork。
+                var beforeProbe = new Rect(_w.Left, _w.Top, _w.Width, _w.Height);
+                _w.WindowState = WindowState.Maximized;
+                await Task.Delay(200);
+                var hookHwnd = new WindowInteropHelper(_w).Handle;
+                MainWindow.NativeRect hookMon, hookWork;
+                bool hasWork = MainWindow.TryGetWorkArea(hookHwnd, out hookMon, out hookWork);
+                Line("display env (native): monitor=" + hookMon.Left + "," + hookMon.Top +
+                     " " + (hookMon.Right - hookMon.Left) + "x" + (hookMon.Bottom - hookMon.Top) +
+                     " work=" + hookWork.Left + "," + hookWork.Top +
+                     " " + (hookWork.Right - hookWork.Left) + "x" + (hookWork.Bottom - hookWork.Top));
+                try
+                {
+                    var screens = System.Windows.Forms.Screen.AllScreens;
+                    Line("display env (screens): " + screens.Length);
+                    foreach (var sc in screens)
+                        Line("  " + sc.DeviceName + " primary=" + sc.Primary +
+                             " bounds=" + sc.Bounds + " work=" + sc.WorkingArea);
+                }
+                catch (Exception ex) { Line("display env (screens): unavailable " + ex.Message); }
+
+                var wpPtr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(MainWindow.WINDOWPOS)));
+                try
+                {
+                    var bogus = new MainWindow.WINDOWPOS
+                    {
+                        Hwnd = hookHwnd,
+                        X = hookWork.Left + 40,
+                        Y = hookWork.Top - 40,
+                        Cx = (hookWork.Right - hookWork.Left) + 640,
+                        Cy = (hookWork.Bottom - hookWork.Top) + 320,
+                        Flags = 0x0010
+                    };
+                    Marshal.StructureToPtr(bogus, wpPtr, false);
+                    bool hookHandled = false;
+                    _w.WorkAreaHook(hookHwnd, MainWindow.WM_WINDOWPOSCHANGING,
+                        IntPtr.Zero, wpPtr, ref hookHandled);
+                    var after = (MainWindow.WINDOWPOS)Marshal.PtrToStructure(
+                        wpPtr, typeof(MainWindow.WINDOWPOS));
+                    Check("real hook pins an oversized maximize rect to the work area",
+                        hasWork && after.X == hookWork.Left && after.Y == hookWork.Top &&
+                        after.Cx == hookWork.Right - hookWork.Left &&
+                        after.Cy == hookWork.Bottom - hookWork.Top,
+                        "after=" + after.X + "," + after.Y + " " + after.Cx + "x" + after.Cy +
+                        " work=" + hookWork.Left + "," + hookWork.Top + " " +
+                        (hookWork.Right - hookWork.Left) + "x" +
+                        (hookWork.Bottom - hookWork.Top));
+                }
+                finally { Marshal.FreeHGlobal(wpPtr); }
+                _w.WindowState = WindowState.Normal;
+                await Task.Delay(150);
+                _w.Left = beforeProbe.Left;
+                _w.Top = beforeProbe.Top;
+                _w.Width = beforeProbe.Width;
+                _w.Height = beforeProbe.Height;
 
                 // ---- 批次 A / A2：F11 真全屏状态机 ----
                 var mon100 = MainWindow.MonitorRectFromNative(0, 0, 1920, 1080, new DpiScale(1, 1));

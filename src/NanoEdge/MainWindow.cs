@@ -24,7 +24,10 @@ namespace NanoEdge
         private TabModel _active;
         private BrowserHost _browser;
 
-        private Grid _root, _bodyGrid, _tabHost;
+        private Grid _root, _bodyGrid, _tabHost, _contentGrid;
+        private PgAdminReloginBar _reloginBar;
+        private PgAdminSessionMonitor _relogin;
+        private ScriptsPage _scriptsPage;
         private Border _toolbarHost, _rail, _statusBar, _popupContent, _memoryBadgeBorder;
         private Button _railPin, _popupPin;
         private FrameworkElement _railHeader;
@@ -108,7 +111,7 @@ namespace NanoEdge
                          HasArg("--memtest") || HasArg("--navtest") || HasArg("--m3ctest") ||
                          HasArg("--m4test") || HasArg("--m5test") || HasArg("--m6test") ||
                          HasArg("--m6btest") || HasArg("--m7test") || HasArg("--m8test") ||
-                         HasArg("--fixtest");
+                         HasArg("--m9test") || HasArg("--m10test") || HasArg("--fixtest");
             if (_noPersist)
             {
                 // 自测/截图一律不写用户会话、历史、缩放和下载记录。
@@ -191,6 +194,7 @@ namespace NanoEdge
                 System.Windows.Interop.ComponentDispatcher.ThreadPreprocessMessage -= OnThreadPreprocessMessage;
                 Ipc.Stop();
                 Ipc.Received -= OnIpcReceived;
+                if (_relogin != null) _relogin.Dispose();
             };
 
             Loaded += MainWindow_Loaded;
@@ -263,7 +267,8 @@ namespace NanoEdge
         {
             return HasArg("--memtest") || HasArg("--navtest") || HasArg("--m3ctest") ||
                    HasArg("--m4test") || HasArg("--m5test") || HasArg("--m6test") ||
-                   HasArg("--m6btest") || HasArg("--m7test") || HasArg("--m8test");
+                   HasArg("--m6btest") || HasArg("--m7test") || HasArg("--m8test") ||
+                   HasArg("--m9test") || HasArg("--m10test");
         }
 
         private void ApplyPreviewArgs()
@@ -351,10 +356,21 @@ namespace NanoEdge
             Grid.SetColumn(_rail, 0);
             _bodyGrid.Children.Add(_rail);
 
+            // 网页区域两行：Row0 是 pgAdmin 重登工具条（默认折叠 = 0 高度），Row1 仍是
+            // 唯一装着所有 WebView2 的 _tabHost。只在构造时包一层 Grid，
+            // 绝不 reparent WebView2，也不改 _tabHost.Children。
             _tabHost = new Grid { ClipToBounds = true };
             _tabHost.SetResourceReference(Grid.BackgroundProperty, "CanvasBrush");
-            Grid.SetColumn(_tabHost, 1);
-            _bodyGrid.Children.Add(_tabHost);
+            _contentGrid = new Grid();
+            _contentGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            _contentGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            _reloginBar = new PgAdminReloginBar();
+            Grid.SetRow(_reloginBar, 0);
+            _contentGrid.Children.Add(_reloginBar);
+            Grid.SetRow(_tabHost, 1);
+            _contentGrid.Children.Add(_tabHost);
+            Grid.SetColumn(_contentGrid, 1);
+            _bodyGrid.Children.Add(_contentGrid);
             _root.Children.Add(_bodyGrid);
 
             _statusBar = new Border { Height = 22, Padding = new Thickness(10, 0, 10, 0) };
@@ -381,6 +397,7 @@ namespace NanoEdge
             Content = _root;
 
             _browser = new BrowserHost(_tabHost, _settings);
+            _relogin = CreateReloginMonitor();
             // 恢复备份后，已经打开的目标站点页面可以立刻试一次，不必等下次刷新。
             DdlRestore.PendingChanged += () =>
             {
@@ -627,6 +644,7 @@ namespace NanoEdge
             if (HasArg("--memtest") || HasArg("--navtest") || HasArg("--m3ctest") ||
                 HasArg("--m4test") || HasArg("--m5test") || HasArg("--m6test") ||
                 HasArg("--m6btest") || HasArg("--m7test") || HasArg("--m8test") ||
+                HasArg("--m9test") || HasArg("--m10test") ||
                 HasArg("--fixtest") || HasArg("--menupreview") || HasArg("--fullscreen"))
             {
                 NewTab();
@@ -804,6 +822,7 @@ namespace NanoEdge
 
         private void ApplyLayout()
         {
+            if (_reloginBar != null) _reloginBar.ApplyLanguage();
             _toolbarHost.Child = BuildToolbar();
             var vertical = _settings.Layout == LayoutMode.Vertical;
             var expanded = vertical && _settings.VerticalExpanded;
@@ -1371,6 +1390,7 @@ namespace NanoEdge
 
         private void OnNavigationDone(TabModel tab, string url, bool success)
         {
+            if (_relogin != null) _relogin.OnNavigationDone(tab, url, success);
             if (success)
             {
                 // 重定向 / 同址刷新会在几秒内连发两次 NavigationCompleted，别把访问次数灌水。
@@ -3058,7 +3078,8 @@ namespace NanoEdge
             menu.Items.Add(MakeMenuItem(L.T("新建标签 (Ctrl+T)"), () => NewTab()));
             menu.Items.Add(MakeMenuItem(L.T("恢复最近关闭 (Ctrl+Shift+T)"), ReopenClosedTab));
             menu.Items.Add(MakeMenuItem(L.T("新建密封标签"), NewSecretTab));
-            menu.Items.Add(MakeMenuItem(L.T("切换密封标签 (Alt+`)"), ToggleSecret));
+            menu.Items.Add(MakeMenuItem(
+                L.T("切换密封标签") + " (" + Hotkey.Display(_settings.SecretHotkey) + ")", ToggleSecret));
             menu.Items.Add(MakeMenuItem(L.T("密封标签通知：") + (_settings.SecretNotifications ? L.T("允许") : L.T("关闭")),
                 ToggleSecretNotifications));
             menu.Items.Add(Theme.StyleSeparator(new Separator()));
@@ -3338,6 +3359,8 @@ namespace NanoEdge
             var site = sourceSite ?? "";
             var view = InternalPages.Create("nano://" + tab.InternalPage, _settings,
                 OpenFromInternal, message => _toast.Show(message), () => site);
+            var scriptsView = view as ScriptsPage;
+            if (scriptsView != null) _scriptsPage = scriptsView;
 
             // 设置页要通过这几条线去动主题/布局/语言/内存，页面本身不碰 WebView2。
             var settingsPage = view as SettingsPage;
@@ -3415,6 +3438,14 @@ namespace NanoEdge
                 ApplyLayout();
                 RebuildLocalViews();
                 _toast.Show(L.T("语言已切换"));
+                return;
+            }
+            if (kind == "weblanguage")
+            {
+                // 网页语言只动 WebView2 的请求头与后续文档的 navigator.language：
+                // 不重建视图、不重载网页，也不需要动 L / 内部页。
+                _browser.ApplyWebLanguage();
+                _toast.Show(L.T("网页语言已更新，刷新页面后生效"));
                 return;
             }
             if (kind == "theme")
@@ -3562,6 +3593,7 @@ namespace NanoEdge
             SetAddress(AddressFor(tab));
             RebuildTabStrip();
             SaveSession();
+            if (_relogin != null) _relogin.OnActiveTabChanged();
         }
 
         // 懒加载 / 恢复入口：被丢弃或上次会话留下的标签在这里真正创建 WebView2。
@@ -3762,6 +3794,8 @@ namespace NanoEdge
         protected override void OnPreviewKeyDown(KeyEventArgs e)
         {
             base.OnPreviewKeyDown(e);
+            // 设置页正在录入快捷键时，宿主不能先把这个组合吃掉（会顺手执行它绑定的功能）。
+            if (SettingsPage.IsCapturing(Keyboard.FocusedElement as DependencyObject)) return;
             // WPF 的 WebView2 控件会把加速键转发回 WPF 层，所以只放行消息泵
             // 是不够的：这里再截一次 F5 就会主动 Reload，页面热键照样被盖掉。
             // 两层都放行，页面 JS 才能拿到 keydown 并 preventDefault。
@@ -3778,9 +3812,15 @@ namespace NanoEdge
             const int WM_KEYDOWN = 0x0100;
             const int WM_SYSKEYDOWN = 0x0104;
             if (msg.message != WM_KEYDOWN && msg.message != WM_SYSKEYDOWN) return;
+            if (SettingsPage.IsCapturing(Keyboard.FocusedElement as DependencyObject)) return;
 
             var key = KeyInterop.KeyFromVirtualKey((int)msg.wParam);
-            var modifiers = Keyboard.Modifiers;
+            // ThreadPreprocessMessage 阶段 WPF 的 KeyboardDevice 还没同步按键状态：
+            // Alt 组合走 WM_SYSKEYDOWN 时 Keyboard.Modifiers 常常还是 None，旧代码
+            // 会把整条切换键当成"无修饰键"丢掉。补一层 Win32 实时状态，并把
+            // WM_SYSKEYDOWN 本身当作 Alt 的依据（F10 也会发它，但表里没这个键）。
+            var modifiers = Keyboard.Modifiers | NativeModifiers();
+            if (msg.message == WM_SYSKEYDOWN) modifiers |= ModifierKeys.Alt;
             var ctrl = (modifiers & ModifierKeys.Control) == ModifierKeys.Control;
             var shift = (modifiers & ModifierKeys.Shift) == ModifierKeys.Shift;
             var alt = (modifiers & ModifierKeys.Alt) == ModifierKeys.Alt;
@@ -3824,14 +3864,18 @@ namespace NanoEdge
         // 快捷键统一入口：WPF 输入和 WebView2 的原始按键（页面聚焦时）都走这里。
         private bool HandleShortcut(Key key, ModifierKeys modifiers, Key systemKey)
         {
+            // Alt 组合在 WPF 层投递的是 Key.System，真键在 systemKey；消息泵层
+            // 传 Key.None、key 已经是真键。归一化之后两条路径才用同一套判断。
+            key = Hotkey.NormalizeKey(key, systemKey);
             var ctrl = (modifiers & ModifierKeys.Control) == ModifierKeys.Control;
             var shift = (modifiers & ModifierKeys.Shift) == ModifierKeys.Shift;
             var alt = (modifiers & ModifierKeys.Alt) == ModifierKeys.Alt;
 
             if (alt && (key == Key.Left || systemKey == Key.Left)) { _browser.Back(_active); return true; }
             if (alt && (key == Key.Right || systemKey == Key.Right)) { _browser.Forward(_active); return true; }
-            // SPEC 5.6 / 7.4：Alt+` 在密封标签与刚才的普通标签之间切换。
-            if (alt && key == Key.OemTilde) { ToggleSecret(); return true; }
+            // SPEC 5.6 / 7.4：默认 Alt+`，设置页「隐私」可改；命中后在密封标签
+            // 与刚才的普通标签之间来回切。放在内置键之前，录入时已排除冲突。
+            if (Hotkey.Matches(_settings.SecretHotkey, key, modifiers)) { ToggleSecret(); return true; }
             // SPEC 5.6：Ctrl+F5 是硬刷新（绕过缓存）；普通 F5 保持原生 Reload。
             if (key == Key.F5)
             {
@@ -4001,6 +4045,20 @@ namespace NanoEdge
                 return;
             }
 
+            if (HasArg("--m9test"))
+            {
+                var test = new M9SelfTest(this);
+                var unused = test.RunAsync();
+                return;
+            }
+
+            if (HasArg("--m10test"))
+            {
+                var test = new M10SelfTest(this);
+                var unused = test.RunAsync();
+                return;
+            }
+
             // A5：菜单样式预览用 Canvas 覆盖层（ContextMenu 是独立 HWND，截图抓不到）。
             if (HasArg("--menupreview")) BuildMenuPreview();
 
@@ -4151,14 +4209,61 @@ namespace NanoEdge
             public int Flags;
         }
 
+        // WM_WINDOWPOSCHANGING 的 lParam。x/y/cx/cy 是物理像素，
+        // 与 PerMonitorV2 下 GetMonitorInfo 的 rcWork 同一坐标系。
+        [StructLayout(LayoutKind.Sequential)]
+        private struct WINDOWPOS
+        {
+            public IntPtr Hwnd, HwndInsertAfter;
+            public int X, Y, Cx, Cy;
+            public uint Flags;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct WINDOWPLACEMENT
+        {
+            public int Length, Flags, ShowCmd;
+            public NativePoint MinPosition, MaxPosition;
+            public NativeRect NormalPosition;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern short GetKeyState(int nVirtKey);
+
+        private const int VK_SHIFT = 0x10;
+        private const int VK_CONTROL = 0x11;
+        private const int VK_MENU = 0x12;
+
+        // 线程消息预处理阶段的修饰键状态：Keyboard.Modifiers 依赖 WPF 输入队列，
+        // 焦点在 WebView2 的独立 HWND 时它可能还没同步。直接读 Win32 当前状态更稳。
+        private static ModifierKeys NativeModifiers()
+        {
+            var mods = ModifierKeys.None;
+            if ((GetKeyState(VK_CONTROL) & 0x8000) != 0) mods |= ModifierKeys.Control;
+            if ((GetKeyState(VK_SHIFT) & 0x8000) != 0) mods |= ModifierKeys.Shift;
+            if ((GetKeyState(VK_MENU) & 0x8000) != 0) mods |= ModifierKeys.Alt;
+            return mods;
+        }
+
         [DllImport("user32.dll")]
         private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
 
+        [DllImport("user32.dll")]
+        private static extern bool GetWindowPlacement(IntPtr hwnd, ref WINDOWPLACEMENT placement);
+
+        private const uint MONITOR_DEFAULTTOPRIMARY = 1;
         private const uint MONITOR_DEFAULTTONEAREST = 2;
         private const int WM_GETMINMAXINFO = 0x0024;
+        private const int WM_WINDOWPOSCHANGING = 0x0046;
+        private const uint SWP_NOSIZE = 0x0001;
+        private const uint SWP_NOMOVE = 0x0002;
+        private const int SW_SHOWMAXIMIZED = 3;
+        // WindowChrome 最大化时会在工作区外留一圈隐形 resize 边框；
+        // 这个容差内的偏差不算错位，避免和 WPF 反复互相改写窗口矩形。
+        private const int MaximizeSlack = 16;
 
         private void InstallWorkAreaHook()
         {
@@ -4169,29 +4274,120 @@ namespace NanoEdge
             };
         }
 
+        // 窗口所在显示器的整屏 / 工作区，都是物理像素。
+        private static bool TryGetWorkArea(IntPtr hwnd, out NativeRect monitor, out NativeRect work)
+        {
+            monitor = new NativeRect();
+            work = new NativeRect();
+            var mi = new MONITORINFO { Size = Marshal.SizeOf(typeof(MONITORINFO)) };
+            if (!GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), ref mi))
+                return false;
+            monitor = mi.Monitor;
+            work = mi.Work;
+            return work.Right > work.Left && work.Bottom > work.Top;
+        }
+
+        // MINMAXINFO 的 ptMaxSize / ptMaxPosition 按 Win32 语义是「主屏基准」：
+        // 窗口最大化到副屏时，窗口管理器会按主屏与该屏的尺寸差自动补偿。
+        // 直接填副屏的绝对 rcWork 会被二次放大（副屏比主屏大时窗口明显超宽，
+        // 高度也错开任务栏）。这里只填主屏工作区尺寸 + 相对目标屏的位置。
+        private static void ComputeMinMaxWorkArea(
+            NativeRect primaryMonitor, NativeRect primaryWork,
+            NativeRect targetMonitor, NativeRect targetWork,
+            out NativePoint maxPosition, out NativePoint maxSize)
+        {
+            maxPosition = new NativePoint
+            {
+                X = primaryMonitor.Left + targetWork.Left - targetMonitor.Left,
+                Y = primaryMonitor.Top + targetWork.Top - targetMonitor.Top
+            };
+            maxSize = new NativePoint
+            {
+                X = primaryWork.Right - primaryWork.Left,
+                Y = primaryWork.Bottom - primaryWork.Top
+            };
+        }
+
+        // 系统按 MINMAXINFO（多屏补偿 + 混合 DPI 换算）算出的最终矩形仍可能
+        // 不等于目标屏 rcWork。在窗口真正改变前钉一次，绕过所有补偿规则。
+        // 返回 false 表示不该改写：已贴合、正在还原、或 flags 不允许改尺寸。
+        private static bool TryFixMaximizedWindowPos(
+            WINDOWPOS pos, NativeRect work, out WINDOWPOS fixedPos)
+        {
+            fixedPos = pos;
+            if ((pos.Flags & SWP_NOSIZE) != 0) return false;
+            int w = work.Right - work.Left, h = work.Bottom - work.Top;
+            if (w <= 0 || h <= 0) return false;
+            // 还原到 RestoreBounds 时 placement 可能还没更新；那种矩形明显小于
+            // 工作区，不能拦下来重新钉成最大化。
+            if (pos.Cx < w * 0.7 || pos.Cy < h * 0.7) return false;
+            bool aligned =
+                Math.Abs(pos.X - work.Left) <= MaximizeSlack &&
+                Math.Abs(pos.Y - work.Top) <= MaximizeSlack &&
+                Math.Abs(pos.Cx - w) <= MaximizeSlack &&
+                Math.Abs(pos.Cy - h) <= MaximizeSlack;
+            if (aligned) return false;
+            fixedPos.X = work.Left;
+            fixedPos.Y = work.Top;
+            fixedPos.Cx = w;
+            fixedPos.Cy = h;
+            fixedPos.Flags &= ~SWP_NOMOVE;   // 位置必须跟着一起生效
+            return true;
+        }
+
+        private bool IsMaximizedNative(IntPtr hwnd)
+        {
+            try
+            {
+                var p = new WINDOWPLACEMENT { Length = Marshal.SizeOf(typeof(WINDOWPLACEMENT)) };
+                return GetWindowPlacement(hwnd, ref p) && p.ShowCmd == SW_SHOWMAXIMIZED;
+            }
+            catch { return WindowState == WindowState.Maximized; }
+        }
+
         // WindowStyle.None 的窗口由系统按整屏 rcMonitor 算最大化矩形，
-        // 任务栏就被盖住了。这里把最大化尺寸和位置改成当前显示器的 rcWork。
+        // 任务栏会被盖住。第一层把 MINMAXINFO 改成主屏基准的 rcWork，
+        // 第二层在 WM_WINDOWPOSCHANGING 把最终矩形钉到窗口所在屏的 rcWork。
         private IntPtr WorkAreaHook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam,
             ref bool handled)
         {
-            if (msg != WM_GETMINMAXINFO) return IntPtr.Zero;
-            // 真全屏按 rcMonitor 自己摆窗口，不走 A3 的 rcWork 最大化矩形；
-            // 否则全屏尺寸会被工作区限制，任务栏区域永远铺不满。
+            // 真全屏按 rcMonitor 自己摆窗口，两层最大化修正都要让路；
             // 退出全屏时会先清 _immersive 再还原 Maximized，钩子必须及时回来。
             if (_immersive) return IntPtr.Zero;
-            var info = (MINMAXINFO)Marshal.PtrToStructure(lParam, typeof(MINMAXINFO));
-            var monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-            var mi = new MONITORINFO { Size = Marshal.SizeOf(typeof(MONITORINFO)) };
-            if (!GetMonitorInfo(monitor, ref mi)) return IntPtr.Zero;
 
-            // WM_GETMINMAXINFO 用物理像素；app.manifest 声明 PerMonitorV2，
-            // GetMonitorInfo 返回的也是物理像素，两边一致，不用再换算 DPI。
-            info.MaxPosition.X = mi.Work.Left - mi.Monitor.Left;
-            info.MaxPosition.Y = mi.Work.Top - mi.Monitor.Top;
-            info.MaxSize.X = mi.Work.Right - mi.Work.Left;
-            info.MaxSize.Y = mi.Work.Bottom - mi.Work.Top;
-            Marshal.StructureToPtr(info, lParam, true);
-            handled = true;
+            if (msg == WM_GETMINMAXINFO)
+            {
+                var tmi = new MONITORINFO { Size = Marshal.SizeOf(typeof(MONITORINFO)) };
+                var pmi = new MONITORINFO { Size = Marshal.SizeOf(typeof(MONITORINFO)) };
+                if (!GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), ref tmi) ||
+                    !GetMonitorInfo(MonitorFromWindow(IntPtr.Zero, MONITOR_DEFAULTTOPRIMARY), ref pmi))
+                    return IntPtr.Zero;
+
+                var info = (MINMAXINFO)Marshal.PtrToStructure(lParam, typeof(MINMAXINFO));
+                NativePoint position, size;
+                ComputeMinMaxWorkArea(pmi.Monitor, pmi.Work,
+                    tmi.Monitor, tmi.Work, out position, out size);
+                info.MaxPosition = position;
+                info.MaxSize = size;
+                Marshal.StructureToPtr(info, lParam, true);
+                handled = true;
+                return IntPtr.Zero;
+            }
+
+            // 首次 ShowWindow(SW_MAXIMIZE) 的 WINDOWPOSCHANGING 可能早于原生
+            // placement 更新，WPF 的 WindowState 此时已经写好，两者取或。
+            if (msg == WM_WINDOWPOSCHANGING &&
+                (IsMaximizedNative(hwnd) || WindowState == WindowState.Maximized))
+            {
+                NativeRect monitor, work;
+                if (TryGetWorkArea(hwnd, out monitor, out work))
+                {
+                    var pos = (WINDOWPOS)Marshal.PtrToStructure(lParam, typeof(WINDOWPOS));
+                    WINDOWPOS fixedPos;
+                    if (TryFixMaximizedWindowPos(pos, work, out fixedPos))
+                        Marshal.StructureToPtr(fixedPos, lParam, false);
+                }
+            }
             return IntPtr.Zero;
         }
     }

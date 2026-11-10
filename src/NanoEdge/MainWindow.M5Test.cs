@@ -73,6 +73,7 @@ namespace NanoEdge
 
                 // 设置项来自用户文件，自测里强制成默认值，避免被上一次手动开关影响。
                 _w._settings.SecretNotifications = false;
+                _w._settings.SecretHotkey = Hotkey.Default;
 
                 _portDenied = StartServer();
                 _portAllowed = StartServer();
@@ -150,6 +151,127 @@ namespace NanoEdge
                 Check("alt+` switches back to the previous normal tab",
                     ReferenceEquals(_w._active, normal),
                     "active=" + (_w._active == null ? "-" : _w._active.DisplayTitle));
+
+                // ---------- 5b. 真实输入路径（回归：普通标签上按键切不过去） ----------
+                // WPF 在 Alt 组合下投递的是 Key.System，真实按键在 SystemKey 里。
+                _w.SelectTab(normal);
+                _w.HandleShortcut(System.Windows.Input.Key.System,
+                    System.Windows.Input.ModifierKeys.Alt, System.Windows.Input.Key.OemTilde);
+                Check("wpf Key.System path switches to the secret tab",
+                    ReferenceEquals(_w._active, secret),
+                    "active=" + (_w._active == null ? "-" : _w._active.DisplayTitle));
+
+                // 页面聚焦时只走线程消息泵：Alt+` 是 WM_SYSKEYDOWN(0x0104) + VK_OEM_3(0xC0)，
+                // 此时 WPF 的 Keyboard.Modifiers 还没同步，不能靠它判断 Alt。
+                _w.SelectTab(normal);
+                var sysMsg = new System.Windows.Interop.MSG
+                {
+                    message = 0x0104,
+                    wParam = (IntPtr)0xC0
+                };
+                bool sysHandled = false;
+                _w.OnThreadPreprocessMessage(ref sysMsg, ref sysHandled);
+                Check("message pump WM_SYSKEYDOWN switches to the secret tab",
+                    sysHandled && ReferenceEquals(_w._active, secret),
+                    "handled=" + sysHandled + " active=" +
+                    (_w._active == null ? "-" : _w._active.DisplayTitle));
+
+                // ---------- 5c. 切换键可修改 ----------
+                Check("default hotkey displays as Alt+`",
+                    Hotkey.Display(Hotkey.Default) == "Alt+`", Hotkey.Display(Hotkey.Default));
+
+                _w._settings.SecretHotkey = "Ctrl+Shift+S";
+                _w.SelectTab(normal);
+                _w.HandleShortcut(System.Windows.Input.Key.S,
+                    System.Windows.Input.ModifierKeys.Control | System.Windows.Input.ModifierKeys.Shift,
+                    System.Windows.Input.Key.None);
+                Check("custom hotkey switches to the secret tab",
+                    ReferenceEquals(_w._active, secret),
+                    "active=" + (_w._active == null ? "-" : _w._active.DisplayTitle));
+
+                _w.SelectTab(normal);
+                _w.HandleShortcut(System.Windows.Input.Key.OemTilde,
+                    System.Windows.Input.ModifierKeys.Alt, System.Windows.Input.Key.None);
+                Check("old Alt+` stops working after the key changed",
+                    ReferenceEquals(_w._active, normal),
+                    "active=" + (_w._active == null ? "-" : _w._active.DisplayTitle));
+
+                // 改过的键也必须能从页面聚焦时的消息泵路径进来。
+                _w._settings.SecretHotkey = "Alt+Q";
+                _w.SelectTab(normal);
+                var altQ = new System.Windows.Interop.MSG
+                {
+                    message = 0x0104,
+                    wParam = (IntPtr)System.Windows.Input.KeyInterop.VirtualKeyFromKey(
+                        System.Windows.Input.Key.Q)
+                };
+                bool altQHandled = false;
+                _w.OnThreadPreprocessMessage(ref altQ, ref altQHandled);
+                Check("custom hotkey works from the message pump path",
+                    altQHandled && ReferenceEquals(_w._active, secret),
+                    "handled=" + altQHandled + " active=" +
+                    (_w._active == null ? "-" : _w._active.DisplayTitle));
+
+                Check("capture normalizes WPF Key.System",
+                    Hotkey.Capture(System.Windows.Input.Key.System,
+                        System.Windows.Input.ModifierKeys.Alt,
+                        System.Windows.Input.Key.Q) == "Alt+Q", "Alt+Q");
+                Check("bare key is rejected",
+                    Hotkey.Capture(System.Windows.Input.Key.S,
+                        System.Windows.Input.ModifierKeys.None,
+                        System.Windows.Input.Key.None) == null, "null");
+                Check("reserved Ctrl+T is rejected",
+                    Hotkey.Capture(System.Windows.Input.Key.T,
+                        System.Windows.Input.ModifierKeys.Control,
+                        System.Windows.Input.Key.None) == null, "null");
+                Check("malformed setting falls back to default",
+                    Hotkey.Normalize("not-a-chord") == Hotkey.Default,
+                    Hotkey.Normalize("not-a-chord"));
+
+                // 落盘往返：临时重定向，绝不碰用户自己的 settings.json。
+                var savedPath = SettingsStore.FilePath;
+                var savedPersist = SettingsStore.Persist;
+                try
+                {
+                    SettingsStore.FilePath = Path.Combine(_temp, "settings.json");
+                    SettingsStore.Persist = true;
+                    _w._settings.SecretHotkey = "Ctrl+Shift+S";
+                    SettingsStore.Save(_w._settings);
+                    var reloaded = SettingsStore.Load();
+                    Check("custom hotkey survives settings.json round-trip",
+                        reloaded.SecretHotkey == "Ctrl+Shift+S", reloaded.SecretHotkey);
+                }
+                finally
+                {
+                    SettingsStore.FilePath = savedPath;
+                    SettingsStore.Persist = savedPersist;
+                }
+                _w._settings.SecretHotkey = Hotkey.Default;
+
+                // ---------- 5d. 设置页录入状态机 ----------
+                var page = new SettingsPage(_w._settings);
+                Check("settings page starts outside capture mode",
+                    !SettingsPage.IsCapturing(page), "capturing=false");
+                var picker = page.HotkeyButtonForTest;
+                Check("hotkey row shows the current combination",
+                    picker != null && picker.Content != null &&
+                    picker.Content.ToString() == Hotkey.Display(Hotkey.Default),
+                    picker == null ? "button not found" : picker.Content.ToString());
+                if (picker != null)
+                {
+                    picker.RaiseEvent(new RoutedEventArgs(System.Windows.Controls.Button.ClickEvent));
+                    Check("clicking the button enters capture mode",
+                        SettingsPage.IsCapturing(page), "capturing=true");
+                    var esc = new System.Windows.Input.KeyEventArgs(
+                        System.Windows.Input.Keyboard.PrimaryDevice,
+                        PresentationSource.FromVisual(_w), 0,
+                        System.Windows.Input.Key.Escape)
+                    {
+                        RoutedEvent = System.Windows.Input.Keyboard.PreviewKeyDownEvent
+                    };
+                    page.RaiseEvent(esc);
+                    Check("Esc leaves capture mode", !SettingsPage.IsCapturing(page), "capturing=false");
+                }
 
                 // ---------- 6. 通知开 ----------
                 _w._settings.SecretNotifications = true;

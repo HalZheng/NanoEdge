@@ -141,13 +141,19 @@ namespace NanoEdge
     public sealed class AppSettings
     {
         public int SchemaVersion = 3;
-        public string Language = "system";           // zh-CN | en-US | system（跟随系统）
+        public string Language = "system";           // 外壳界面语言：zh-CN | en-US | system（跟随系统）
+        // 网页语言：网站据此决定默认展示哪一版，与上面的界面语言完全独立。
+        // 这里写字面量而不是 WebLanguage.System：字段名与静态类同名，字段初始值
+        // 里的同名标识符会被解析成这个实例字段（CS0236）。
+        public string WebLanguage = "system";
         public string Theme = "dark";               // dark | light | system（主题的跟随系统，和语言是两回事）
         public LayoutMode Layout = LayoutMode.Compact;
         public bool VerticalExpanded;
         public bool ShowStatusBar = false;           // 默认隐藏，设置页可重新打开
         // 密封标签是否允许页面通知（默认关：不弹、不留权限记录）。
         public bool SecretNotifications;
+        // 密封标签切换键（默认 Alt+`），格式见 Hotkey.cs；设置页「隐私」可重新录入。
+        public string SecretHotkey = Hotkey.Default;
         public string SearchEngine = SearchEngineOptions.Google;
         public List<Shortcut> Shortcuts = new List<Shortcut>();
         public MemorySettings Memory = new MemorySettings();
@@ -212,6 +218,79 @@ namespace NanoEdge
                 if (string.Equals(option.Template, template, StringComparison.OrdinalIgnoreCase))
                     return option.Template;
             return Google;
+        }
+    }
+
+    // 网页语言（网站检测后默认展示哪一版）的唯一口径。
+    // 它和 L / AppSettings.Language 没有任何关系：界面语言只翻外壳的文案，
+    // 网站只看 Accept-Language 请求头和页面里的 navigator.language。
+    // system = 不干预 WebView2 原生行为（默认，零开销、零行为变化）；
+    // 显式档 = 用 WebResourceRequested 改写请求头 + 文档创建时对齐 navigator.language。
+    internal static class WebLanguage
+    {
+        public const string System = "system";
+        public const string Chinese = "zh-CN";
+        public const string English = "en-US";
+
+        public static string Normalize(string value)
+        {
+            if (string.Equals(value, Chinese, StringComparison.OrdinalIgnoreCase)) return Chinese;
+            if (string.Equals(value, English, StringComparison.OrdinalIgnoreCase)) return English;
+            // 空值、手改坏的值都当作「跟随系统」，而不是把请求头写成乱码。
+            return System;
+        }
+
+        public static bool IsOverride(string value)
+        {
+            return !string.Equals(Normalize(value), System, StringComparison.OrdinalIgnoreCase);
+        }
+
+        // 返回空串表示不覆盖（跟随系统）。
+        public static string AcceptLanguage(string value)
+        {
+            switch (Normalize(value))
+            {
+                case Chinese: return "zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7";
+                // 强制英文时不要再带中文兜底，否则有些站点仍会判成中文用户。
+                case English: return "en-US,en;q=0.9";
+                default: return "";
+            }
+        }
+
+        public static string NavigatorLanguage(string value)
+        {
+            switch (Normalize(value))
+            {
+                case Chinese: return Chinese;
+                case English: return English;
+                default: return "";
+            }
+        }
+
+        public static string NavigatorLanguagesJson(string value)
+        {
+            switch (Normalize(value))
+            {
+                case Chinese: return "[\"zh-CN\",\"zh\",\"en-US\",\"en\"]";
+                case English: return "[\"en-US\",\"en\"]";
+                default: return "[]";
+            }
+        }
+
+        // 在页面自己的脚本之前执行（AddScriptToExecuteOnDocumentCreated）。
+        // navigator.language 是原型上的 getter，在实例上重定义即可；不做任何 DOM
+        // 或 Intl 的改写，避免影响站点自己的格式化逻辑。
+        public static string Script(string value)
+        {
+            var language = NavigatorLanguage(value);
+            var list = NavigatorLanguagesJson(value);
+            if (string.IsNullOrEmpty(language)) return "";
+            return "(function(){try{" +
+                   "Object.defineProperty(navigator,'language',{configurable:true,get:function(){return '" +
+                   language + "';}});" +
+                   "var a=" + list + ";" +
+                   "Object.defineProperty(navigator,'languages',{configurable:true,get:function(){return a.slice();}});" +
+                   "}catch(e){}})();";
         }
     }
 }

@@ -50,6 +50,8 @@ namespace NanoEdge
                     case "--m6btest":
                     case "--m7test":
                     case "--m8test":
+                    case "--m9test":
+                    case "--m10test":
                     case "--menupreview":
                     case "--fullscreen":
                     case "--test-mutex":

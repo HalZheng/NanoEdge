@@ -28,6 +28,10 @@ namespace NanoEdge
         public DateTime AddedUtc = DateTime.UtcNow;
         public DateTime LastRunUtc = DateTime.MinValue;
 
+        // pgAdmin 重登设置属于该脚本（5.3）。用户名/密码不在这里，只在 DPAPI 凭据文件里。
+        // 老 scripts.json 没有这个键时 JavaScriptSerializer 会留 null，读取处一律兜底。
+        public PgAdminReloginSettings PgadminRelogin = null;
+
         // 代码以 scripts\<id>.user.js 为准，不进索引文件，避免元数据里塞几 KB 正文。
         [ScriptIgnore] public string Code = "";
         [ScriptIgnore] public string FilePath = "";
@@ -492,6 +496,14 @@ namespace NanoEdge
                 Json.Write(ValuesPath, Values);
             }
             catch (Exception ex) { Diagnostics.Log("script save failed: " + ex.Message); }
+        }
+
+        // pgAdmin 重登配置区块保存后：只落盘索引并通知宿主重注入，绝不动脚本文本。
+        public static void CommitSettings()
+        {
+            EnsureLoaded();
+            Flush();
+            NotifyChanged();
         }
 
         public static void Reload()

@@ -105,6 +105,11 @@ namespace NanoEdge
                 settings.SchemaVersion = 3;
             }
             settings.SearchEngine = SearchEngineOptions.Normalize(settings.SearchEngine);
+            // 手改坏的组合回退默认键，别让密封标签切换键彻底消失。
+            settings.SecretHotkey = Hotkey.Normalize(settings.SecretHotkey);
+            // 旧配置没有 WebLanguage 字段，反序列化会保留字段初始值 system；
+            // 手改坏的值也在这里收回，避免把非法语言写进请求头。
+            settings.WebLanguage = WebLanguage.Normalize(settings.WebLanguage);
             return settings;
         }
 

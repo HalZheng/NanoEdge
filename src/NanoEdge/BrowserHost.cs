@@ -123,6 +123,7 @@ namespace NanoEdge
         public event Action<TabModel> FlagsChanged;              // audio / downloads / devtools
         public event Action<TabModel, bool> RestoreCompleted;    // snapshot applied?
         public event Action<TabModel, string, bool> NavigationDone; // tab, url, success
+        public event Action<TabModel, string, int> HttpResponse;    // tab, request uri, status code
         public event Action<TabModel, double> ZoomChanged;       // 供状态栏显示当前档位
         public event Action<TabModel, string, bool> ProcessFailed;  // tab, message, offerReload
         public event Action BrowserExited;                       // 整个浏览器进程没了
@@ -143,10 +144,28 @@ namespace NanoEdge
         // 自测用：确认 Ctrl+F5 真的走了 CDP 硬刷新，而不是普通 Reload。
         internal int HardReloads { get; private set; }
 
+        // ---------- 网页语言（与外壳界面语言无关） ----------
+        // 当前生效值。显式档才注册过滤器；system 档不注册，保持 WebView2 原生行为。
+        private string _webLanguage;
+        private readonly HashSet<CoreWebView2> _languageFilters = new HashSet<CoreWebView2>();
+        private bool _headerFailureLogged;
+
+        // 只拦主文档和网站用来做语言判断的接口请求，图片/字体/样式不进托管回调。
+        private static readonly CoreWebView2WebResourceContext[] LanguageContexts =
+        {
+            CoreWebView2WebResourceContext.Document,
+            CoreWebView2WebResourceContext.XmlHttpRequest,
+            CoreWebView2WebResourceContext.Fetch
+        };
+
+        internal string CurrentWebLanguage { get { return _webLanguage; } }
+        internal int LanguageFilterCount { get { return _languageFilters.Count; } }
+
         public BrowserHost(Grid host, AppSettings settings)
         {
             _host = host;
             _settings = settings;
+            _webLanguage = WebLanguage.Normalize(settings.WebLanguage);
             Scripts = new ScriptBridge();
             ScriptStore.Changed += RefreshScripts;
         }
@@ -331,6 +350,11 @@ namespace NanoEdge
             // 因为站点记忆要求我们自己掌握档位（否则 Ctrl+0 只回到站点默认值，不是 100%）。
             core.Settings.IsZoomControlEnabled = true;
 
+            // 网页语言：过滤器必须在首次导航之前就挂好（WebView2 文档明确要求）。
+            // 事件处理器常驻，但只有显式档注册了过滤器时才会被调用。
+            core.WebResourceRequested += OnWebResourceRequested;
+            SyncLanguageFilter(core);
+
             view.ZoomFactorChanged += (s, e) =>
             {
                 if (_applyingZoom) return;
@@ -351,6 +375,19 @@ namespace NanoEdge
             core.FaviconChanged += async (s, e) => await UpdateFaviconAsync(core, tab);
             // 浏览器自己下载图标时截获那次响应：不再额外发一次请求（SPEC 7.8）。
             core.WebResourceResponseReceived += async (s, e) => await OnFaviconResponseAsync(core, tab, e);
+            // pgAdmin 掉线检测（7.1 条件 2）：只转发请求 URL 与状态码，不读响应正文。
+            core.WebResourceResponseReceived += (s, e) =>
+            {
+                var handler = HttpResponse;
+                if (handler == null) return;
+                try
+                {
+                    var uri = e.Request == null ? "" : e.Request.Uri;
+                    var status = e.Response == null ? 0 : e.Response.StatusCode;
+                    if (!string.IsNullOrEmpty(uri)) handler(tab, uri, status);
+                }
+                catch { }
+            };
             core.SourceChanged += (s, e) =>
             {
                 if (string.IsNullOrEmpty(core.Source)) return;
@@ -430,6 +467,68 @@ namespace NanoEdge
             };
 
             await ApplyScriptsAsync(core);
+        }
+
+        // ---------- 网页语言 ----------
+
+        // 设置页改动后调用：新请求立刻带上新头；已打开文档里的 navigator.language
+        // 要等下一次导航（重新注册 document-created 脚本只影响之后的文档）。
+        // 不重启浏览器进程、不重建 WebView2、不重载任何标签。
+        public void ApplyWebLanguage()
+        {
+            _webLanguage = WebLanguage.Normalize(_settings.WebLanguage);
+            foreach (var view in _webviews.Values.ToList())
+                SyncLanguageFilter(view == null ? null : view.CoreWebView2);
+            // 语言脚本和用户脚本共用一套注册链：一起移除、一起重加。
+            RefreshScripts();
+            Diagnostics.Log("web language = " + _webLanguage + ", filters=" + _languageFilters.Count);
+        }
+
+        private void SyncLanguageFilter(CoreWebView2 core)
+        {
+            if (core == null) return;
+            var enabled = WebLanguage.IsOverride(_webLanguage);
+            if (enabled)
+            {
+                if (!_languageFilters.Add(core)) return;
+                foreach (var context in LanguageContexts)
+                {
+                    try
+                    {
+                        core.AddWebResourceRequestedFilter("*", context,
+                            CoreWebView2WebResourceRequestSourceKinds.All);
+                    }
+                    catch (Exception ex) { Diagnostics.Log("add language filter failed: " + ex.Message); }
+                }
+            }
+            else
+            {
+                if (!_languageFilters.Remove(core)) return;
+                foreach (var context in LanguageContexts)
+                {
+                    try
+                    {
+                        core.RemoveWebResourceRequestedFilter("*", context,
+                            CoreWebView2WebResourceRequestSourceKinds.All);
+                    }
+                    catch { }   // 过滤器本来就没加上时移除会报 E_INVALIDARG，忽略
+                }
+            }
+        }
+
+        private void OnWebResourceRequested(object sender, CoreWebView2WebResourceRequestedEventArgs e)
+        {
+            var header = WebLanguage.AcceptLanguage(_webLanguage);
+            if (string.IsNullOrEmpty(header) || e.Request == null) return;
+            try { e.Request.Headers.SetHeader("Accept-Language", header); }
+            catch (Exception ex)
+            {
+                if (!_headerFailureLogged)
+                {
+                    _headerFailureLogged = true;
+                    Diagnostics.Log("set Accept-Language failed: " + ex.Message);
+                }
+            }
         }
 
         // ---------- favicon（SPEC 7.8：不为了图标发网络请求） ----------
@@ -592,8 +691,15 @@ namespace NanoEdge
 
             var scripts = ScriptStore.All().Where(s => s.Enabled).ToList();
             var sources = new List<string>();
+            // 语言脚本排在最前：页面自己的脚本、用户脚本读 navigator.language 时
+            // 拿到的已经是设置值。system 档返回空串，不注入。
+            var languageScript = WebLanguage.Script(_webLanguage);
+            if (!string.IsNullOrEmpty(languageScript)) sources.Add(languageScript);
             sources.Add(ScriptEngine.Bootstrap());
             foreach (var script in scripts) sources.Add(ScriptEngine.Wrap(script));
+            // 只有开了重登才注入这段引导器；它内部按站点 + 10 分钟标记双重判定，
+            // 其它站点的页面即使被注入也不会有任何动作（F-12）。
+            if (PgAdminReloginConfig.AnyEnabled()) sources.Add(PgAdminReloginScripts.Document());
 
             var ids = new List<string>();
             foreach (var source in sources)
@@ -608,7 +714,9 @@ namespace NanoEdge
         private void ForgetScripts(TabModel tab)
         {
             var core = Core(tab);
-            if (core != null) _injected.Remove(core);
+            if (core == null) return;
+            _injected.Remove(core);
+            _languageFilters.Remove(core);
         }
 
         // ---------- 崩溃恢复 ----------
@@ -660,6 +768,7 @@ namespace NanoEdge
         public void ResetAfterBrowserCrash(IEnumerable<TabModel> tabs)
         {
             _injected.Clear();
+            _languageFilters.Clear();
             foreach (var tab in tabs.ToList())
             {
                 FrameworkElement view;
@@ -939,6 +1048,7 @@ namespace NanoEdge
             _views.Clear();
             _webviews.Clear();
             _injected.Clear();
+            _languageFilters.Clear();
         }
 
         public void Back(TabModel tab) { NavigateBuiltIn(tab, true); }

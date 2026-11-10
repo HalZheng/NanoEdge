@@ -345,7 +345,7 @@
 | 项 | 落地 |
 |---|---|
 | 伪装 | 标签标题固定「文档」（`DisplayTitle`）、tooltip 不显示 URL、地址栏留空、不进历史、不进会话、不进地址栏联想、不能收藏 |
-| 切换 | `Alt+\`` 在密封标签与「上一个普通标签」之间来回切；走应用内消息泵，不是 `RegisterHotKey` |
+| 切换 | 默认 `Alt+\`` 在密封标签与「上一个普通标签」之间来回切；走应用内消息泵，不是 `RegisterHotKey`；**键位可在设置页改**（见本节末尾 2026-11-10 补记） |
 | 通知 | `AppSettings.SecretNotifications`（默认关）：关时对密封标签的 `Notification` 权限请求 `Deny + Handled`，开时 `Allow`；主菜单可切换 |
 | 不留痕 | 缩放不写 `zoom.json`、丢弃快照不落盘、下载记录不写站点 host、导航日志写 `(secret)` 而不是 URL、导航失败 Toast 不显示 host |
 
@@ -385,6 +385,12 @@
 - **密封标签会出现在内存面板里**（标题「文档」）：有意保留，用户要能看到并释放它的内存。
 
 **指标影响**：体积 +16.5KB（766KB）；密封标签只多一个 renderer，与普通标签相同，无额外进程；无启动开销。
+
+**补记（2026-11-10）：切换键修复 + 可配置**。用户反馈「普通标签页按快捷键切不过去」。根因是两条真实输入路径都被旧自测绕过：① WPF 在 Alt 组合下投递 `Key.System`（真键在 `SystemKey`），`HandleShortcut` 只比 `Key.OemTilde`；② 消息泵收到 `WM_SYSKEYDOWN` 时 `Keyboard.Modifiers` 还没同步到 Alt，被「无修饰键就放行」的守门直接丢掉。修复方式是入口统一 `Hotkey.NormalizeKey` 归一化、消息泵改用 Win32 `GetKeyState` 加 `WM_SYSKEYDOWN` 判定修饰键。同时把切换键做成 `AppSettings.SecretHotkey`（默认 `Alt+OemTilde`，如 `Ctrl+Shift+S`），设置页「隐私 → 切换密封标签快捷键」提供按键录入，主菜单显示当前键；录入拒绝裸键和宿主已占用的组合（`Hotkey.IsReserved`），配置坏了自动回退默认。**仍是应用内快捷键，不是全局热键**；0.15 砍掉的独立 Profile / 防截屏 / DPAPI / 清理等一律不变。
+
+> 本文件其它章节出现的 `Alt+\`` 均指默认键，不代表不可修改；可配置的只有密封标签切换键一个。
+
+验证：`--m5test` 扩到 35/35 PASS（新增两条真实输入路径、自定义键、消息泵自定义键、配置往返、录入状态机、冲突拦截）；回归 `--fixtest` 296/296、`--m6btest` 30/30、`--navtest` 30/30、`--m4test` 133/133、`--m3ctest` 54/54（首次 1 项偶发 FAIL，页面 URL 未就绪导致站点键落到「本地文件」，重跑通过，与本批改动无关）。体积 1,271,296 → 1,279,488 字节（+8KB，含新增自测代码），仍远低于 3MB；无额外进程、无启动开销。
 
 ### 0.16 M6-a：发布收尾（2026-11-04 22:55）
 
@@ -1142,13 +1148,14 @@ UI 主色 `#FF4D9D` 不变。**图标已验收通过，定稿。**
 | `Ctrl+Shift+O` | 书签（M3-b 已实现） |
 | `Ctrl+J` | 下载列表 `nano://downloads`（M3-c 已实现；新开标签，已有则切过去） |
 | `Ctrl+Shift+A` | 标签搜索（P1，未实现） |
-| `Alt+\`` | **密封标签：切走 / 恢复**（应用内，见 0.15） |
+| `Alt+\``（默认，可改） | **密封标签：切走 / 恢复**（应用内，见 0.15；设置页「隐私 → 切换密封标签快捷键」可重新录入，主菜单显示当前键） |
 | `Ctrl+Shift+M` | 内存面板（**0.18 已实现**） |
 | `Ctrl+Shift+L` | 布局轮换（0.18 从 `Ctrl+Shift+M` 让位；`Ctrl+L` 仍是聚焦地址栏） |
 | `Ctrl+F5` | 硬刷新（**0.18 已实现**，走 CDP `ignoreCache`） |
 | 鼠标中键点击标签 | 关闭该标签（**0.18 已实现**） |
 
 > 0.18 补齐状态：`Ctrl+Shift+T`（恢复最近关闭）、`Ctrl+Shift+M`、`Ctrl+F5`、中键关闭均已落地；仅 `Ctrl+Shift+A` 仍属 P1。
+> 唯一可配置的快捷键是密封标签切换键；全文其它 `Alt+\`` 均指默认值。
 
 ---
 
@@ -1315,7 +1322,7 @@ UI 主色 `#FF4D9D` 不变。**图标已验收通过，定稿。**
 |---|---|
 | 入口 | 主菜单「新建密封标签」，不新增创建快捷键 |
 | 伪装 | 标签标题固定「文档」（`TabModel.DisplayTitle`）、标签 tooltip 不显示 URL、地址栏留空、不进历史、不进会话恢复、不进地址栏联想、不能收藏 |
-| 切换 | `Alt+\`` 在密封标签与「上一个普通标签」之间来回切；没有密封标签时 Toast 提示。走应用内消息泵，**不是 `RegisterHotKey` 全局热键**：窗口不在前台时不生效 |
+| 切换 | 默认 `Alt+\`` 在密封标签与「上一个普通标签」之间来回切；没有密封标签时 Toast 提示。走应用内消息泵，**不是 `RegisterHotKey` 全局热键**：窗口不在前台时不生效。键位可在设置页「隐私 → 切换密封标签快捷键」重新录入（`AppSettings.SecretHotkey`，拒绝裸键与宿主已占用组合），主菜单显示当前键 |
 | 通知 | 设置项 `SecretNotifications`（默认关）：关闭时对密封标签的 `Notification` 权限请求直接 `Deny + Handled`，打开时 `Allow`；主菜单里可切换 |
 | 不留痕 | 缩放不写 `zoom.json`、丢弃快照不落盘、下载记录不写站点 host、导航日志写 `(secret)` 而不是 URL、导航失败 Toast 不显示 host |
 | 多标签 | 可以开多个密封标签；`Alt+\`` 切到最近创建的那个，切回时回到进入前的普通标签 |
@@ -1356,7 +1363,7 @@ UI 主色 `#FF4D9D` 不变。**图标已验收通过，定稿。**
   logs\
 ```
 
-设置分区（M6-b 实际落地，见 0.17）：`外观（主题/语言）/ 布局（布局/固定展开/状态栏）/ 内存（三档 + 阈值）/ 隐私（密封标签通知）/ 关于（版本/数据目录/默认浏览器）`。脚本管理仍在 `nano://scripts`，不重复放进设置页。
+设置分区（M6-b 实际落地，见 0.17；2026-11-10 拆出网页语言，见 7.7.1）：`外观（主题/界面语言/网页语言）/ 布局（布局/固定展开/状态栏）/ 内存（三档 + 阈值）/ 隐私（密封标签通知/切换键）/ 关于（版本/数据目录/默认浏览器）`。脚本管理仍在 `nano://scripts`，不重复放进设置页。
 
 **AppData 模式 vs 便携模式（Q5）**
 
@@ -1377,6 +1384,25 @@ UI 主色 `#FF4D9D` 不变。**图标已验收通过，定稿。**
 - `AppSettings.Language`（zh-CN / en-US）持久化；`--lang=` 可启动覆盖；所有 `--mXtest` 强制中文，保证断言稳定。
 - 切换语言时重建工具栏、标签条、内部页/起始页视图与标签标题；**WebView2 不重载**。
 - 新增语言 = 在 `Locale.cs` 的字典里补一列，调用点不需要改。
+
+### 7.7.1 网页语言（2026-11-10 追加）
+
+**界面语言和网页语言是两项独立设置，互不联动**。网站看不见我们的菜单，只看浏览器发过去的 `Accept-Language` 请求头和页面里的 `navigator.language`。
+
+| | 界面语言 `AppSettings.Language` | 网页语言 `AppSettings.WebLanguage` |
+|---|---|---|
+| 管什么 | 菜单 / 设置页 / 按钮 / 标签标题的字 | 网站检测后默认展示中文版还是英文版 |
+| 网站看得到吗 | 看不到 | 看得到：请求头 + `navigator.language` |
+| 切换代价 | 重建本地视图，WebView2 不动 | 不重建任何视图；请求头对之后的请求立即生效，已打开页面要刷新 |
+
+- 三档 `system`（默认）/ `zh-CN` / `en-US`，独立持久化在 `settings.json`；旧配置缺字段自动回退 `system`，手改坏的值在 `SettingsStore.Load` 归一化。
+- `system` = **完全不干预**：不注册过滤器、不注入脚本，沿用 WebView2 原生行为（本批之前的行为不变，默认零开销）。
+- 显式档：`WebLanguage.AcceptLanguage` 生成请求头；`BrowserHost` 用 WebView2 的 `AddWebResourceRequestedFilter`（只拦 `Document` / `XmlHttpRequest` / `Fetch`）在 `WebResourceRequested` 里 `SetHeader("Accept-Language", ...)`；同时用 `AddScriptToExecuteOnDocumentCreated` 把 `navigator.language` / `languages` 对齐（排在用户脚本之前）。
+- **不用 `CoreWebView2EnvironmentOptions.Language`**：它是环境级、创建时固定、运行中不可改，且同一 UserDataFolder 下用不同值创建会直接失败；为改语言重启浏览器进程要重载所有标签，代价远大于收益。
+- 生效口径：切换后新请求立即带新头，已打开文档不重跑注入脚本 → 设置页 hint 与 Toast 都写「刷新页面后生效」，不假装热更新。不重启内核、不重建标签、不重载网页、不动 Profile / Cookie。
+- 边界：不覆盖 `Intl.*().resolvedOptions().locale`，不改 WebView2 自带右键菜单 / 对话框的语言（那是内核 UI 语言，随系统），不翻译网页内容；网站自己的语言切换器仍可覆盖。
+- 开销：默认零新增回调；显式档每个主文档 / XHR / fetch 请求一次轻量托管回调；无新依赖、无新资源文件、不动内存三态模型。
+- 验收：`--m10test` 28/28 PASS（`out/m10-report.txt`），本机 HTTP 服务回显真实请求头 + 读 `navigator.language`，覆盖三档切换、双语设置页截图与配置往返。
 
 ### 7.8 起始页（P0）
 
