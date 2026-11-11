@@ -4,6 +4,7 @@ using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
@@ -12,42 +13,47 @@ using Microsoft.Web.WebView2.Core;
 namespace NanoEdge
 {
     // =====================================================================
-    // 8.1 / 8.2 顶部工具条
-    // 用户口径（覆盖 SPEC 3.2 的常驻显示）：按钮只有确认掉登录了才出现。
-    // 工具条本身在「掉登录」或「有 20 秒状态提示」时可见；只藏按钮不藏状态文字，
-    // 否则 8.3 要求的「已重新登录」会无处显示。
+    // 悬浮重登按钮（覆盖 SPEC 8.1 的整行工具条）
+    //
+    // WebView2 是 HwndHost，WPF 元素盖不住它，所以「悬浮在网页上方」只能用 Popup：
+    // 独立顶层窗口、不参与布局，网页不会被挤下去，宽度就是按钮（+状态文字）那么宽，居中。
+    // 用户口径：只有确认掉登录才出现；切到别的标签/站点立刻收起。
     // =====================================================================
-    internal sealed class PgAdminReloginBar : Grid
+    internal sealed class PgAdminReloginBar : IDisposable
     {
+        private readonly Popup _popup;
+        private readonly Border _card;
         private readonly Button _button;
         private readonly TextBlock _status;
         private readonly DispatcherTimer _statusTimer;
         private readonly SolidColorBrush _normalBrush = Brush("#D32F2F");
         private readonly CornerRadius _cornerRadius = new CornerRadius(6);
+        private readonly FrameworkElement _anchor;
         private bool _signedOut;
         private bool _busy;
         private bool _hasStatus;
+        private bool _windowVisible = true;
 
         public event Action Clicked;
 
-        public PgAdminReloginBar()
+        public PgAdminReloginBar(FrameworkElement anchor)
         {
-            Height = 36;
-            Visibility = Visibility.Collapsed;
-            SetResourceReference(Grid.BackgroundProperty, "ChromeBrush");
+            _anchor = anchor;
 
-            var row = new StackPanel
+            _card = new Border
             {
-                Orientation = Orientation.Horizontal,
-                HorizontalAlignment = HorizontalAlignment.Right,
-                VerticalAlignment = VerticalAlignment.Center
+                CornerRadius = new CornerRadius(8),
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(6, 4, 6, 4)
             };
+            _card.SetResourceReference(Border.BackgroundProperty, "ChromeBrush");
+            _card.SetResourceReference(Border.BorderBrushProperty, "LineBrush");
 
             _status = new TextBlock
             {
                 FontSize = 12,
-                MaxWidth = 440,
-                Margin = new Thickness(0, 0, 10, 0),
+                MaxWidth = 360,
+                Margin = new Thickness(6, 0, 8, 0),
                 VerticalAlignment = VerticalAlignment.Center,
                 TextTrimming = TextTrimming.CharacterEllipsis,
                 Visibility = Visibility.Collapsed
@@ -55,13 +61,61 @@ namespace NanoEdge
             _status.SetResourceReference(TextBlock.ForegroundProperty, "MutedBrush");
 
             _button = MakeButton();
+            var row = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                VerticalAlignment = VerticalAlignment.Center
+            };
             row.Children.Add(_status);
             row.Children.Add(_button);
-            Children.Add(row);
+            _card.Child = row;
 
+            _popup = new Popup
+            {
+                PlacementTarget = anchor,
+                Placement = PlacementMode.Relative,
+                StaysOpen = true,
+                AllowsTransparency = true,
+                Child = _card,
+                IsOpen = false
+            };
+
+            _card.SizeChanged += OnCardSizeChanged;
+            _anchor.SizeChanged += OnAnchorSizeChanged;
             _statusTimer = new DispatcherTimer();
             _statusTimer.Tick += (s, e) => { _statusTimer.Stop(); ClearStatus(); };
             ApplyLanguage();
+        }
+
+        private void OnCardSizeChanged(object sender, SizeChangedEventArgs e) { Reposition(); }
+
+        private void OnAnchorSizeChanged(object sender, SizeChangedEventArgs e) { Reposition(); }
+
+        // 居中：相对 _tabHost（网页区域）左上角算偏移，宽度就是卡片本身。
+        public void Reposition()
+        {
+            if (!_popup.IsOpen) return;
+            if (_anchor.ActualWidth <= 0) return;
+            _card.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+            var width = _card.DesiredSize.Width;
+            if (width <= 0) return;
+            _popup.HorizontalOffset = Math.Max(0, (_anchor.ActualWidth - width) / 2);
+            _popup.VerticalOffset = 8;
+        }
+
+        // 窗口最小化时收起；恢复时按状态重新显示。
+        public void SetWindowVisible(bool visible)
+        {
+            _windowVisible = visible;
+            ApplyState();
+        }
+
+        public void Dispose()
+        {
+            _statusTimer.Stop();
+            try { _popup.IsOpen = false; } catch { }
+            _card.SizeChanged -= OnCardSizeChanged;
+            _anchor.SizeChanged -= OnAnchorSizeChanged;
         }
 
         private Button MakeButton()
@@ -70,7 +124,7 @@ namespace NanoEdge
             {
                 Height = 28,
                 MinWidth = 88,
-                Margin = new Thickness(0, 4, 12, 4),
+                Margin = new Thickness(0),
                 FontSize = 13,
                 FontWeight = FontWeights.Bold,
                 Foreground = Brushes.White,
@@ -186,14 +240,37 @@ namespace NanoEdge
             var text = _busy ? L.T("登录中…") : L.T("重登录");
             _button.Content = text;
             AutomationProperties.SetName(_button, text);
-            Visibility = (_signedOut || _hasStatus) ? Visibility.Visible : Visibility.Collapsed;
+            if ((_signedOut || _hasStatus) && _windowVisible) Open();
+            else Close();
+        }
+
+        private void Open()
+        {
+            if (_popup.IsOpen) { Reposition(); return; }
+            if (!_anchor.IsVisible || _anchor.ActualWidth <= 0) return;
+            // 打开前先量一次，避免第一帧出现在最左侧再跳到中间。
+            _card.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+            var width = _card.DesiredSize.Width;
+            if (width > 0)
+            {
+                _popup.HorizontalOffset = Math.Max(0, (_anchor.ActualWidth - width) / 2);
+                _popup.VerticalOffset = 8;
+            }
+            _popup.IsOpen = true;
+        }
+
+        private void Close()
+        {
+            if (_popup.IsOpen) _popup.IsOpen = false;
         }
 
         // 自测用：按钮 / 状态的可见性与文案。
         internal bool ButtonVisibleForTest { get { return _button.Visibility == Visibility.Visible; } }
         internal string ButtonTextForTest { get { return Convert.ToString(_button.Content); } }
         internal string StatusTextForTest { get { return _status.Text; } }
-        internal bool IsVisibleForTest { get { return Visibility == Visibility.Visible; } }
+        internal bool IsVisibleForTest { get { return _popup.IsOpen; } }
+        internal FrameworkElement CardForTest { get { return _card; } }
+        internal double HorizontalOffsetForTest { get { return _popup.HorizontalOffset; } }
         internal string NormalBackgroundForTest { get { return _normalBrush.Color.ToString(); } }
         internal double CornerRadiusForTest { get { return _cornerRadius.TopLeft; } }
         internal bool BoldForTest { get { return _button.FontWeight == FontWeights.Bold; } }
@@ -291,6 +368,9 @@ namespace NanoEdge
 
         public void OnActiveTabChanged()
         {
+            // 状态提示属于上一个标签的操作反馈，切走就丢掉；
+            // 否则「已重新登录」那 20 秒会让悬浮条停在别的站点上（用户反馈过的 bug）。
+            _bar.ClearStatus();
             var tab = _activeTab();
             if (tab == null) { _bar.SetSignedOut(false); return; }
             bool signedOut;
@@ -451,7 +531,10 @@ namespace NanoEdge
         {
             if (tab == null) return;
             _signedOut.Remove(tab.Id);
-            if (ReferenceEquals(tab, _activeTab())) _bar.SetSignedOut(false);
+            if (!ReferenceEquals(tab, _activeTab())) return;
+            // 同一个标签导航到别的网站时也要立刻收起悬浮条（状态提示一并清掉）。
+            _bar.ClearStatus();
+            _bar.SetSignedOut(false);
         }
 
         // 保存凭据 / 改动配置后：解除熄灭，并对当前已打开的页面补一次即时注入。

@@ -17,6 +17,7 @@ _ref/
 .workbuddy/
 docs/HANDOFF-*.md
 docs/COMPARE-*.md
+docs/FIX-PLAN-*.md
 
 # IDE / 操作系统
 .vs/

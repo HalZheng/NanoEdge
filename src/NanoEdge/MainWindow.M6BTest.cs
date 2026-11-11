@@ -95,6 +95,10 @@ namespace NanoEdge
                     zhTexts.Any(t => t != null && t.Contains("700MB")), "700MB");
                 Check("zh page has the secret tab hotkey row",
                     zhTexts.Contains("切换密封标签快捷键"), "row ok");
+                Check("zh page explains secret tabs are not kept after restart",
+                    zhTexts.Any(t => t != null && t.Contains("重启后")), "note ok");
+                Check("zh page says allowing notifications does not guarantee a popup",
+                    zhTexts.Any(t => t != null && t.Contains("注册过通知身份")), "note ok");
                 Check("zh settings page rendered",
                     File.Exists(Path.Combine(_root, "out", "m6b-settings-zh.png")), "out/m6b-settings-zh.png");
 
@@ -109,6 +113,10 @@ namespace NanoEdge
                     "sections ok");
                 Check("en page has the secret tab hotkey row",
                     enTexts.Contains("Secret tab switch shortcut"), "row ok");
+                Check("en page explains secret tabs are not kept after restart",
+                    enTexts.Any(t => t != null && t.Contains("restart")), "note ok");
+                Check("en page says allowing notifications does not guarantee a popup",
+                    enTexts.Any(t => t != null && t.Contains("registered as a notification sender")), "note ok");
                 var leaked = LeakedChinese(enTexts);
                 Check("en settings page has no untranslated Chinese", leaked.Count == 0,
                     leaked.Count == 0 ? "none" : string.Join(" | ", leaked.Take(6)));

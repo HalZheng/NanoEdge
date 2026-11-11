@@ -453,7 +453,19 @@ namespace NanoEdge
                 e.State = _settings.SecretNotifications
                     ? CoreWebView2PermissionState.Allow
                     : CoreWebView2PermissionState.Deny;
+                // 不写进 profile：一条「某 origin 可以发通知」的授权记录，本身就是
+                // 「这个站点来过」的磁盘痕迹，密封标签不该留下它。
+                e.SavesInProfile = false;
                 e.Handled = true;
+            };
+
+            // 授权是按 origin 记在 profile 里的，站点被放行过一次之后就不会再走
+            // PermissionRequested —— 于是一个已经放行过的站点，在把开关关掉之后
+            // 仍然能弹通知（--m5test 里量到过）。所以展示前再兜一层：开关关着，
+            // 密封标签的通知一律不展示。只动密封标签，普通标签默认展示不受影响。
+            core.NotificationReceived += (s, e) =>
+            {
+                if (tab.IsSecret && !_settings.SecretNotifications) e.Handled = true;
             };
 
             // 崩溃恢复（SPEC 7.5 / M6）：渲染进程崩溃重载一次，无响应给手动重载。
@@ -696,6 +708,9 @@ namespace NanoEdge
             var languageScript = WebLanguage.Script(_webLanguage);
             if (!string.IsNullOrEmpty(languageScript)) sources.Add(languageScript);
             sources.Add(ScriptEngine.Bootstrap());
+            // 登录表单识别：只暴露 scan / fill 两个方法，不常驻观察器（内存口径见 SPEC 2）。
+            // 设置页关掉「填充账号密码」后连脚本都不注入，页面里不留痕迹。
+            if (_settings.PasswordFill) sources.Add(LoginFill.Script);
             foreach (var script in scripts) sources.Add(ScriptEngine.Wrap(script));
             // 只有开了重登才注入这段引导器；它内部按站点 + 10 分钟标记双重判定，
             // 其它站点的页面即使被注入也不会有任何动作（F-12）。

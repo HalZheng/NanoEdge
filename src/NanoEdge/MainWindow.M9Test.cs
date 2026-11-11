@@ -350,16 +350,49 @@ namespace NanoEdge
                 Check("另一个站点取到它自己的脚本",
                     forOther != null && forOther.Script.Id == other.Id, "");
 
-                // 按钮显示规则（用户口径）：没掉登录不显示。
+                // 按钮显示规则（用户口径）：没掉登录不显示；而且它是 Popup 悬浮层，
+                // 不参与布局 —— 出现时网页区域的高度不能变小。
                 var bar = _w.ReloginBarForTest;
                 bar.ClearStatus();
                 bar.SetSignedOut(false);
-                Check("没掉登录：按钮隐藏、工具条折叠",
+                Check("没掉登录：悬浮条完全不显示",
                     !bar.ButtonVisibleForTest && !bar.IsVisibleForTest, "");
+                var hostHeightBefore = _w._tabHost.ActualHeight;
                 bar.SetSignedOut(true);
                 Check("掉登录：按钮出现，中文显示「重登录」",
                     bar.ButtonVisibleForTest && bar.IsVisibleForTest &&
                     bar.ButtonTextForTest == "重登录" && bar.ButtonEnabledForTest, "");
+                Check("悬浮条出现时网页不会被挤下去（Popup 不占布局）",
+                    Math.Abs(_w._tabHost.ActualHeight - hostHeightBefore) <= 0.5 &&
+                    Math.Abs(_w._tabHost.ActualHeight - _w._bodyGrid.ActualHeight) <= 1,
+                    "tabHost=" + _w._tabHost.ActualHeight.ToString("0") +
+                    " body=" + _w._bodyGrid.ActualHeight.ToString("0"));
+                var cardWidth = bar.CardForTest.DesiredSize.Width;
+                var centered = Math.Max(0, (_w._tabHost.ActualWidth - cardWidth) / 2);
+                Check("悬浮按钮水平居中在网页区域顶部",
+                    cardWidth > 0 && cardWidth < _w._tabHost.ActualWidth &&
+                    Math.Abs(bar.HorizontalOffsetForTest - centered) <= 2,
+                    "card=" + cardWidth.ToString("0") +
+                    " offset=" + bar.HorizontalOffsetForTest.ToString("0"));
+
+                // 用户报的 bug：切到别的网站的标签页时，悬浮条还留着。
+                var previousActive = _w._active;
+                // 让监测器也记下「这个标签掉登录」——切回来才有状态可恢复。
+                _w.ReloginForTest.MarkSignedOutForTest(previousActive, true);
+                var otherTab = new TabModel { Url = "https://other.invalid/", Title = "other" };
+                _w._tabs.Add(otherTab);
+                _w._active = otherTab;
+                _w.ReloginForTest.OnActiveTabChanged();
+                Check("切到别的网站标签后悬浮条立刻收起",
+                    !bar.IsVisibleForTest && !bar.ButtonVisibleForTest,
+                    "visible=" + bar.IsVisibleForTest);
+                _w._active = previousActive;
+                _w.ReloginForTest.OnActiveTabChanged();
+                Check("切回原标签时按它自己的掉登录状态恢复显示",
+                    bar.ButtonVisibleForTest && bar.IsVisibleForTest, "");
+                _w._tabs.Remove(otherTab);
+                _w.ReloginForTest.MarkSignedOutForTest(previousActive, false);
+                bar.ClearStatus();
                 Check("按钮样式：红色 #D32F2F / 圆角 6 / 白色粗体",
                     bar.NormalBackgroundForTest == "#FFD32F2F" &&
                     bar.CornerRadiusForTest == 6 && bar.BoldForTest &&
@@ -673,25 +706,32 @@ namespace NanoEdge
             private void RenderBar(string path, string language, string expected)
             {
                 L.Apply(language);
-                var bar = new PgAdminReloginBar();
+                var anchor = new System.Windows.Controls.Grid { Width = 520, Height = 40 };
+                var bar = new PgAdminReloginBar(anchor);
+                // 平时看到的样子：只有一颗悬浮按钮，没有整行背景。
                 bar.SetSignedOut(true);
-                bar.ShowStatus(L.T("已重新登录"), true, 20);
-                var host = new System.Windows.Controls.Grid { Width = 520, Height = 36 };
-                host.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#141922"));
-                host.Children.Add(bar);
-                RenderPage(host, path, 520, 36);
+                // 悬浮卡片本体：Popup 是独立窗口，截图直接渲染卡片，
+                // 尺寸取它自己想要的宽度（就是按钮 + 状态文字那么宽）。
+                var card = bar.CardForTest;
+                card.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+                var width = Math.Max(140, card.DesiredSize.Width);
+                var height = Math.Max(36, card.DesiredSize.Height);
+                RenderPage(card, path, width, height, 192);
                 Check("截图 " + language + " 按钮文字 = " + expected,
                     bar.ButtonTextForTest == expected, bar.ButtonTextForTest);
             }
 
-            private static void RenderPage(FrameworkElement page, string path, double width, double height)
+            private static void RenderPage(FrameworkElement page, string path,
+                                           double width, double height, double dpi = 96)
             {
                 page.Width = width;
                 page.Height = height;
                 page.Measure(new Size(width, height));
                 page.Arrange(new Rect(0, 0, width, height));
                 page.UpdateLayout();
-                var bitmap = new RenderTargetBitmap((int)width, (int)height, 96, 96, PixelFormats.Pbgra32);
+                var bitmap = new RenderTargetBitmap(
+                    (int)Math.Ceiling(width * dpi / 96), (int)Math.Ceiling(height * dpi / 96),
+                    dpi, dpi, PixelFormats.Pbgra32);
                 bitmap.Render(page);
                 var encoder = new PngBitmapEncoder();
                 encoder.Frames.Add(BitmapFrame.Create(bitmap));

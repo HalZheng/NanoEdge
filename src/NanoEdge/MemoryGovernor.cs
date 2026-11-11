@@ -201,14 +201,20 @@ namespace NanoEdge
             }
         }
 
+        // 状态真变了才通知：MainWindow 靠 Changed 刷新标签条角标。
+        // Tick 每秒都会调这两个方法，没变化时不该把 UI 推倒重建。
         private void EnsureLow(TabModel tab)
         {
-            if (tab.MemoryState == TabMemoryState.Active) _ops.SetLow(tab);
+            if (tab.MemoryState != TabMemoryState.Active) return;
+            _ops.SetLow(tab);
+            if (tab.MemoryState == TabMemoryState.Low) Changed?.Invoke();
         }
 
         private void EnsureActive(TabModel tab)
         {
-            if (tab.MemoryState == TabMemoryState.Low) _ops.SetNormal(tab);
+            if (tab.MemoryState != TabMemoryState.Low) return;
+            _ops.SetNormal(tab);
+            if (tab.MemoryState == TabMemoryState.Active) Changed?.Invoke();
         }
 
         private async void DiscardInBackground(TabModel tab, string reason)

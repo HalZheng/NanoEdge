@@ -12,7 +12,7 @@ namespace NanoEdge
     // 语言切换要重建内部页视图，不能由页面自己干。
     public sealed class SettingsPage : UserControl
     {
-        public event Action<string> Changed;              // theme | layout | memory | language | weblanguage | status | privacy | search
+        public event Action<string> Changed;              // theme | layout | memory | language | weblanguage | status | privacy | search | password
         public event Action OpenDataFolderRequested;
         public event Action SetDefaultBrowserRequested;
 
@@ -183,9 +183,70 @@ namespace NanoEdge
                     _settings.SecretNotifications = on;
                     Raise("privacy");
                 })));
+            // 把「允许」到底允许了什么写清楚：它只放开权限，不保证真能弹（实测过，见 SPEC 0.15 补记 4）。
+            var notifyNote = new TextBlock
+            {
+                Text = L.T("打开只是把通知权限放给网站；Windows 只替注册过通知身份的程序弹通知，当前版本没注册，所以打开后通常看不到弹窗。关闭是直接拦掉，任何情况下都不展示。"),
+                FontSize = 10,
+                Margin = new Thickness(2, 8, 2, 0),
+                TextWrapping = TextWrapping.Wrap
+            };
+            notifyNote.SetResourceReference(TextBlock.ForegroundProperty, "MutedBrush");
+            _body.Children.Add(notifyNote);
             _body.Children.Add(Row(L.T("切换密封标签快捷键"),
                 L.T("点一下按钮，再按下想用的组合键；至少带 Ctrl / Shift / Alt 中的一个"),
                 HotkeyPicker()));
+            var secretNote = new TextBlock
+            {
+                Text = L.T("密封状态不写进会话，程序重启后这个标签不会恢复；按快捷键会把当前标签原地密封，再按一次解除。"),
+                FontSize = 10,
+                Margin = new Thickness(2, 8, 2, 0),
+                TextWrapping = TextWrapping.Wrap
+            };
+            secretNote.SetResourceReference(TextBlock.ForegroundProperty, "MutedBrush");
+            _body.Children.Add(secretNote);
+
+            // ---------- 密码 ----------
+            _body.Children.Add(Section(L.T("密码")));
+            _body.Children.Add(Row(L.T("填充账号密码"),
+                L.T("从 KeePassXC 取账号填进登录页；密码本身从不保存在 NanoEdge"),
+                Toggle(_settings.PasswordFill, on =>
+                {
+                    _settings.PasswordFill = on;
+                    Raise("password");
+                })));
+
+            var keyConfig = KeePassBridge.LoadConfig();
+            if (keyConfig != null)
+            {
+                _body.Children.Add(Row(L.T("KeePassXC"),
+                    L.T("已关联：") + keyConfig.ConnectionId,
+                    TextButton(L.T("清除关联"), () =>
+                    {
+                        KeePassBridge.ForgetConfig();
+                        Raise("password");
+                    })));
+            }
+            else
+            {
+                // 没关联时把「卡在哪一步」说清楚，比只写「未连接」有用
+                var reason = !KeePassBridge.IntegrationRunning()
+                    ? L.T("请先在 KeePassXC 设置里开启「浏览器集成」")
+                    : (KeePassBridge.FindProxy() == null
+                        ? L.T("未安装 KeePassXC")
+                        : L.T("尚未关联，下次填充时会让您允许一次"));
+                _body.Children.Add(Row(L.T("KeePassXC"), reason, null));
+            }
+
+            var fillNote = new TextBlock
+            {
+                Text = L.T("密码只在填充的那一瞬间经过内存，不写日志、不进页面快照。关闭开关后立刻不再显示钥匙图标；已经打开的页面要刷新才会移除扫描脚本。"),
+                FontSize = 10,
+                Margin = new Thickness(2, 8, 2, 0),
+                TextWrapping = TextWrapping.Wrap
+            };
+            fillNote.SetResourceReference(TextBlock.ForegroundProperty, "MutedBrush");
+            _body.Children.Add(fillNote);
 
             // ---------- 关于 ----------
             _body.Children.Add(Section(L.T("关于")));

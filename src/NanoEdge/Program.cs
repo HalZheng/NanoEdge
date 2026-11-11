@@ -30,6 +30,15 @@ namespace NanoEdge
             return null;
         }
 
+        private static bool HasArg(string[] args, string name)
+        {
+            if (args == null) return false;
+            foreach (var arg in args)
+                if (arg == name || arg.StartsWith(name + "=", StringComparison.OrdinalIgnoreCase))
+                    return true;
+            return false;
+        }
+
         // 自测/截图进程使用独立的单实例名，避免把正在使用的 NanoEdge 顶掉，
         // 也避免自测参数被已有实例当成 URL 收走。
         private static bool IsSelfTest(string[] args)
@@ -38,6 +47,7 @@ namespace NanoEdge
             foreach (var arg in args)
             {
                 if (arg.StartsWith("--screenshot=", StringComparison.OrdinalIgnoreCase)) return true;
+                if (arg.StartsWith("--kpxctest", StringComparison.OrdinalIgnoreCase)) return true;
                 switch (arg)
                 {
                     case "--fixtest":
@@ -52,6 +62,7 @@ namespace NanoEdge
                     case "--m8test":
                     case "--m9test":
                     case "--m10test":
+                    case "--logintest":
                     case "--menupreview":
                     case "--fullscreen":
                     case "--test-mutex":
@@ -113,6 +124,10 @@ namespace NanoEdge
                         "NanoEdge", MessageBoxButton.OK, MessageBoxImage.Error);
                     return 2;
                 }
+
+                // KeePassXC 直连自测：纯后台逻辑，不需要 WebView2，也不需要主窗口。
+                if (HasArg(args, "--kpxctest"))
+                    return KeePassSelfTest.Run(args);
 
                 // Per SPEC v1.2: no installer, no version gating, no guided flow.
                 // Only a short explanation and exit.

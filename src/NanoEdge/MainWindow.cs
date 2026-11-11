@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
@@ -24,7 +25,7 @@ namespace NanoEdge
         private TabModel _active;
         private BrowserHost _browser;
 
-        private Grid _root, _bodyGrid, _tabHost, _contentGrid;
+        private Grid _root, _bodyGrid, _tabHost;
         private PgAdminReloginBar _reloginBar;
         private PgAdminSessionMonitor _relogin;
         private ScriptsPage _scriptsPage;
@@ -63,7 +64,6 @@ namespace NanoEdge
         private DateTime _lastChromeDownUtc = DateTime.MinValue;
         private Point _lastChromeDownPoint;
         private bool _chromeDragArmed;
-        private TabModel _secretReturnTab;   // Alt+` 从密封标签切回的那个普通标签
         // _immersive 是「真全屏」的唯一状态位：外壳隐藏、A3 钩子让路、
         // 几何不落盘都由它决定。_fullscreenBusy 只挡进出全屏途中的中间几何。
         private bool _immersive;
@@ -195,6 +195,7 @@ namespace NanoEdge
                 Ipc.Stop();
                 Ipc.Received -= OnIpcReceived;
                 if (_relogin != null) _relogin.Dispose();
+                if (_reloginBar != null) _reloginBar.Dispose();
             };
 
             Loaded += MainWindow_Loaded;
@@ -224,11 +225,13 @@ namespace NanoEdge
             {
                 SyncPopupSize();
                 if (_memoryPanel != null && _memoryPanel.IsOpen) _memoryPanel.Reposition();
+                if (_reloginBar != null) _reloginBar.Reposition();
             };
             LocationChanged += (s, e) =>
             {
                 SaveWindowBounds();
                 if (_memoryPanel != null && _memoryPanel.IsOpen) _memoryPanel.Reposition();
+                if (_reloginBar != null) _reloginBar.Reposition();
             };
             Activated += (s, e) =>
             {
@@ -253,6 +256,9 @@ namespace NanoEdge
                     ExitFullscreen();
                 if (WindowState == WindowState.Minimized && _memoryPanel != null)
                     _memoryPanel.Close();
+                // 悬浮按钮是 Popup，最小化时收起，恢复时按当前状态再显示。
+                if (_reloginBar != null)
+                    _reloginBar.SetWindowVisible(WindowState != WindowState.Minimized);
             };
         }
 
@@ -356,21 +362,14 @@ namespace NanoEdge
             Grid.SetColumn(_rail, 0);
             _bodyGrid.Children.Add(_rail);
 
-            // 网页区域两行：Row0 是 pgAdmin 重登工具条（默认折叠 = 0 高度），Row1 仍是
-            // 唯一装着所有 WebView2 的 _tabHost。只在构造时包一层 Grid，
-            // 绝不 reparent WebView2，也不改 _tabHost.Children。
+            // 网页区域只有 _tabHost 一个子元素：所有 WebView2 都住在这里，绝不 reparent。
+            // pgAdmin 重登按钮是 Popup 悬浮层（WebView2 是 HwndHost，WPF 元素盖不住它），
+            // 不参与布局，所以它出现时网页不会被挤下去。
             _tabHost = new Grid { ClipToBounds = true };
             _tabHost.SetResourceReference(Grid.BackgroundProperty, "CanvasBrush");
-            _contentGrid = new Grid();
-            _contentGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            _contentGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-            _reloginBar = new PgAdminReloginBar();
-            Grid.SetRow(_reloginBar, 0);
-            _contentGrid.Children.Add(_reloginBar);
-            Grid.SetRow(_tabHost, 1);
-            _contentGrid.Children.Add(_tabHost);
-            Grid.SetColumn(_contentGrid, 1);
-            _bodyGrid.Children.Add(_contentGrid);
+            Grid.SetColumn(_tabHost, 1);
+            _bodyGrid.Children.Add(_tabHost);
+            _reloginBar = new PgAdminReloginBar(_tabHost);
             _root.Children.Add(_bodyGrid);
 
             _statusBar = new Border { Height = 22, Padding = new Thickness(10, 0, 10, 0) };
@@ -425,6 +424,8 @@ namespace NanoEdge
             _browser.RestoreCompleted += OnRestoreCompleted;
             _browser.ZoomChanged += (tab, factor) => { if (ReferenceEquals(tab, _active)) UpdateStatus(); };
             _browser.FaviconChanged += tab => RebuildTabStrip();
+            // 音频 / 下载 / DevTools 这类自动豁免会改变角标，走同一条签名比较链路。
+            _browser.FlagsChanged += tab => UpdateMemoryBadge();
 
             _governor = new MemoryGovernor(() => _active, () => _tabs, _browser, _settings.Memory);
             _governor.Changed += UpdateMemoryBadge;
@@ -979,7 +980,7 @@ namespace NanoEdge
                 Background = new SolidColorBrush(Colors.Transparent),
                 VerticalContentAlignment = VerticalAlignment.Center,
                 FontSize = 12,
-                Margin = new Thickness(9, 0, 9, 0)
+                Margin = new Thickness(9, 0, 26, 0)
             };
             _address.SetResourceReference(TextBox.ForegroundProperty, "TextBrush");
             _address.SetResourceReference(TextBox.CaretBrushProperty, "AccentBrush");
@@ -996,7 +997,12 @@ namespace NanoEdge
             {
                 if (_suggestCloseTimer != null) _suggestCloseTimer.Start();
             };
-            addressBorder.Child = _address;
+            // 钥匙图标叠在地址栏右端（Chrome 的位置），平时 Collapsed；
+            // 扫描到密码框才亮。地址栏右边留 26px 给它，避免文字被压住。
+            var addressGrid = new Grid();
+            addressGrid.Children.Add(_address);
+            addressGrid.Children.Add(BuildLoginButton());
+            addressBorder.Child = addressGrid;
             _addressBorder = addressBorder;
 
             if (_suggestions != null) _suggestions.SetAnchor(_addressBorder ?? (FrameworkElement)_address);
@@ -1400,10 +1406,26 @@ namespace NanoEdge
                 tab.LastRecordedUtc = DateTime.UtcNow;
                 // 密封标签不进历史（7.4）；标题更新也走 HistoryStore.UpdateTitle 的 null 兜底。
                 if (!tab.IsSecret && !same) HistoryStore.Record(url, tab.Title);
+
+                // 登录框可能晚于导航完成才渲染（SPA），两个时间点各扫一次；
+                // 都不中也没关系，点钥匙图标时会再扫。
+                HideLoginButton();
+                RefreshLoginStateDelayed(tab, 600);
+                RefreshLoginStateDelayed(tab, 2000);
                 return;
             }
             if (!ReferenceEquals(tab, _active)) return;
             _toast.Show(tab.IsSecret ? L.T("无法打开页面") : L.T("无法打开 ") + HostLabel(url), L.T("重试"), () => _browser.Reload(tab));
+        }
+
+        private async void RefreshLoginStateDelayed(TabModel tab, int delayMs)
+        {
+            try
+            {
+                await Task.Delay(delayMs);
+                RefreshLoginState(tab);
+            }
+            catch (Exception ex) { Diagnostics.Log("delayed login scan failed: " + ex.Message); }
         }
 
         private static string HostLabel(string url)
@@ -1641,6 +1663,7 @@ namespace NanoEdge
         // 这样纵向分组成员不会再掉到最下面，新标签也永远在最后。
         private void RebuildTabStrip()
         {
+            _markerSignature = MarkerSignature();
             RebuildHorizontalStrip();
             RebuildVerticalPanels();
             UpdateStatus();
@@ -2506,7 +2529,60 @@ namespace NanoEdge
             _toast.Show(L.T("已解散分组：") + name);
         }
 
+        private enum TabMarker { None, Discarded, Low, Exempt }
+
+        // 角标由「内存状态 + 豁免原因 + 密封开关」共同决定。只有签名变化才重建
+        // 标签条：Changed / 采样 / FlagsChanged 回调随时会来，每次推倒重建会
+        // 打断拖放和悬停，也没必要。
+        private string _markerSignature = "";
+
+        private string MarkerSignature()
+        {
+            var sig = "";
+            if (_tabs == null) return sig;
+            foreach (var tab in _tabs)
+                sig += tab.Id + ":" + (int)tab.MemoryState + ":" +
+                       (tab.Resident ? 1 : 0) + ":" + (tab.IsSecret ? 1 : 0) + ":" +
+                       (ExemptionOf(tab) ?? "") + "|";
+            return sig;
+        }
+
+        // 一个标签只显示一个状态角标，按「已丢弃 > 降冷 > 豁免 > 常态」取最高优先级。
+        // 密封标签刻意不参与：任何可见角标都会宣告「这是隐私标签」，与伪装相悖。
+        private TabMarker TabStateMarker(TabModel tab)
+        {
+            if (tab == null || tab.IsSecret) return TabMarker.None;
+            if (tab.MemoryState == TabMemoryState.Discarded) return TabMarker.Discarded;
+            if (tab.MemoryState == TabMemoryState.Low) return TabMarker.Low;
+            return ExemptionOf(tab) == null ? TabMarker.None : TabMarker.Exempt;
+        }
+
+        private string ExemptionOf(TabModel tab)
+        {
+            return _governor == null ? null : _governor.ExemptionReason(tab);
+        }
+
+        // 角标只有 6px，装不下文字；状态与原因统一进悬停提示。
+        private string TabStateTip(TabModel tab, TabMarker marker)
+        {
+            var reason = ExemptionOf(tab);
+            switch (marker)
+            {
+                case TabMarker.Discarded:
+                    return L.T("已释放内存 · 点击标签即可恢复") +
+                           (reason == null ? "" : " · " + reason);
+                case TabMarker.Low:
+                    return L.T("降冷 · 页面照常运行，内存优先级已降低") +
+                           (reason == null ? "" : " · " + reason);
+                default:
+                    return reason == L.T("内存常驻")
+                        ? L.T("内存常驻：这个站点的标签不会被自动释放")
+                        : L.T("自动豁免：") + reason;
+            }
+        }
+
         // 有 favicon 就用图标，没有就退回首字母色块（SPEC 7.8 的降级口径）。
+        // 状态角标贴在图标右上角：背景不参与状态表达，避免和「选中态」撞色。
         private FrameworkElement MakeTabBadge(TabModel tab, double size)
         {
             var badge = new Border
@@ -2527,27 +2603,59 @@ namespace NanoEdge
                 };
                 RenderOptions.SetBitmapScalingMode(image, BitmapScalingMode.HighQuality);
                 badge.Child = image;
-                return badge;
+            }
+            else
+            {
+                badge.SetResourceReference(Border.BackgroundProperty, "AccentSoftBrush");
+                var initial = string.IsNullOrEmpty(tab.DisplayTitle) ? "N" : tab.DisplayTitle.Substring(0, 1).ToUpperInvariant();
+                var letter = new TextBlock
+                {
+                    Text = initial,
+                    FontSize = Math.Max(9, size * 0.55),
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+                letter.SetResourceReference(TextBlock.ForegroundProperty, "AccentBrush");
+                badge.Child = letter;
             }
 
-            badge.SetResourceReference(Border.BackgroundProperty, "AccentSoftBrush");
-            var initial = string.IsNullOrEmpty(tab.DisplayTitle) ? "N" : tab.DisplayTitle.Substring(0, 1).ToUpperInvariant();
-            var letter = new TextBlock
+            var marker = TabStateMarker(tab);
+            if (marker == TabMarker.None) return badge;
+
+            var wrap = new Grid
             {
-                Text = initial,
-                FontSize = Math.Max(9, size * 0.55),
+                Width = size,
+                Height = size,
                 HorizontalAlignment = HorizontalAlignment.Center,
                 VerticalAlignment = VerticalAlignment.Center
             };
-            letter.SetResourceReference(TextBlock.ForegroundProperty, "AccentBrush");
-            badge.Child = letter;
-            return badge;
+            wrap.Children.Add(badge);
+            var dot = new Border
+            {
+                Width = 6,
+                Height = 6,
+                CornerRadius = new CornerRadius(3),
+                BorderThickness = new Thickness(1),
+                HorizontalAlignment = HorizontalAlignment.Right,
+                VerticalAlignment = VerticalAlignment.Top,
+                Margin = new Thickness(0, -1, -1, 0),
+                IsHitTestVisible = false,
+                Tag = "state-marker:" + marker
+            };
+            dot.SetResourceReference(Border.BorderBrushProperty,
+                marker == TabMarker.Discarded ? "MutedBrush" : "ChromeBrush");
+            dot.SetResourceReference(Border.BackgroundProperty,
+                marker == TabMarker.Discarded ? "ChromeBrush"
+                : marker == TabMarker.Low ? "StateLowBrush" : "MutedBrush");
+            wrap.Children.Add(dot);
+            return wrap;
         }
 
         private FrameworkElement MakeTabChip(TabModel tab, bool showTitle, bool showClose,
             double minWidth, double maxWidth, bool verticalInsert = false)
         {
             var active = ReferenceEquals(tab, _active);
+            var marker = TabStateMarker(tab);
             var border = new Border
             {
                 Height = 30,
@@ -2559,24 +2667,19 @@ namespace NanoEdge
                 Tag = tab,
                 AllowDrop = true
             };
-            // 内存常驻要有看得见的区别：淡色底 + 左侧竖条 + 悬停说明。
-            // 三处背景写入统一走 applyBackground，避免鼠标移开后样式丢失。
+            // 背景只表达「选中 / 悬停」，不再表达状态：状态和内存面板共用一套
+            // 三态色，统一走图标右上角的小角标。三处背景写入都走 applyBackground，
+            // 避免鼠标移开后样式丢失。
             Action applyBackground = () =>
                 border.SetResourceReference(Border.BackgroundProperty,
-                    tab.Resident ? "AccentSoftBrush" : (active ? "SurfaceBrush" : "TabIdleBrush"));
+                    active ? "SurfaceBrush" : "TabIdleBrush");
             applyBackground();
-            if (tab.Resident)
-            {
-                border.BorderThickness = new Thickness(2, 0, 0, 0);
-                border.SetResourceReference(Border.BorderBrushProperty, "WarnBrush");
-                border.ToolTip = L.T("内存常驻：这个站点的标签不会被自动释放");
-            }
             if (active)
             {
-                border.BorderThickness = tab.Resident
-                    ? new Thickness(2, 0, 0, 2) : new Thickness(0, 0, 0, 2);
+                border.BorderThickness = new Thickness(0, 0, 0, 2);
                 border.SetResourceReference(Border.BorderBrushProperty, "AccentBrush");
             }
+            if (marker != TabMarker.None) border.ToolTip = TabStateTip(tab, marker);
 
             var grid = new Grid();
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(26) });
@@ -2597,7 +2700,8 @@ namespace NanoEdge
                     TextTrimming = TextTrimming.CharacterEllipsis,
                     ToolTip = tab.IsSecret ? "" : tab.Url
                 };
-                title.SetResourceReference(TextBlock.ForegroundProperty, "TextBrush");
+                title.SetResourceReference(TextBlock.ForegroundProperty,
+                    marker == TabMarker.Discarded ? "MutedBrush" : "TextBrush");
                 Grid.SetColumn(title, 1);
                 grid.Children.Add(title);
             }
@@ -3078,8 +3182,10 @@ namespace NanoEdge
             menu.Items.Add(MakeMenuItem(L.T("新建标签 (Ctrl+T)"), () => NewTab()));
             menu.Items.Add(MakeMenuItem(L.T("恢复最近关闭 (Ctrl+Shift+T)"), ReopenClosedTab));
             menu.Items.Add(MakeMenuItem(L.T("新建密封标签"), NewSecretTab));
+            var toggleLabel = _active != null && _active.IsSecret ? "解除密封" : "密封当前标签";
             menu.Items.Add(MakeMenuItem(
-                L.T("切换密封标签") + " (" + Hotkey.Display(_settings.SecretHotkey) + ")", ToggleSecret));
+                L.T(toggleLabel) + " (" + Hotkey.Display(_settings.SecretHotkey) + ")",
+                ToggleSecret));
             menu.Items.Add(MakeMenuItem(L.T("密封标签通知：") + (_settings.SecretNotifications ? L.T("允许") : L.T("关闭")),
                 ToggleSecretNotifications));
             menu.Items.Add(Theme.StyleSeparator(new Separator()));
@@ -3253,26 +3359,32 @@ namespace NanoEdge
             if (_address != null) _address.Focus();
         }
 
+        // 密封状态是「当前标签自己的开关」：原地翻转 IsSecret，不新建标签、
+        // 也不跳到别的标签。页面内容、WebView2、Cookie 全都不动，变的只是
+        // 显示（标题/地址栏/图标）和之后的留痕策略。
         private void ToggleSecret()
         {
-            var secret = _tabs.FirstOrDefault(t => t.IsSecret);
-            if (secret == null)
+            var tab = _active;
+            if (tab == null) return;
+            tab.IsSecret = !tab.IsSecret;
+            if (tab.IsSecret)
             {
-                _toast.Show(L.T("没有密封标签（菜单 → 新建密封标签）"));
-                return;
+                // 普通标签期间抓到的站点图标会泄露身份，就地密封必须一起清掉。
+                tab.Favicon = null;
+                // 转换之前已经写进历史 / zoom.json / 联想 / 快照的记录不倒删：
+                // 只保证「之后」不再写，倒删反而会把不相干的历史一起抹掉。
             }
-
-            if (ReferenceEquals(_active, secret))
+            else
             {
-                var back = _secretReturnTab != null && _tabs.Contains(_secretReturnTab) && !_secretReturnTab.IsSecret
-                    ? _secretReturnTab
-                    : _tabs.FirstOrDefault(t => !t.IsSecret);
-                if (back == null) { _toast.Show(L.T("没有可切回的标签")); return; }
-                SelectTab(back);
-                return;
+                // 解封后把密封前的站点图标从纯内存缓存取回来。缓存只在导航时
+                // 回填（BrowserHost.SourceChanged），原地解封不会触发那条路径，
+                // 不补这一步图标会一直缺失到下次导航。缓存没有就等下次导航。
+                tab.Favicon = Favicons.Get(tab.Url);
             }
-
-            SelectTab(secret);
+            SetAddress(AddressFor(tab));
+            RebuildTabStrip();
+            SaveSession();
+            // 刻意不弹 Toast：Toast 在屏幕上看得见，会把「密封」这件事露出去。
         }
 
         private void ToggleSecretNotifications()
@@ -3280,7 +3392,7 @@ namespace NanoEdge
             _settings.SecretNotifications = !_settings.SecretNotifications;
             SettingsStore.Save(_settings);
             _toast.Show(_settings.SecretNotifications
-                ? L.T("密封标签：允许页面通知")
+                ? L.T("密封标签：已允许通知请求")
                 : L.T("密封标签：已关闭页面通知"));
         }
 
@@ -3320,6 +3432,10 @@ namespace NanoEdge
             var normalized = InternalPages.Normalize(url);
             // 必须在覆盖 tab.Url 之前取站点：用户脚本页的「按站点禁用」要用它。
             var site = string.IsNullOrEmpty(sourceSite) ? ZoomStore.SiteOf(tab.Url) : sourceSite;
+            // 密封标签被导航到内部页后就不再是隐私内容：清掉标记，否则会出现
+            // 「标题叫文档、内容是设置页」的怪标签，还会被当成密封标签继续伪装、
+            // 并从会话里排除。用户主动打开内部页时这个标签已不再是隐私内容。
+            if (tab.IsSecret) tab.IsSecret = false;
             tab.Url = normalized;
             tab.Title = InternalPages.TitleOf(normalized);
             tab.InternalPage = normalized == InternalPages.Start ? "" : normalized.Substring("nano://".Length);
@@ -3464,6 +3580,14 @@ namespace NanoEdge
             {
                 UpdateStatus();
                 if (_memoryPanel != null && _memoryPanel.IsOpen) { var unused = _memoryPanel.RefreshAsync(); }
+                return;
+            }
+            if (kind == "password")
+            {
+                // 重新注入或移除扫描脚本；关掉后钥匙图标立刻消失。
+                _browser.RefreshScripts();
+                if (!_settings.PasswordFill) HideLoginButton();
+                else RefreshLoginStateDelayed(_active, 300);
             }
         }
 
@@ -3582,9 +3706,6 @@ namespace NanoEdge
         private void SelectTab(TabModel tab)
         {
             if (tab == null) return;
-            // 记住"从哪个普通标签切到密封标签"，Alt+` 才能切回来；普通→普通也更新。
-            if (_active != null && !_active.IsSecret && !ReferenceEquals(_active, tab))
-                _secretReturnTab = _active;
             _active = tab;
             tab.LastActiveUtc = DateTime.UtcNow;
             EnsureLoaded(tab);
@@ -3717,6 +3838,13 @@ namespace NanoEdge
 
         private void UpdateMemoryBadge()
         {
+            // 降冷 / 恢复 / 自动豁免变化后，角标要跟着变；只在签名变化时重建。
+            var sig = MarkerSignature();
+            if (sig != _markerSignature)
+            {
+                if (_tabStripPanel != null) RebuildTabStrip();
+                else _markerSignature = sig;
+            }
             if (_memoryBadge == null) return;
             var snapshot = _governor == null ? null : _governor.LastSnapshot;
             if (snapshot == null)
@@ -3815,11 +3943,11 @@ namespace NanoEdge
             if (SettingsPage.IsCapturing(Keyboard.FocusedElement as DependencyObject)) return;
 
             var key = KeyInterop.KeyFromVirtualKey((int)msg.wParam);
-            // ThreadPreprocessMessage 阶段 WPF 的 KeyboardDevice 还没同步按键状态：
-            // Alt 组合走 WM_SYSKEYDOWN 时 Keyboard.Modifiers 常常还是 None，旧代码
-            // 会把整条切换键当成"无修饰键"丢掉。补一层 Win32 实时状态，并把
-            // WM_SYSKEYDOWN 本身当作 Alt 的依据（F10 也会发它，但表里没这个键）。
-            var modifiers = Keyboard.Modifiers | NativeModifiers();
+            // ThreadPreprocessMessage 阶段不能读 Keyboard.Modifiers：WPF 的键盘状态
+            // 要等消息分发后才同步，读到的可能是旧值（残留的 Ctrl/Shift 会让组合键
+            // 多出修饰位而匹配失败，表现为偶发失灵）。这里只认 Win32 实时状态，
+            // 并把 WM_SYSKEYDOWN 本身当作 Alt 的依据（F10 也会发它，但表里没这个键）。
+            var modifiers = NativeModifiers();
             if (msg.message == WM_SYSKEYDOWN) modifiers |= ModifierKeys.Alt;
             var ctrl = (modifiers & ModifierKeys.Control) == ModifierKeys.Control;
             var shift = (modifiers & ModifierKeys.Shift) == ModifierKeys.Shift;
@@ -3999,6 +4127,13 @@ namespace NanoEdge
             if (HasArg("--m3ctest"))
             {
                 var test = new M3CSelfTest(this);
+                var unused = test.RunAsync();
+                return;
+            }
+
+            if (HasArg("--logintest"))
+            {
+                var test = new LoginSelfTest(this);
                 var unused = test.RunAsync();
                 return;
             }
@@ -4230,19 +4365,29 @@ namespace NanoEdge
         [DllImport("user32.dll")]
         private static extern short GetKeyState(int nVirtKey);
 
+        [DllImport("user32.dll")]
+        private static extern short GetAsyncKeyState(int nVirtKey);
+
         private const int VK_SHIFT = 0x10;
         private const int VK_CONTROL = 0x11;
         private const int VK_MENU = 0x12;
 
-        // 线程消息预处理阶段的修饰键状态：Keyboard.Modifiers 依赖 WPF 输入队列，
-        // 焦点在 WebView2 的独立 HWND 时它可能还没同步。直接读 Win32 当前状态更稳。
+        // 线程消息预处理阶段要的是「此刻物理按着哪些修饰键」。
+        // GetAsyncKeyState 读实时状态，不受 WPF 输入队列/消息队列同步时序影响；
+        // GetKeyState 兜底（远程桌面、按键注入等场景异步状态偶尔读不到）。
         private static ModifierKeys NativeModifiers()
         {
             var mods = ModifierKeys.None;
-            if ((GetKeyState(VK_CONTROL) & 0x8000) != 0) mods |= ModifierKeys.Control;
-            if ((GetKeyState(VK_SHIFT) & 0x8000) != 0) mods |= ModifierKeys.Shift;
-            if ((GetKeyState(VK_MENU) & 0x8000) != 0) mods |= ModifierKeys.Alt;
+            if (IsModifierDown(VK_CONTROL)) mods |= ModifierKeys.Control;
+            if (IsModifierDown(VK_SHIFT)) mods |= ModifierKeys.Shift;
+            if (IsModifierDown(VK_MENU)) mods |= ModifierKeys.Alt;
             return mods;
+        }
+
+        private static bool IsModifierDown(int vk)
+        {
+            return (GetAsyncKeyState(vk) & 0x8000) != 0 ||
+                   (GetKeyState(vk) & 0x8000) != 0;
         }
 
         [DllImport("user32.dll")]

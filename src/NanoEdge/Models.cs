@@ -154,6 +154,9 @@ namespace NanoEdge
         public bool SecretNotifications;
         // 密封标签切换键（默认 Alt+`），格式见 Hotkey.cs；设置页「隐私」可重新录入。
         public string SecretHotkey = Hotkey.Default;
+        // 登录表单自动填充：密码始终留在 KeePassXC，NanoEdge 只在填充那一瞬间取明文。
+        // 关掉后不再注入扫描脚本，地址栏也不会出现钥匙图标。
+        public bool PasswordFill = true;
         public string SearchEngine = SearchEngineOptions.Google;
         public List<Shortcut> Shortcuts = new List<Shortcut>();
         public MemorySettings Memory = new MemorySettings();

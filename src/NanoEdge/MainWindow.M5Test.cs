@@ -33,6 +33,13 @@ namespace NanoEdge
             private int _portDenied;
             private int _portAllowed;
 
+            // 通知探针：宿主观测点。只记录，不改 WebView2 的行为。
+            private readonly List<string> _hostTitles = new List<string>();
+            private readonly List<bool> _hostHandled = new List<bool>();
+            private readonly object _hostLock = new object();
+            private int _permRequests;
+            private int _permSaves;
+
             public M5SelfTest(MainWindow window) { _w = window; }
 
             public async Task RunAsync()
@@ -101,6 +108,7 @@ namespace NanoEdge
                 _w.Navigate(secret, urlDenied);
                 var ready = await WaitReadyAsync(secret, urlDenied, 20000);
                 Check("secret page loaded", ready, "ready=" + ready);
+                ProbeCore(secret);
                 Check("navigation log does not contain the secret url",
                     ReadFrom(logPath, logBefore).IndexOf(urlDenied, StringComparison.OrdinalIgnoreCase) < 0,
                     "log bytes=" + (FileLengthSafe(logPath) - logBefore));
@@ -127,43 +135,72 @@ namespace NanoEdge
                     session.Tabs.All(t => t.Url != secret.Url),
                     "rows=" + session.Tabs.Count);
 
-                // ---------- 4. 通知默认关闭 ----------
+                // ---------- 4. 通知默认关闭：不看返回值，看页面能不能真的弹出 ----------
                 var denied = await WaitPermissionAsync(secret, 12000);
                 Check("notifications are denied when the switch is off", denied == "denied", denied);
+
+                // 规范写的是「permission=denied 时 new Notification() 抛 TypeError」，
+                // 但 Chromium 实际不抛：构造会成功、只是永远不展示。所以判据不是抛不抛，
+                // 而是「页面 onshow 有没有到 + 宿主有没有收到展示事件」。
+                await EvalStringAsync(secret, "__m5.shown=false");
+                var deniedCtor = await EvalStringAsync(secret, "window.__m5.notify('nanoedge m5 denied')");
+                var deniedShown = await WaitPageFlagAsync(secret, "__m5.shown", 2500);
+                Check("nothing is displayed when the switch is off",
+                    !deniedShown && HostCount() == 0,
+                    "ctor=" + deniedCtor + " shown=" + deniedShown + " hostEvents=" + HostCount() +
+                    " err=" + await EvalStringAsync(secret, "String(__m5.err)"));
 
                 // 控制组：普通标签导航会进历史
                 var normalUrl = "http://127.0.0.1:" + _portDenied + "/page?normal=1";
                 _w.NewTab(normalUrl);
                 var normal = _w._active;
                 await WaitReadyAsync(normal, normalUrl, 20000);
+                ProbeCore(normal);   // 普通标签的核心也要挂探针，否则「没被误伤」无从证明
                 Check("normal navigation is recorded in history", HistoryStore.All().Count == 1,
                     "entries=" + HistoryStore.All().Count);
 
-                // ---------- 5. Alt+` 切换 ----------
+                // ---------- 5. 同一标签的密封 / 解封 toggle ----------
                 _w.SelectTab(normal);
+                EnsurePlain(normal);
+                var tabsAtToggle = _w._tabs.Count;
+                var realTitle = normal.DisplayTitle;
+                var realUrl = normal.Url;
                 _w.HandleShortcut(System.Windows.Input.Key.OemTilde,
                     System.Windows.Input.ModifierKeys.Alt, System.Windows.Input.Key.None);
-                Check("alt+` switches to the secret tab", ReferenceEquals(_w._active, secret),
-                    "active=" + (_w._active == null ? "-" : _w._active.DisplayTitle));
+                Check("hotkey seals the current tab in place",
+                    normal.IsSecret && ReferenceEquals(_w._active, normal) &&
+                    _w._tabs.Count == tabsAtToggle,
+                    "secret=" + normal.IsSecret + " tabs=" + _w._tabs.Count);
+                Check("sealed tab is disguised as 文档 and hides its url",
+                    normal.DisplayTitle == "文档" && _w._address.Text == "",
+                    "title=" + normal.DisplayTitle + " address='" + _w._address.Text + "'");
+                Check("sealing clears the site favicon", normal.Favicon == null,
+                    normal.Favicon == null ? "null" : "present");
 
                 _w.HandleShortcut(System.Windows.Input.Key.OemTilde,
                     System.Windows.Input.ModifierKeys.Alt, System.Windows.Input.Key.None);
-                Check("alt+` switches back to the previous normal tab",
-                    ReferenceEquals(_w._active, normal),
-                    "active=" + (_w._active == null ? "-" : _w._active.DisplayTitle));
+                Check("second press unseals the same tab",
+                    !normal.IsSecret && ReferenceEquals(_w._active, normal) &&
+                    _w._tabs.Count == tabsAtToggle,
+                    "secret=" + normal.IsSecret + " tabs=" + _w._tabs.Count);
+                Check("unsealed tab shows its real title and url again",
+                    normal.DisplayTitle == realTitle && _w._address.Text == realUrl,
+                    "title=" + normal.DisplayTitle + " address='" + _w._address.Text + "'");
 
-                // ---------- 5b. 真实输入路径（回归：普通标签上按键切不过去） ----------
+                // ---------- 5b. 真实输入路径（回归：普通标签上按键没反应） ----------
                 // WPF 在 Alt 组合下投递的是 Key.System，真实按键在 SystemKey 里。
                 _w.SelectTab(normal);
+                EnsurePlain(normal);
                 _w.HandleShortcut(System.Windows.Input.Key.System,
                     System.Windows.Input.ModifierKeys.Alt, System.Windows.Input.Key.OemTilde);
-                Check("wpf Key.System path switches to the secret tab",
-                    ReferenceEquals(_w._active, secret),
-                    "active=" + (_w._active == null ? "-" : _w._active.DisplayTitle));
+                Check("wpf Key.System path seals the current tab",
+                    normal.IsSecret && ReferenceEquals(_w._active, normal),
+                    "secret=" + normal.IsSecret);
 
                 // 页面聚焦时只走线程消息泵：Alt+` 是 WM_SYSKEYDOWN(0x0104) + VK_OEM_3(0xC0)，
                 // 此时 WPF 的 Keyboard.Modifiers 还没同步，不能靠它判断 Alt。
                 _w.SelectTab(normal);
+                EnsurePlain(normal);
                 var sysMsg = new System.Windows.Interop.MSG
                 {
                     message = 0x0104,
@@ -171,10 +208,9 @@ namespace NanoEdge
                 };
                 bool sysHandled = false;
                 _w.OnThreadPreprocessMessage(ref sysMsg, ref sysHandled);
-                Check("message pump WM_SYSKEYDOWN switches to the secret tab",
-                    sysHandled && ReferenceEquals(_w._active, secret),
-                    "handled=" + sysHandled + " active=" +
-                    (_w._active == null ? "-" : _w._active.DisplayTitle));
+                Check("message pump WM_SYSKEYDOWN seals the current tab",
+                    sysHandled && normal.IsSecret && ReferenceEquals(_w._active, normal),
+                    "handled=" + sysHandled + " secret=" + normal.IsSecret);
 
                 // ---------- 5c. 切换键可修改 ----------
                 Check("default hotkey displays as Alt+`",
@@ -182,23 +218,24 @@ namespace NanoEdge
 
                 _w._settings.SecretHotkey = "Ctrl+Shift+S";
                 _w.SelectTab(normal);
+                EnsurePlain(normal);
                 _w.HandleShortcut(System.Windows.Input.Key.S,
                     System.Windows.Input.ModifierKeys.Control | System.Windows.Input.ModifierKeys.Shift,
                     System.Windows.Input.Key.None);
-                Check("custom hotkey switches to the secret tab",
-                    ReferenceEquals(_w._active, secret),
-                    "active=" + (_w._active == null ? "-" : _w._active.DisplayTitle));
+                Check("custom hotkey seals the current tab",
+                    normal.IsSecret && ReferenceEquals(_w._active, normal),
+                    "secret=" + normal.IsSecret);
 
-                _w.SelectTab(normal);
+                EnsurePlain(normal);
                 _w.HandleShortcut(System.Windows.Input.Key.OemTilde,
                     System.Windows.Input.ModifierKeys.Alt, System.Windows.Input.Key.None);
                 Check("old Alt+` stops working after the key changed",
-                    ReferenceEquals(_w._active, normal),
-                    "active=" + (_w._active == null ? "-" : _w._active.DisplayTitle));
+                    !normal.IsSecret, "secret=" + normal.IsSecret);
 
                 // 改过的键也必须能从页面聚焦时的消息泵路径进来。
                 _w._settings.SecretHotkey = "Alt+Q";
                 _w.SelectTab(normal);
+                EnsurePlain(normal);
                 var altQ = new System.Windows.Interop.MSG
                 {
                     message = 0x0104,
@@ -208,9 +245,8 @@ namespace NanoEdge
                 bool altQHandled = false;
                 _w.OnThreadPreprocessMessage(ref altQ, ref altQHandled);
                 Check("custom hotkey works from the message pump path",
-                    altQHandled && ReferenceEquals(_w._active, secret),
-                    "handled=" + altQHandled + " active=" +
-                    (_w._active == null ? "-" : _w._active.DisplayTitle));
+                    altQHandled && normal.IsSecret && ReferenceEquals(_w._active, normal),
+                    "handled=" + altQHandled + " secret=" + normal.IsSecret);
 
                 Check("capture normalizes WPF Key.System",
                     Hotkey.Capture(System.Windows.Input.Key.System,
@@ -273,6 +309,23 @@ namespace NanoEdge
                     Check("Esc leaves capture mode", !SettingsPage.IsCapturing(page), "capturing=false");
                 }
 
+                // ---------- 5e. 真实 Win32 消息端到端 ----------
+                _w.SelectTab(normal);
+                EnsurePlain(normal);
+                var hwnd = new System.Windows.Interop.WindowInteropHelper(_w).Handle;
+                PostMessage(hwnd, 0x0104, (IntPtr)0xC0, (IntPtr)0x20000000);
+                await Task.Delay(300);
+                Check("real WM_SYSKEYDOWN message seals the current tab",
+                    normal.IsSecret && ReferenceEquals(_w._active, normal),
+                    "secret=" + normal.IsSecret);
+
+                // ---------- 5f. 消息泵不再读 Keyboard.Modifiers：状态必须干净 ----------
+                // 真实按下 Ctrl/Shift 的读取依赖物理键盘，无前台焦点的自测进程验证不了；
+                // 这里守住另一半：没有按键时不能带残留修饰位（残留会让组合键匹配失败）。
+                Check("native modifiers are clean when nothing is held",
+                    MainWindow.NativeModifiers() == System.Windows.Input.ModifierKeys.None,
+                    "mods=" + MainWindow.NativeModifiers());
+
                 // ---------- 6. 通知开 ----------
                 _w._settings.SecretNotifications = true;
                 _w.SelectTab(secret);
@@ -282,6 +335,86 @@ namespace NanoEdge
                 Check("secret page reloaded on a second origin", ready2, "ready=" + ready2);
                 var allowed = await WaitPermissionAsync(secret, 12000);
                 Check("notifications are allowed when the switch is on", allowed == "granted", allowed);
+
+                // ---------- 6b. 「展示」到底发没发生 ----------
+                // 页面真的 new 一个 Notification：宿主若收到 NotificationReceived 且没被
+                // Handled 掉，再加上页面 onshow 触发，才算「这条通知真的发出去了」。
+                await EvalStringAsync(secret, "__m5.shown=false");
+                var allowCtor = await EvalStringAsync(secret, "window.__m5.notify('nanoedge m5 allow')");
+                var hostFired = await WaitForAsync(() => HostCount() > 0, 5000);
+                var shownOn = await WaitPageFlagAsync(secret, "__m5.shown", 4000);
+                Check("the notification is displayed when the switch is on",
+                    allowCtor == "ok" && hostFired && shownOn && !LastHandled(),
+                    "ctor=" + allowCtor + " events=" + HostCount() + " shown=" + shownOn +
+                    " handled=" + LastHandled() + " titles=" + HostTitles());
+                CopyScreen(Path.Combine(_root, "out", "m5-toast.png"));
+
+                // ---------- 6c. 把开关关回去：已经放行过的 origin 还能不能弹 ----------
+                // 授权是按 origin 缓存在 profile 里的，重新导航未必还会触发 PermissionRequested，
+                // 这条专门打「关了开关但缓存还在」这条路。
+                var permBefore = await EvalStringAsync(secret, "Notification.permission");
+                var requestsBefore = PermRequests();
+                var hostBefore = HostCount();
+                _w._settings.SecretNotifications = false;
+                _w.Navigate(secret, urlAllowed);
+                var ready3 = await WaitReadyAsync(secret, urlAllowed, 20000);
+                var permAfter = await EvalStringAsync(secret, "Notification.permission");
+                await EvalStringAsync(secret, "__m5.shown=false");
+                var ctorAfter = await EvalStringAsync(secret, "window.__m5.notify('nanoedge m5 off-again')");
+                var shownAfter = await WaitPageFlagAsync(secret, "__m5.shown", 2500);
+                var askedAgain = PermRequests() - requestsBefore;
+                var displayedAfter = HostCount() > hostBefore && !LastHandled();
+                Line("[perm] reloaded=" + ready3 + " before=" + permBefore + " after=" + permAfter +
+                     " askedAgain=" + askedAgain + " savesInProfile=" + _permSaves);
+                Check("a previously granted origin stops displaying once the switch is off",
+                    !shownAfter && !displayedAfter,
+                    "permission=" + permAfter + " ctor=" + ctorAfter + " shown=" + shownAfter +
+                    " askedAgain=" + askedAgain + " hostEvents=" + (HostCount() - hostBefore) +
+                    " handled=" + LastHandled());
+
+                // ---------- 6d. 兜底那层到底有没有用 ----------
+                // 造一个「origin 早就被放行过」的局面（等价于：先当普通标签放过一次，
+                // 再按快捷键把它密封）。这时 PermissionRequested 根本不会再触发，
+                // 只能靠 NotificationReceived 那一层把展示拦下来。
+                var secretOrigin = "http://127.0.0.1:" + _portAllowed;
+                var preGranted = await PreGrantAsync(secret, secretOrigin);
+                Line("[perm] pre-granted setup = " + preGranted);
+                if (preGranted)
+                {
+                    var hostBefore2 = HostCount();
+                    _w.Navigate(secret, urlAllowed);
+                    await WaitReadyAsync(secret, urlAllowed, 20000);
+                    var permCached = await EvalStringAsync(secret, "Notification.permission");
+                    await EvalStringAsync(secret, "__m5.shown=false");
+                    await EvalStringAsync(secret, "window.__m5.notify('nanoedge m5 pre-granted')");
+                    var shownCached = await WaitPageFlagAsync(secret, "__m5.shown", 2500);
+                    var fired = HostCount() > hostBefore2;
+                    Check("a pre-granted secret origin still cannot display while the switch is off",
+                        !shownCached && !(fired && !LastHandled()),
+                        "permission=" + permCached + " hostEvents=" + (HostCount() - hostBefore2) +
+                        " handled=" + LastHandled() + " shown=" + shownCached);
+                }
+
+                // ---------- 6e. 这层兜底不能误伤普通标签 ----------
+                _w.SelectTab(normal);
+                EnsurePlain(normal);
+                var normalOrigin = "http://127.0.0.1:" + _portDenied;
+                var normalGranted = await PreGrantAsync(normal, normalOrigin);
+                Line("[perm] normal-tab pre-granted setup = " + normalGranted);
+                if (normalGranted)
+                {
+                    _w.Navigate(normal, normalUrl);
+                    await WaitReadyAsync(normal, normalUrl, 20000);
+                    var normalPerm = await EvalStringAsync(normal, "Notification.permission");
+                    var hostBefore3 = HostCount();
+                    await EvalStringAsync(normal, "__m5.shown=false");
+                    await EvalStringAsync(normal, "window.__m5.notify('nanoedge m5 normal')");
+                    var normalShown = await WaitPageFlagAsync(normal, "__m5.shown", 3000);
+                    Check("a normal tab is not suppressed by the secret-tab guard",
+                        normalPerm == "granted" && HostCount() > hostBefore3 && !LastHandled(),
+                        "permission=" + normalPerm + " hostEvents=" + (HostCount() - hostBefore3) +
+                        " handled=" + LastHandled() + " shown=" + normalShown);
+                }
 
                 // ---------- 7. 视觉证据 ----------
                 _w.WindowState = WindowState.Normal;
@@ -297,6 +430,37 @@ namespace NanoEdge
                 Render(_w._toolbarHost, Path.Combine(_root, "out", "m5-tabstrip.png"));
                 Check("toolbar rendered", File.Exists(Path.Combine(_root, "out", "m5-tabstrip.png")),
                     "out/m5-tabstrip.png");
+
+                // ---------- 8. 一个密封标签都没有时，仍能就地密封当前标签 ----------
+                _w.CloseTab(secret);
+                _w.SelectTab(normal);
+                EnsurePlain(normal);
+                Check("no secret tab remains after closing it",
+                    !_w._tabs.Any(t => t.IsSecret), "tabs=" + _w._tabs.Count);
+                var countBefore = _w._tabs.Count;
+                _w.HandleShortcut(System.Windows.Input.Key.OemTilde,
+                    System.Windows.Input.ModifierKeys.Alt, System.Windows.Input.Key.None);
+                Check("hotkey seals in place without creating a new tab",
+                    normal.IsSecret && ReferenceEquals(_w._active, normal) &&
+                    _w._tabs.Count == countBefore,
+                    "secret=" + normal.IsSecret + " tabs=" + _w._tabs.Count);
+                Check("sealed-in-place tab is disguised as 文档",
+                    normal.DisplayTitle == "文档", normal.DisplayTitle);
+
+                _w.HandleShortcut(System.Windows.Input.Key.OemTilde,
+                    System.Windows.Input.ModifierKeys.Alt, System.Windows.Input.Key.None);
+                Check("second press unseals it", !normal.IsSecret,
+                    "secret=" + normal.IsSecret);
+
+                // 内部页不能把标签留在「密封」状态，否则标题叫文档、内容却是设置页。
+                _w.SelectTab(normal);
+                EnsurePlain(normal);
+                _w.HandleShortcut(System.Windows.Input.Key.OemTilde,
+                    System.Windows.Input.ModifierKeys.Alt, System.Windows.Input.Key.None);
+                _w.OpenInternalPage(normal, "nano://settings");
+                Check("opening an internal page clears the secret flag",
+                    !normal.IsSecret && normal.InternalPage == "settings",
+                    "secret=" + normal.IsSecret + " page=" + normal.InternalPage);
 
                 Line("");
                 Line("history file = " + HistoryStore.FilePath + " (" + HistoryStore.All().Count + " entries)");
@@ -387,6 +551,105 @@ namespace NanoEdge
                 catch { return null; }
             }
 
+            // ---------- 通知探针 ----------
+
+            // 宿主观测点：只记录，不动 Handled，也不改 State —— 不干扰被测行为。
+            private void ProbeCore(TabModel tab)
+            {
+                var core = _w._browser.Core(tab);
+                if (core == null) { Line("[probe] no core"); return; }
+
+                core.PermissionRequested += (s, e) =>
+                {
+                    if (e.PermissionKind != Microsoft.Web.WebView2.Core.CoreWebView2PermissionKind.Notifications)
+                        return;
+                    lock (_hostLock)
+                    {
+                        _permRequests++;
+                        if (e.SavesInProfile) _permSaves++;
+                    }
+                    Line("[probe] permission requested " + e.PermissionKind + " " + e.Uri +
+                         " savesInProfile=" + e.SavesInProfile);
+                };
+
+                core.NotificationReceived += (s, e) =>
+                {
+                    var title = "(none)";
+                    try { title = e.Notification == null ? "(null)" : e.Notification.Title; }
+                    catch { title = "(unreadable)"; }
+                    lock (_hostLock)
+                    {
+                        _hostTitles.Add(title);
+                        // 生产代码在同一个事件上兜了「开关关着就 Handled」这一层，
+                        // 这里读到的是所有处理器跑完之后的最终决定。
+                        _hostHandled.Add(e.Handled);
+                    }
+                    Line("[probe] NotificationReceived title='" + title + "' handled=" + e.Handled);
+                };
+            }
+
+            // 把某个 origin 的通知授权直接写进 profile，模拟「这条来源早就被放行过」。
+            // 生产代码只在 PermissionRequested 里管授权，这一手绕过了它，专门打兜底那层。
+            private async Task<bool> PreGrantAsync(TabModel tab, string origin)
+            {
+                var core = _w._browser.Core(tab);
+                if (core == null) return false;
+                var any = false;
+                foreach (var candidate in new[] { origin, origin + "/" })
+                {
+                    try
+                    {
+                        await core.Profile.SetPermissionStateAsync(
+                            Microsoft.Web.WebView2.Core.CoreWebView2PermissionKind.Notifications,
+                            candidate,
+                            Microsoft.Web.WebView2.Core.CoreWebView2PermissionState.Allow);
+                        any = true;
+                        Line("[perm] SetPermissionStateAsync Allow " + candidate);
+                    }
+                    catch (Exception ex)
+                    {
+                        Line("[perm] SetPermissionStateAsync failed " + candidate + ": " + ex.Message);
+                    }
+                }
+                return any;
+            }
+
+            private int HostCount() { lock (_hostLock) return _hostTitles.Count; }            private int PermRequests() { lock (_hostLock) return _permRequests; }
+            private string HostTitles() { lock (_hostLock) return string.Join("|", _hostTitles); }
+            private bool LastHandled() { lock (_hostLock) return _hostHandled.Count > 0 && _hostHandled[_hostHandled.Count - 1]; }
+
+            private async Task<bool> WaitPageFlagAsync(TabModel tab, string expression, int timeoutMs)
+            {
+                var started = Environment.TickCount;
+                while (Environment.TickCount - started < timeoutMs)
+                {
+                    var value = await EvalStringAsync(tab, "String(" + expression + ")");
+                    if (value == "true") return true;
+                    await Task.Delay(150);
+                }
+                return false;
+            }
+
+            // 真实桌面截图：toast 是独立 HWND，RenderTargetBitmap 抓不到，只能整屏拷贝。
+            // 会话没有活动桌面时这里会拿不到画面（或全黑），只做尽力而为的证据。
+            private void CopyScreen(string path)
+            {
+                try
+                {
+                    var bounds = System.Windows.Forms.SystemInformation.VirtualScreen;
+                    using (var bitmap = new System.Drawing.Bitmap(bounds.Width, bounds.Height))
+                    {
+                        using (var graphics = System.Drawing.Graphics.FromImage(bitmap))
+                            graphics.CopyFromScreen(bounds.Left, bounds.Top, 0, 0, bitmap.Size);
+                        var directory = Path.GetDirectoryName(path);
+                        if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
+                        bitmap.Save(path, System.Drawing.Imaging.ImageFormat.Png);
+                    }
+                    Line("[screen] captured " + bounds.Width + "x" + bounds.Height + " → " + path);
+                }
+                catch (Exception ex) { Line("[screen] capture failed: " + ex.Message); }
+            }
+
             // ---------- 本机服务 ----------
 
             private int StartServer()
@@ -463,15 +726,39 @@ namespace NanoEdge
             private static string Page()
             {
                 return "<!doctype html><html><head><meta charset=\"utf-8\"><title>m5 page</title>" +
-                       "<script>window.__m5 = { perm: 'pending' };" +
+                       "<script>window.__m5 = { perm: 'pending', ctor: 'none', err: '', shown: false };" +
                        "if (window.Notification && Notification.requestPermission) {" +
                        "  Notification.requestPermission().then(function (p) { __m5.perm = p; })" +
                        "    .catch(function (e) { __m5.perm = 'error:' + e; });" +
-                       "} else { __m5.perm = 'unsupported'; }</script>" +
+                       "} else { __m5.perm = 'unsupported'; }" +
+                       // 真的去弹一个通知：能不能构造、onshow 有没有到，都记下来。
+                       "window.__m5.notify = function (title) {" +
+                       "  try {" +
+                       "    var n = new Notification(title, { body: 'nanoedge m5test' });" +
+                       "    n.onshow = function () { __m5.shown = true; };" +
+                       "    __m5.ctor = 'ok';" +
+                       "    return 'ok';" +
+                       "  } catch (e) {" +
+                       "    __m5.ctor = 'throw';" +
+                       "    __m5.err = (e && e.name ? e.name + ': ' : '') + (e && e.message ? e.message : String(e));" +
+                       "    return 'throw';" +
+                       "  }" +
+                       "};</script>" +
                        "</head><body style=\"margin:0;padding:18px;background:#111;color:#eee;" +
                        "font:14px 'Segoe UI',sans-serif\">" +
                        "<h1 style=\"font-size:18px;margin:0 0 8px 0\">M5 notification probe</h1>" +
                        "<p style=\"color:#888\">served by 127.0.0.1</p></body></html>";
+            }
+
+            // 真实消息路径：把 WM_SYSKEYDOWN 投进窗口消息队列，让 WPF 的线程泵去分发，
+            // 而不是直接调 OnThreadPreprocessMessage（旧自测只做到了后者）。
+            [System.Runtime.InteropServices.DllImport("user32.dll")]
+            private static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+            // 把被测标签复位成普通状态：直接翻转，不依赖当前快捷键设置。
+            private void EnsurePlain(TabModel tab)
+            {
+                if (tab != null && tab.IsSecret) _w.ToggleSecret();
             }
 
             // ---------- 报告 ----------

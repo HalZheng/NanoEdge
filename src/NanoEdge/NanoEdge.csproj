@@ -11,7 +11,7 @@
     <AssemblyName>NanoEdge</AssemblyName>
     <RootNamespace>NanoEdge</RootNamespace>
     <!-- 版本号唯一来源：CI 用 tag 覆盖（-p:Version=x.y.z），本地构建用这里的值。 -->
-    <Version>0.1.6</Version>
+    <Version>0.1.7</Version>
     <!-- 信息版本只保留纯版本号，不拼 git 提交哈希（界面直接显示它）。 -->
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
@@ -23,9 +23,13 @@
   <ItemGroup>
     <Reference Include="System.Web.Extensions" />
     <Reference Include="System.Windows.Forms" />
+    <!-- GDI 截屏：自测里要把 WebView2 渲染的页面 + WPF 弹层一起拍下来。 -->
+    <Reference Include="System.Drawing" />
     <!-- ProtectedData（DPAPI）在 System.Security.dll，net48 默认引用里不一定带。 -->
     <Reference Include="System.Security" />
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4078.44" GeneratePathProperty="true" />
+    <!-- libsodium 只取原生 DLL 内嵌，不用它的托管包装；341KB 二进制不进 Git 历史。 -->
+    <PackageReference Include="libsodium" Version="1.0.20" GeneratePathProperty="true" />
     <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies.net48" Version="1.0.3" PrivateAssets="all" />
     <PackageReference Include="Costura.Fody" Version="6.2.0" PrivateAssets="all" />
     <PackageReference Include="Fody" Version="6.9.3" PrivateAssets="all" />
@@ -34,6 +38,13 @@
   <ItemGroup>
     <EmbeddedResource Include="$(PkgMicrosoft_Web_WebView2)\build\native\x64\WebView2Loader.dll"
                       LogicalName="NanoEdge.Native.WebView2Loader.dll" />
+    <!-- libsodium：KeePassXC 浏览器集成协议的 crypto_box（X25519 + XSalsa20-Poly1305）。
+         .NET 没有等价实现，只能带原生库；由 NativeLoader 解到 %LOCALAPPDATA%\NanoEdge\native。 -->
+    <EmbeddedResource Include="$(Pkglibsodium)\runtimes\win-x64\native\libsodium.dll"
+                      LogicalName="NanoEdge.Native.libsodium.dll" />
+    <!-- KeePassXC 官方图标（取自 KeePassXC 安装目录 share/icons，GPL-3.0）。
+         用官方 logo 是为了让用户一眼认出「这是 KeePassXC 在填」，和 Chrome 插件一致。 -->
+    <EmbeddedResource Include="Native\keepassxc.png" LogicalName="NanoEdge.Native.keepassxc.png" />
     <!-- 窗口图标（任务栏/Alt+Tab）用同一份 ico，避免和 exe 图标不一致。 -->
     <EmbeddedResource Include="..\..\assets\nanoedge.ico" LogicalName="NanoEdge.nanoedge.ico" />
   </ItemGroup>

@@ -1208,15 +1208,60 @@ namespace NanoEdge
                     _w._groups.All(g => g.Id != closeGroup.Id),
                     "tabs=" + _w._tabs.Count + " groups=" + _w._groups.Count);
 
-                // ---- 上一批的常驻样式回归 ----
+                // ---- 标签状态角标：一个位置、唯一优先级、背景不染色 ----
+                Func<TabModel, string> markerOf = t =>
+                {
+                    var chip = TabItems(_w._tabStripPanel).OfType<Border>()
+                        .FirstOrDefault(b => ReferenceEquals(b.Tag, t));
+                    if (chip == null) return "no-chip";
+                    var dots = VisualDescendants<Border>(chip)
+                        .Where(b => (b.Tag as string ?? "").StartsWith("state-marker:"))
+                        .Select(b => (string)b.Tag).ToList();
+                    return dots.Count == 0 ? "none" : string.Join(",", dots);
+                };
                 var resident = _w._tabs[0];
+                var savedResident = resident.Resident;
+                var savedState = resident.MemoryState;
+                var savedSecret = resident.IsSecret;
+                resident.IsSecret = false;
                 resident.Resident = true;
+                resident.MemoryState = TabMemoryState.Active;
                 _w.RebuildTabStrip();
                 var rchip = TabItems(_w._tabStripPanel).OfType<Border>()
                     .FirstOrDefault(b => ReferenceEquals(b.Tag, resident));
-                Check("resident tab has a visible marker",
-                    rchip != null && rchip.BorderThickness.Left > 0,
+                Check("resident tab uses one icon marker",
+                    markerOf(resident) == "state-marker:Exempt", markerOf(resident));
+                Check("resident tab no longer paints its background",
+                    rchip != null && rchip.BorderThickness.Left == 0,
                     rchip == null ? "no chip" : "left=" + rchip.BorderThickness.Left);
+
+                resident.MemoryState = TabMemoryState.Low;
+                _w.UpdateMemoryBadge();   // 故意不手动重建，验证 Changed / 签名链路
+                Check("cooled outranks resident and refreshes without a rebuild",
+                    markerOf(resident) == "state-marker:Low", markerOf(resident));
+                var chipBefore = TabItems(_w._tabStripPanel).OfType<Border>()
+                    .FirstOrDefault(b => ReferenceEquals(b.Tag, resident));
+                _w.UpdateMemoryBadge();
+                var chipAfter = TabItems(_w._tabStripPanel).OfType<Border>()
+                    .FirstOrDefault(b => ReferenceEquals(b.Tag, resident));
+                Check("unchanged state does not rebuild the tab strip",
+                    chipBefore != null && ReferenceEquals(chipBefore, chipAfter),
+                    chipBefore == null ? "no chip"
+                        : "same=" + ReferenceEquals(chipBefore, chipAfter));
+                resident.MemoryState = TabMemoryState.Discarded;
+                _w.RebuildTabStrip();
+                Check("discarded outranks cooled in the marker",
+                    markerOf(resident) == "state-marker:Discarded", markerOf(resident));
+                resident.IsSecret = true;
+                _w.RebuildTabStrip();
+                Check("secret tab shows no state marker",
+                    markerOf(resident) == "none", markerOf(resident));
+
+                resident.IsSecret = savedSecret;
+                resident.Resident = savedResident;
+                resident.MemoryState = savedState;
+                _w.RebuildTabStrip();
+                RenderTabMarkers();
 
                 // 端到端：真实按一次 F5，看页面 JS 能不能拿到并拦下。
                 await TestF5Async();
@@ -1553,6 +1598,10 @@ namespace NanoEdge
                 var missing = languageHints.Where(h => L.T(h) == h).ToList();
                 Check("both language hints have English entries", missing.Count == 0,
                     missing.Count == 0 ? "2/2 translated" : "missing=" + string.Join(" | ", missing));
+                // 设置页隐私分区新增的通知说明（0.15 补记 4：解释「允许」不等于真能弹）。
+                var notifyHint = "打开只是把通知权限放给网站；Windows 只替注册过通知身份的程序弹通知，当前版本没注册，所以打开后通常看不到弹窗。关闭是直接拦掉，任何情况下都不展示。";
+                Check("notification hint has an English entry", L.T(notifyHint) != notifyHint,
+                    L.T(notifyHint) == notifyHint ? "missing" : "translated");
                 L.Apply(savedLang);
 
                 // ---- 第十一轮：A5 暗色菜单露白 ----
@@ -2898,6 +2947,46 @@ namespace NanoEdge
                 var directory = Path.GetDirectoryName(path);
                 if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
                 File.WriteAllText(path, content, Encoding.UTF8);
+            }
+
+            // 状态角标的视觉证据：四个标签并排，用独立控件渲染，不碰主窗口布局。
+            private void RenderTabMarkers()
+            {
+                try
+                {
+                    var demos = new[]
+                    {
+                        new TabModel { Title = "普通页面", Url = "https://marker-normal.invalid/", IsStartPage = false },
+                        new TabModel { Title = "后台页面", Url = "https://marker-low.invalid/", IsStartPage = false,
+                            MemoryState = TabMemoryState.Low },
+                        new TabModel { Title = "已释放页面", Url = "https://marker-gone.invalid/", IsStartPage = false,
+                            MemoryState = TabMemoryState.Discarded },
+                        new TabModel { Title = "常驻页面", Url = "https://marker-keep.invalid/", IsStartPage = false,
+                            Resident = true }
+                    };
+                    var strip = new StackPanel
+                    {
+                        Orientation = Orientation.Horizontal,
+                        Width = 620,
+                        Height = 34
+                    };
+                    strip.SetResourceReference(StackPanel.BackgroundProperty, "ChromeBrush");
+                    foreach (var t in demos)
+                        strip.Children.Add(_w.MakeTabChip(t, true, false, 145, 145));
+                    strip.Measure(new Size(620, 34));
+                    strip.Arrange(new Rect(0, 0, 620, 34));
+                    strip.UpdateLayout();
+
+                    var bitmap = new RenderTargetBitmap(620, 34, 96, 96, PixelFormats.Pbgra32);
+                    bitmap.Render(strip);
+                    var encoder = new PngBitmapEncoder();
+                    encoder.Frames.Add(BitmapFrame.Create(bitmap));
+                    var path = Path.Combine(Root(), "out", "fix-tabmarkers.png");
+                    using (var stream = File.Create(path)) encoder.Save(stream);
+                    Line("tab marker screenshot: out/fix-tabmarkers.png (" +
+                         new FileInfo(path).Length + " bytes)");
+                }
+                catch (Exception ex) { Line("tab marker render failed: " + ex.Message); }
             }
 
             // 向导浮层在 BookmarksPage 的可视树内，RenderTargetBitmap 能直接抓到（不用 Popup）。
