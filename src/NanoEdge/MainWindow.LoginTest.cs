@@ -241,7 +241,9 @@ setTimeout(function(){
                 KeePassBridge.ConfigPath = savedConfigPath;
 
                 // ---------- 页面内图标 + 切标签补扫 ----------
-                var icons0 = await LoginFill.IconCountAsync(core);
+                // 用一次明确的同步安装来判定，别读「当前有多少图标」：
+                // 后台 600/2000/5000ms 扫描会异步重装，srcdoc iframe 恰好没就绪时会少一个。
+                var icons0 = await LoginFill.InstallIconsAsync(core);
                 Check(icons0 == 5, "用户名输入框内装了 5 个图标（实际 " + icons0 + "）");
                 var iconInside = await EvalAsync(core,
                     "(function(){var i=document.querySelector('.__neLoginIcon');" +
