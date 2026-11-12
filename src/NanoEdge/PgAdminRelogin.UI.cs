@@ -29,16 +29,23 @@ namespace NanoEdge
         private readonly SolidColorBrush _normalBrush = Brush("#D32F2F");
         private readonly CornerRadius _cornerRadius = new CornerRadius(6);
         private readonly FrameworkElement _anchor;
+        // 两道显示门控都做成「实时查询」而不是事件里缓存的布尔值：
+        // 窗口失焦 / 标签换站点 / 脚本被禁用时，都不会留下过期的显示状态。
+        private readonly Func<bool> _isForeground;
+        private readonly Func<bool> _isPageEligible;
         private bool _signedOut;
         private bool _busy;
         private bool _hasStatus;
-        private bool _windowVisible = true;
 
         public event Action Clicked;
 
-        public PgAdminReloginBar(FrameworkElement anchor)
+        public PgAdminReloginBar(FrameworkElement anchor,
+                                 Func<bool> isForeground = null,
+                                 Func<bool> isPageEligible = null)
         {
             _anchor = anchor;
+            _isForeground = isForeground ?? (() => true);
+            _isPageEligible = isPageEligible ?? (() => true);
 
             _card = new Border
             {
@@ -103,11 +110,26 @@ namespace NanoEdge
             _popup.VerticalOffset = 8;
         }
 
-        // 窗口最小化时收起；恢复时按状态重新显示。
-        public void SetWindowVisible(bool visible)
+        // 窗口激活/失焦、最小化/还原、当前标签换站点、脚本配置变化后重新算一次能见度。
+        public void RefreshVisibility() { ApplyState(); }
+
+        // 自测里没有稳定的显示上下文，IsActive 不可控：只覆盖「前台」这一项，
+        // 站点匹配始终走真实的 @match 判定，不放水。
+        internal bool? ForegroundOverrideForTest { get; set; }
+        internal bool CanShowNow { get { return CanShow(); } }
+
+        private bool CanShow()
         {
-            _windowVisible = visible;
-            ApplyState();
+            var foreground = ForegroundOverrideForTest.HasValue
+                ? ForegroundOverrideForTest.Value
+                : Eval(_isForeground);
+            return foreground && Eval(_isPageEligible);
+        }
+
+        private static bool Eval(Func<bool> predicate)
+        {
+            try { return predicate(); }
+            catch { return false; }   // 判定失败宁可不显示，绝不误弹
         }
 
         public void Dispose()
@@ -235,12 +257,15 @@ namespace NanoEdge
 
         private void ApplyState()
         {
-            _button.Visibility = _signedOut ? Visibility.Visible : Visibility.Collapsed;
+            // 悬浮条一律只在前台窗口 + 命中重登脚本 @match 的当前标签上出现。
+            // 状态文字（含「已重新登录」）走同一道门，不能绕过按钮单独浮出。
+            var allowed = CanShow();
+            _button.Visibility = (_signedOut && allowed) ? Visibility.Visible : Visibility.Collapsed;
             _button.IsEnabled = _signedOut && !_busy;
             var text = _busy ? L.T("登录中…") : L.T("重登录");
             _button.Content = text;
             AutomationProperties.SetName(_button, text);
-            if ((_signedOut || _hasStatus) && _windowVisible) Open();
+            if ((_signedOut || _hasStatus) && allowed) Open();
             else Close();
         }
 
@@ -372,10 +397,11 @@ namespace NanoEdge
             // 否则「已重新登录」那 20 秒会让悬浮条停在别的站点上（用户反馈过的 bug）。
             _bar.ClearStatus();
             var tab = _activeTab();
-            if (tab == null) { _bar.SetSignedOut(false); return; }
-            bool signedOut;
-            _signedOut.TryGetValue(tab.Id, out signedOut);
+            bool signedOut = false;
+            if (tab != null) _signedOut.TryGetValue(tab.Id, out signedOut);
             _bar.SetSignedOut(signedOut);
+            // 新标签可能根本不命中 @match，按真实门控再收一次。
+            _bar.RefreshVisibility();
         }
 
         // 7.1 触发条件 1：导航完成后落在 /login。
@@ -393,7 +419,9 @@ namespace NanoEdge
         public void OnResponse(TabModel tab, string uri, int status)
         {
             if (status != 401 || tab == null || _disposed) return;
-            var cfg = PgAdminReloginConfig.ForUrl(tab.Url);
+            // 用响应自己的 URL 判定站点，不用 tab.Url：跨站导航 / SPA 里 tab.Url
+            // 可能滞后，旧地址会把「别的网站上的 401」当成 pgAdmin 掉线。
+            var cfg = PgAdminReloginConfig.ForUrl(uri);
             if (cfg == null) return;
             string origin, path;
             PgAdminSiteResolver.Decompose(uri, out origin, out path);
@@ -448,12 +476,48 @@ namespace NanoEdge
             _autoAttempts.Enqueue(now);
         }
 
+        // 重登是异步的（隐藏视图要走完 GET /login → POST → 校验，可能好几秒）。
+        // 只有「发起它的那个标签仍是活动标签、URL 没变、还命中 @match、悬浮条本身
+        // 允许显示」时，busy / 成功 / 失败反馈才写回 UI。否则用户在等待期间切到别的
+        // 网站（或干脆切到别的软件）后，迟到的结果会凭空浮出「已重新登录」。
+        // 「还是同一个页面」：清理自己写过的 busy 状态只需要这一条，不要求窗口在前台。
+        // 窗口失焦时结果照样会回来，不能因为提示不显示就把「登录中…」永久留在条上。
+        private bool FeedbackOwnsUi(TabModel tab, string startUrl)
+        {
+            if (tab == null || _disposed) return false;
+            if (!ReferenceEquals(tab, _activeTab())) return false;
+            if (!string.Equals(tab.Url ?? "", startUrl ?? "", StringComparison.OrdinalIgnoreCase)) return false;
+            return PgAdminReloginConfig.ForUrl(tab.Url) != null;
+        }
+
+        private bool FeedbackAllowed(TabModel tab, string startUrl)
+        {
+            return FeedbackOwnsUi(tab, startUrl) && _bar.CanShowNow;
+        }
+
+        internal bool FeedbackAllowedForTest(TabModel tab, string startUrl)
+        {
+            return FeedbackAllowed(tab, startUrl);
+        }
+
+        // 自测：把「迟到的结果」直接喂回真实状态机，验证它不会往别的站点写 UI。
+        internal void ApplyResultForTest(TabModel tab, PgAdminSiteConfig cfg,
+                                         ReloginResult result, string startUrl)
+        {
+            ApplyResult(tab, cfg, result, startUrl);
+        }
+
         private async Task ReloginAsync(TabModel tab, PgAdminSiteConfig cfg, string trigger)
         {
             if (_service.IsBusy) return;
             if (trigger == "Auto") RecordAuto();
-            _bar.SetBusy(true);
-            _bar.ShowBusy();
+            var startUrl = tab == null ? "" : tab.Url;
+            var showBusy = FeedbackAllowed(tab, startUrl);
+            if (showBusy)
+            {
+                _bar.SetBusy(true);
+                _bar.ShowBusy();
+            }
             try
             {
                 var request = new ReloginRequest
@@ -467,50 +531,63 @@ namespace NanoEdge
                 };
                 var result = await _service.RunAsync(request);
                 LastResultForTest = result;
-                ApplyResult(tab, cfg, result);
+                ApplyResult(tab, cfg, result, startUrl);
             }
             finally
             {
-                _bar.SetBusy(false);
+                if (showBusy) _bar.SetBusy(false);
             }
         }
 
-        private void ApplyResult(TabModel tab, PgAdminSiteConfig cfg, ReloginResult result)
+        private void ApplyResult(TabModel tab, PgAdminSiteConfig cfg, ReloginResult result, string startUrl)
         {
+            // ShowBusy 写的「登录中…」没有自动过期的计时器：不管结果能不能显示，
+            // 都要先把它撤掉，否则窗口失焦时提示被挡、busy 文案却会一直卡着。
+            if (FeedbackOwnsUi(tab, startUrl)) _bar.ClearStatus();
+
+            // 每次都重新判定：NoCredentials 分支会打开脚本编辑页（切走标签），
+            // 从那一刻起就不能再往新页面上写状态。
+            Action<string, bool> show = (text, success) =>
+            {
+                if (FeedbackAllowed(tab, startUrl)) _bar.ShowStatus(text, success, 20);
+            };
+            Action clear = () =>
+            {
+                if (FeedbackOwnsUi(tab, startUrl)) _bar.ClearStatus();
+            };
+
             switch (result.Outcome)
             {
                 case ReloginOutcome.Succeeded:
                     SetSignedOut(tab, false);
-                    _bar.ShowStatus(L.T("已重新登录"), true, 20);
+                    show(L.T("已重新登录"), true);
                     break;
                 case ReloginOutcome.AlreadySignedIn:
                     SetSignedOut(tab, false);
-                    _bar.ShowStatus(L.T("会话有效"), true, 20);
+                    show(L.T("会话有效"), true);
                     break;
                 case ReloginOutcome.Refreshed:
                     SetSignedOut(tab, false);
-                    _bar.ShowStatus(L.T("已重新登录"), true, 20);
+                    show(L.T("已重新登录"), true);
                     break;
                 case ReloginOutcome.NoCredentials:
                 case ReloginOutcome.Corrupt:
                     // F-4 / 9：不发起网络请求，直接打开该脚本的编辑页。
                     _openEditor(cfg == null || cfg.Script == null ? "" : cfg.Script.Id);
-                    _bar.ShowStatus(string.IsNullOrEmpty(result.Message)
-                        ? L.T("请先保存 pgAdmin 凭据") : result.Message, false, 20);
+                    show(string.IsNullOrEmpty(result.Message)
+                        ? L.T("请先保存 pgAdmin 凭据") : result.Message, false);
                     break;
                 case ReloginOutcome.Rejected:
                 case ReloginOutcome.Failed:
                     _autoPaused = true;                 // 7.3 熄灭，直到手动点击 / 重启 / 保存凭据
                     SetSignedOut(tab, true);
-                    _bar.ShowStatus(string.IsNullOrEmpty(result.Message)
-                        ? L.T("重登失败，请检查密码") : result.Message, false, 20);
+                    show(string.IsNullOrEmpty(result.Message)
+                        ? L.T("重登失败，请检查密码") : result.Message, false);
                     break;
                 case ReloginOutcome.RefreshCancelled:
                     SetSignedOut(tab, true);
-                    if (!string.IsNullOrEmpty(result.Message))
-                        _bar.ShowStatus(result.Message, false, 20);
-                    else
-                        _bar.ClearStatus();
+                    if (!string.IsNullOrEmpty(result.Message)) show(result.Message, false);
+                    else clear();
                     break;
                 case ReloginOutcome.NoSite:
                     SetSignedOut(tab, false);
@@ -541,11 +618,14 @@ namespace NanoEdge
         public void OnCredentialsSaved()
         {
             _autoPaused = false;
+            // 脚本配置可能刚被禁用 / 改了 @match，悬浮条要立刻重算能见度。
+            _bar.RefreshVisibility();
             var unused = InjectCurrentAsync();
         }
 
         private void OnConfigChanged()
         {
+            _bar.RefreshVisibility();
             var unused = InjectCurrentAsync();
         }
 

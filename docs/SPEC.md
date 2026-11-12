@@ -1622,8 +1622,8 @@ HKCU\Software\RegisteredApplications                    -> NanoEdge = ...\Capabi
 |---|---|---|
 | 协议 | `KeePassBridge.cs` | 拉起 proxy、帧读写、加解密、associate / get-logins、状态映射 |
 | 配置 | `%APPDATA%\NanoEdge\keepassxc.json` | 连接名 + identification 密钥对（私钥 DPAPI） |
-| 页面 | `LoginFill.cs` | 注入 `window.__neLogin.{scan,fill,fillActive}`；同源 iframe 递归 |
-| 界面 | `MainWindow.Login.cs` | 地址栏钥匙图标（KeePassXC 官方 logo）+ 账号弹层 + 重新加载 |
+| 页面 | `LoginFill.cs` | 注入 `window.__neLogin.{scan,fill,fillActive,installIcons,showPicker}`；同源 iframe 递归；输入框内图标与账号下拉都是页面内 DOM |
+| 界面 | `MainWindow.Login.cs` | 收页面消息 → 取凭据 → 单账号直填 / 多账号下拉 → 按表单索引填充 |
 
 **硬性约束**（都不是可以商量的取舍）：
 
@@ -1632,25 +1632,50 @@ HKCU\Software\RegisteredApplications                    -> NanoEdge = ...\Capabi
 2. `get-logins` 之前必须先在本次会话 `test-associate`，否则回 `errorCode 8`。
 3. **跨域 iframe 一律不填**：跨域登录框本来就不该用本站密码，这是现成的钓鱼面。
    同源 iframe 走 `contentDocument` 递归，`ownerDocument` 保证用户名框在正确的文档里找。
-4. **不常驻 MutationObserver**：导航后 600ms / 2000ms 各扫一次，点图标时再扫一次。
-   内存不随页面存活时间增长。
-5. **不自动提交**：只填值，按不按回车交给用户。
+4. **不常驻 MutationObserver**：导航后 600ms / 2000ms / 5000ms 各扫一次，
+   切回标签、点图标时各再扫一次；每次扫描顺带安装/重定位输入框内图标。
+   5 秒那次与切标签补扫是给 Kibana 这类「JS bundle 加载完才画登录表单」的 SPA 兜底：
+   少一次，图标就永远不亮，「点图标时再扫」也无从触发。只挂一个 `scroll`/`resize`
+   监听做位置刷新（不是每输入框一个），内存不随页面存活时间增长。
+5. **密码不下发页面脚本**：下拉只收到 `{name, login}`，选中后由宿主按索引调
+   `fill()` 把明文写进 input；JS 里永远拿不到密码。
+6. **不自动提交**：只填值，按不按回车交给用户。
 
-**界面**：地址栏右端 15×15 的 KeePassXC 图标（扫描到密码框才出现）；弹层只列条目名和用户名，
-**不显示密码**；底部「重新加载」= 重扫页面 + 重新取密码。多表单按「焦点 → 视口内 → 第一个」选。
+**界面（对齐 KeePassXC-Browser 官方插件手感）**：图标画在**用户名输入框内部右侧**
+（没有用户名框时贴密码框），一个表单一个；地址栏不再放图标，鼠标不用跨到窗口顶部。
+图标和账号下拉都是页面内 DOM —— WebView2 是 HwndHost，WPF 控件盖不到网页上，
+做成 DOM 才能跟着输入框滚动/换行，这也是「浮层一律用 Popup」约定的唯一例外。
 
-**设置**：`PasswordFill`（默认开）。关掉后不再注入扫描脚本、钥匙图标立刻消失；
-已打开的页面要刷新才会移除脚本（`RemoveScriptToExecuteOnDocumentCreated` 只影响之后的文档）。
+- 点击图标 → 页面 `postMessage` 带表单原始索引 → 宿主取凭据。
+- **只有 1 个账号：直接填充，不弹下拉**；0 个给提示；2 个及以上才在输入框下方弹下拉。
+- 下拉只列条目名 / 用户名，底部「重新加载」= 重扫 + 重新取密码；点外部或选中后收起。
+- 填充按图标对应的表单索引走 `fill()`，索引失效才回退 `fillActive()` 的
+  「焦点 → 视口内 → 第一个」。
+
+**关联入口**：设置页 `nano://settings` 的「密码」区在未关联时给「立即关联」按钮，
+已关联时给「清除关联」按钮，两者都立刻重建该页反映最新状态。按钮直连
+`KeePassBridge.AssociateAsync("NanoEdge", 120s)`，不另起协议；弹窗仍由用户在
+KeePassXC 里填连接名并点「保存并允许访问」（不能静默完成）。这样关联不再依赖
+「先找到一个登录页、图标还恰好亮着」，但点输入框内图标时的自动关联仍保留。
+
+**设置**：`PasswordFill`（默认开）。关掉后不再注入脚本，并主动移除页面内的图标和下拉；
+已打开的页面要刷新才会移除脚本对象（`RemoveScriptToExecuteOnDocumentCreated` 只影响之后的文档）。
 注意开关关闭时要挡住导航时排下的延迟扫描，否则图标会在关闭后闪回来。
 
-**已验证**（`--logintest` 32 checks 全 PASS）：标准表单 / React-Vue 受控组件收到 input 事件 /
-动态渲染 / 隐藏框跳过 / 特殊字符逐字一致 / 越界索引 / 同源 iframe / 焦点优先 / 图标 / 弹层 /
-填充落页 / 开关生效。协议层另有 `--kpxctest`（6 checks，真取回明文并比对）。
+**已验证**（`--logintest` 49 checks 全 PASS）：标准表单 / React-Vue 受控组件收到 input 事件 /
+动态渲染 / 隐藏框跳过 / 特殊字符逐字一致 / 越界索引 / 同源 iframe / 焦点优先 /
+填充落页 / 开关生效；另含设置页「立即关联」按钮中英文案、切标签补扫恢复图标、
+3 秒后才渲染的登录框被 5 秒兜底扫描点亮（复现 Kibana 类 SPA）；
+以及页面内图标数量与「贴在用户名框内侧」的位置断言、官方 logo data URI、
+真点 DOM 图标后单账号直填且不弹下拉、多账号下拉的内容/锚定位置/不含密码、
+延迟扫描重装图标不会误关下拉、点第 2 条按索引填充并收起下拉。
+页面截图用 `CapturePreviewAsync` 抓真实 WebView2 内容。
+协议层另有 `--kpxctest`（6 checks，真取回明文并比对）。
 
 **明确不做**：保存新密码回库（`set-login`）、TOTP（`get-totp`）、passkey、剪贴板兜底、
 自动提交、跨域 iframe。
 
-**图标许可**：地址栏用的是 KeePassXC 官方 logo（取自其安装目录 `share/icons`），
+**图标许可**：输入框内图标用的是 KeePassXC 官方 logo（取自其安装目录 `share/icons`），
 许可跟随 KeePassXC 的 GPL-3.0；正式对外发版前需要在 README 注明来源。
 
 ## 8. 数据模型（草图）

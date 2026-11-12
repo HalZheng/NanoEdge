@@ -128,6 +128,9 @@ namespace NanoEdge
                 try { PgAdminCredentialStore.Save(_script.Id, UserName, pw); }
                 finally { Array.Clear(pw, 0, pw.Length); }
                 _w.ReloginForTest.ConfirmOverrideForTest = message => false;
+                // 自测环境常没有显示上下文，IsActive 不可靠：只固定「前台」这一项，
+                // 站点门控始终走真实的 @match 判定，不放水。
+                _w.ReloginBarForTest.ForegroundOverrideForTest = true;
             }
 
             private UserScript _script;
@@ -136,6 +139,7 @@ namespace NanoEdge
             private void Teardown()
             {
                 _w.ReloginForTest.ConfirmOverrideForTest = null;
+                _w.ReloginBarForTest.ForegroundOverrideForTest = null;
                 PgAdminCredentialStore.PathOverride = _savedCredOverride;
                 PgAdminLog.PathOverride = _savedLogOverride;
                 ScriptStore.IndexPath = _savedIndexPath;
@@ -353,6 +357,15 @@ namespace NanoEdge
                 // 按钮显示规则（用户口径）：没掉登录不显示；而且它是 Popup 悬浮层，
                 // 不参与布局 —— 出现时网页区域的高度不能变小。
                 var bar = _w.ReloginBarForTest;
+                // 悬浮条只服务「当前活动标签命中重登脚本 @match」的页面。
+                // 这里换成一个真的命中 @match 的标签，不靠放宽判定让断言通过。
+                var originalActive = _w._active;
+                var pgTab = new TabModel { Url = _base + "/browser/", Title = "pgAdmin QA" };
+                _w._tabs.Add(pgTab);
+                _w._active = pgTab;
+                bar.RefreshVisibility();
+                Check("站点门控：当前标签命中 @match 才允许显示",
+                    _w.ReloginPageEligibleForTest() && bar.CanShowNow, "");
                 bar.ClearStatus();
                 bar.SetSignedOut(false);
                 Check("没掉登录：悬浮条完全不显示",
@@ -376,22 +389,22 @@ namespace NanoEdge
                     " offset=" + bar.HorizontalOffsetForTest.ToString("0"));
 
                 // 用户报的 bug：切到别的网站的标签页时，悬浮条还留着。
-                var previousActive = _w._active;
                 // 让监测器也记下「这个标签掉登录」——切回来才有状态可恢复。
-                _w.ReloginForTest.MarkSignedOutForTest(previousActive, true);
+                _w.ReloginForTest.MarkSignedOutForTest(pgTab, true);
                 var otherTab = new TabModel { Url = "https://other.invalid/", Title = "other" };
                 _w._tabs.Add(otherTab);
                 _w._active = otherTab;
                 _w.ReloginForTest.OnActiveTabChanged();
                 Check("切到别的网站标签后悬浮条立刻收起",
-                    !bar.IsVisibleForTest && !bar.ButtonVisibleForTest,
+                    !bar.IsVisibleForTest && !bar.ButtonVisibleForTest &&
+                    !_w.ReloginPageEligibleForTest(),
                     "visible=" + bar.IsVisibleForTest);
-                _w._active = previousActive;
+                _w._active = pgTab;
                 _w.ReloginForTest.OnActiveTabChanged();
                 Check("切回原标签时按它自己的掉登录状态恢复显示",
                     bar.ButtonVisibleForTest && bar.IsVisibleForTest, "");
                 _w._tabs.Remove(otherTab);
-                _w.ReloginForTest.MarkSignedOutForTest(previousActive, false);
+                _w.ReloginForTest.MarkSignedOutForTest(pgTab, false);
                 bar.ClearStatus();
                 Check("按钮样式：红色 #D32F2F / 圆角 6 / 白色粗体",
                     bar.NormalBackgroundForTest == "#FFD32F2F" &&
@@ -410,6 +423,78 @@ namespace NanoEdge
                     !bar.ButtonVisibleForTest && bar.IsVisibleForTest &&
                     bar.StatusTextForTest == "已重新登录", "");
                 bar.ClearStatus();
+
+                // ── 回归：浏览器不在前台 / 当前标签不在 @match 站点时不许弹按钮和提示 ──
+                bar.ShowStatus("已重新登录", true, 20);
+                bar.SetSignedOut(true);
+                Check("前台 + 命中站点：按钮和成功提示都可见",
+                    bar.IsVisibleForTest && bar.ButtonVisibleForTest &&
+                    bar.StatusTextForTest == "已重新登录", "");
+                bar.ForegroundOverrideForTest = false;
+                bar.RefreshVisibility();
+                Check("浏览器不在前台：按钮、成功提示整个悬浮条都收起",
+                    !bar.IsVisibleForTest && !bar.ButtonVisibleForTest && !bar.CanShowNow,
+                    "visible=" + bar.IsVisibleForTest);
+                bar.ForegroundOverrideForTest = true;
+                bar.RefreshVisibility();
+                Check("回到前台：按当前状态恢复显示",
+                    bar.IsVisibleForTest && bar.ButtonVisibleForTest, "");
+
+                // 故意不 ClearStatus、不触发 OnActiveTabChanged，模拟事件漏掉的最坏情况：
+                // 光靠站点门控也必须把悬浮条挡住。
+                var offsite = new TabModel { Url = "https://unknown.invalid/login", Title = "offsite" };
+                _w._tabs.Add(offsite);
+                _w._active = offsite;
+                bar.RefreshVisibility();
+                Check("不在 @match 站点：状态还在也整个收起",
+                    !bar.IsVisibleForTest && !bar.ButtonVisibleForTest &&
+                    !_w.ReloginPageEligibleForTest() && !bar.CanShowNow, "");
+                Check("异步重登反馈：切到别的标签后不回写 UI",
+                    !_w.ReloginForTest.FeedbackAllowedForTest(pgTab, pgTab.Url), "");
+                bar.ClearStatus();
+                _w.ReloginForTest.ApplyResultForTest(pgTab, _cfg,
+                    new ReloginResult { Outcome = ReloginOutcome.Succeeded }, pgTab.Url);
+                Check("迟到的「已重新登录」不会写进非 @match 站点的悬浮条",
+                    bar.StatusTextForTest == "" && !bar.IsVisibleForTest &&
+                    !bar.ButtonVisibleForTest,
+                    "status=" + bar.StatusTextForTest);
+
+                _w._active = pgTab;
+                bar.RefreshVisibility();
+                Check("异步重登反馈：发起标签仍活动且 URL 未变才允许回写",
+                    _w.ReloginForTest.FeedbackAllowedForTest(pgTab, pgTab.Url), "");
+                var startUrl = pgTab.Url;
+                pgTab.Url = "https://unknown.invalid/login";
+                Check("异步重登反馈：同一标签已导航到别的站点则不回写",
+                    !_w.ReloginForTest.FeedbackAllowedForTest(pgTab, startUrl), "");
+                pgTab.Url = startUrl;
+
+                bar.ForegroundOverrideForTest = null;
+                Check("未注入时走宿主真实前台 + 站点判定",
+                    bar.CanShowNow == (_w.ReloginForegroundForTest() &&
+                                       _w.ReloginPageEligibleForTest()), "");
+                bar.ForegroundOverrideForTest = true;
+
+                // 重登期间窗口失焦：结果回来时不显示成功提示，但必须把「登录中…」
+                // 撤掉（ShowBusy 没有自动过期的计时器，残留会一直卡在悬浮条上）。
+                bar.SetBusy(true);
+                bar.ShowBusy();
+                bar.ForegroundOverrideForTest = false;
+                _w.ReloginForTest.ApplyResultForTest(pgTab, _cfg,
+                    new ReloginResult { Outcome = ReloginOutcome.Succeeded }, pgTab.Url);
+                Check("失焦时结果回来：清掉「登录中…」且不显示成功提示",
+                    bar.StatusTextForTest == "" && !bar.IsVisibleForTest,
+                    "status=" + bar.StatusTextForTest);
+                bar.SetBusy(false);
+                bar.ForegroundOverrideForTest = true;
+                bar.RefreshVisibility();
+
+                bar.ClearStatus();
+                bar.SetSignedOut(false);
+                _w._tabs.Remove(offsite);
+                _w._tabs.Remove(pgTab);
+                _w._active = originalActive;
+                bar.RefreshVisibility();
 
                 // 冷却 / 熄灭
                 var monitor = _w.ReloginForTest;

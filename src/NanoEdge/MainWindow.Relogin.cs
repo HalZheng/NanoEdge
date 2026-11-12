@@ -9,6 +9,23 @@ namespace NanoEdge
 {
     public sealed partial class MainWindow
     {
+        // 悬浮重登条的两道显示门控：宿主窗口必须是前台活动窗口，且当前活动标签
+        // 必须命中某条「已启用重登」的用户脚本 @match。两者都由调用方实时求值，
+        // 事件只负责触发重算，不缓存结果。
+        private bool ReloginForeground()
+        {
+            return IsActive && WindowState != WindowState.Minimized;
+        }
+
+        private bool ReloginPageEligible()
+        {
+            var tab = _active;
+            return tab != null && PgAdminReloginConfig.ForUrl(tab.Url) != null;
+        }
+
+        internal bool ReloginForegroundForTest() { return ReloginForeground(); }
+        internal bool ReloginPageEligibleForTest() { return ReloginPageEligible(); }
+
         // 重登监测器只在这里构造：MainWindow.cs 主文件不必为了几个 WebView2 类型加 using。
         // 隐藏视图与主视图共用 _browser.EnvironmentAsync() 那唯一一个 environment（同一 profile）。
         private PgAdminSessionMonitor CreateReloginMonitor()

@@ -238,12 +238,16 @@ namespace NanoEdge
                 if (_governor != null) _governor.NotifyActivated();
                 // 真全屏靠临时 Topmost 盖住任务栏；切回来时重新压上去。
                 if (_immersive && !_fullscreenBusy) Topmost = true;
+                // 回到前台才允许重登悬浮条浮出；状态由 bar 自己按当前标签重算。
+                if (_reloginBar != null) _reloginBar.RefreshVisibility();
             };
             Deactivated += (s, e) =>
             {
                 if (_governor != null) _governor.NotifyDeactivated();
                 // 切到别的软件窗口，面板不该还浮在屏幕上。
                 if (_memoryPanel != null && _memoryPanel.IsOpen) _memoryPanel.Close();
+                // 失焦立刻收起重登悬浮条：按钮和「已重新登录」提示都不许浮在别的软件上。
+                if (_reloginBar != null) _reloginBar.RefreshVisibility();
                 // 失焦时撤掉 Topmost，别让全屏窗口一直盖着别的软件。
                 if (_immersive && !_fullscreenBusy) Topmost = false;
             };
@@ -257,8 +261,7 @@ namespace NanoEdge
                 if (WindowState == WindowState.Minimized && _memoryPanel != null)
                     _memoryPanel.Close();
                 // 悬浮按钮是 Popup，最小化时收起，恢复时按当前状态再显示。
-                if (_reloginBar != null)
-                    _reloginBar.SetWindowVisible(WindowState != WindowState.Minimized);
+                if (_reloginBar != null) _reloginBar.RefreshVisibility();
             };
         }
 
@@ -369,7 +372,7 @@ namespace NanoEdge
             _tabHost.SetResourceReference(Grid.BackgroundProperty, "CanvasBrush");
             Grid.SetColumn(_tabHost, 1);
             _bodyGrid.Children.Add(_tabHost);
-            _reloginBar = new PgAdminReloginBar(_tabHost);
+            _reloginBar = new PgAdminReloginBar(_tabHost, ReloginForeground, ReloginPageEligible);
             _root.Children.Add(_bodyGrid);
 
             _statusBar = new Border { Height = 22, Padding = new Thickness(10, 0, 10, 0) };
@@ -415,12 +418,16 @@ namespace NanoEdge
             };
             _browser.UrlChanged += t =>
             {
-                if (ReferenceEquals(t, _active)) SetAddress(AddressFor(t));
+                bool isActive = ReferenceEquals(t, _active);
+                if (isActive) SetAddress(AddressFor(t));
                 SaveSession();
+                // SPA 里地址变了但不一定有 NavigationCompleted，站点门控必须跟着重算。
+                if (isActive && _reloginBar != null) _reloginBar.RefreshVisibility();
             };
             _browser.OpenInNewTab += url => NewTab(url);
             _browser.PlaceholderFactory = MakePlaceholder;
             _browser.NavigationDone += OnNavigationDone;
+            _browser.LoginUiMessage += OnLoginUiMessage;
             _browser.RestoreCompleted += OnRestoreCompleted;
             _browser.ZoomChanged += (tab, factor) => { if (ReferenceEquals(tab, _active)) UpdateStatus(); };
             _browser.FaviconChanged += tab => RebuildTabStrip();
@@ -997,11 +1004,10 @@ namespace NanoEdge
             {
                 if (_suggestCloseTimer != null) _suggestCloseTimer.Start();
             };
-            // 钥匙图标叠在地址栏右端（Chrome 的位置），平时 Collapsed；
-            // 扫描到密码框才亮。地址栏右边留 26px 给它，避免文字被压住。
+            // 图标改画在网页的用户名输入框内（页面内 DOM，见 LoginFill.cs），
+            // 地址栏不再放图标；留白保持原样，地址文字布局不变。
             var addressGrid = new Grid();
             addressGrid.Children.Add(_address);
-            addressGrid.Children.Add(BuildLoginButton());
             addressBorder.Child = addressGrid;
             _addressBorder = addressBorder;
 
@@ -1397,6 +1403,8 @@ namespace NanoEdge
         private void OnNavigationDone(TabModel tab, string url, bool success)
         {
             if (_relogin != null) _relogin.OnNavigationDone(tab, url, success);
+            if (_reloginBar != null && ReferenceEquals(tab, _active))
+                _reloginBar.RefreshVisibility();
             if (success)
             {
                 // 重定向 / 同址刷新会在几秒内连发两次 NavigationCompleted，别把访问次数灌水。
@@ -1407,11 +1415,14 @@ namespace NanoEdge
                 // 密封标签不进历史（7.4）；标题更新也走 HistoryStore.UpdateTitle 的 null 兜底。
                 if (!tab.IsSecret && !same) HistoryStore.Record(url, tab.Title);
 
-                // 登录框可能晚于导航完成才渲染（SPA），两个时间点各扫一次；
-                // 都不中也没关系，点钥匙图标时会再扫。
-                HideLoginButton();
+                // 登录框可能晚于导航完成才渲染（SPA）。前两次照顾普通页面，
+                // 5 秒这次专门兜 Kibana 这类「JS bundle 慢慢加载完才画登录表单」的站点：
+                // 少一次，图标就永远不亮，用户连「点一下再扫」的机会都没有。
+                // 全部是一次性扫描，不装 MutationObserver，内存不随页面存活时间增长。
+                HideLoginIcons();
                 RefreshLoginStateDelayed(tab, 600);
                 RefreshLoginStateDelayed(tab, 2000);
+                RefreshLoginStateDelayed(tab, 5000);
                 return;
             }
             if (!ReferenceEquals(tab, _active)) return;
@@ -3586,7 +3597,7 @@ namespace NanoEdge
             {
                 // 重新注入或移除扫描脚本；关掉后钥匙图标立刻消失。
                 _browser.RefreshScripts();
-                if (!_settings.PasswordFill) HideLoginButton();
+                if (!_settings.PasswordFill) HideLoginIcons();
                 else RefreshLoginStateDelayed(_active, 300);
             }
         }
@@ -3714,6 +3725,9 @@ namespace NanoEdge
             SetAddress(AddressFor(tab));
             RebuildTabStrip();
             SaveSession();
+            // 切回标签时补扫一次：表单可能在导航时的几次扫描之后才渲染完。
+            // 内部页/起始页没有 CoreWebView2，RefreshLoginState 会顺手把图标收起来。
+            RefreshLoginState(tab);
             if (_relogin != null) _relogin.OnActiveTabChanged();
         }
 

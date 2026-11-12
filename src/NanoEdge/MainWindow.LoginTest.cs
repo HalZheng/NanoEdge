@@ -24,6 +24,7 @@ namespace NanoEdge
             private readonly List<string> _failures = new List<string>();
             private int _passes;
             private string _root;
+            private CoreWebView2 _core;
             private readonly JavaScriptSerializer _json = new JavaScriptSerializer();
 
             public LoginSelfTest(MainWindow window) { _w = window; }
@@ -35,7 +36,7 @@ namespace NanoEdge
                 KeePassBridge.ConfigPath = Path.Combine(_root ?? Path.GetTempPath(), "out", "kpxc-test-config.json");
                 SettingsStore.Persist = false;   // 自测改设置但不落盘
                 Line("NanoEdge login fill self-test " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
-                try { await RunCoreAsync(); }
+                try { await RunCoreAsync(); await RunLateScanTestAsync(); }
                 catch (Exception ex) { Fail("unhandled", ex.ToString()); }
                 finally
                 {
@@ -98,10 +99,24 @@ setTimeout(function(){
                 var core = await WaitForCoreAsync(tab);
                 Check(core != null, "拿到 CoreWebView2");
                 if (core == null) return;
+                _core = core;
 
                 // 第一次导航（127.0.0.1:1 必然连不上）还在跑的时候再 Navigate 会被吞掉，
                 // 等它收尾再注册拦截、指向 example.com。
                 await Task.Delay(1500);
+
+                // 第二个测试页：登录表单在 3 秒后才插入 DOM，专门验证 5 秒兜底扫描。
+                // 600ms / 2000ms 那两次必然看不到它，只有 5000ms 那次能扫出来。
+                var lateHtml = @"<!doctype html><html><head><meta charset=""utf-8""><title>late fixture</title>
+<style>body{font:14px system-ui;padding:24px}input{display:block;margin:6px 0;padding:6px;width:260px}</style>
+</head><body><h3>loading…</h3><script>
+setTimeout(function(){
+  var f = document.createElement('form');
+  f.innerHTML = '<input name=""late2-user"" type=""text""><input name=""late2-pass"" type=""password"">';
+  document.body.appendChild(f);
+  window.__late2Ready = true;
+}, 3000);
+</script></body></html>";
 
                 core.AddWebResourceRequestedFilter("*", CoreWebView2WebResourceContext.All);
                 var intercepted = 0;
@@ -109,7 +124,9 @@ setTimeout(function(){
                 {
                     if (!e.Request.Uri.StartsWith("https://example.com", StringComparison.OrdinalIgnoreCase)) return;
                     intercepted++;
-                    var body = Encoding.UTF8.GetBytes(html);
+                    var body = Encoding.UTF8.GetBytes(
+                        e.Request.Uri.StartsWith("https://example.com/late", StringComparison.OrdinalIgnoreCase)
+                            ? lateHtml : html);
                     e.Response = core.Environment.CreateWebResourceResponse(
                         new MemoryStream(body), 200, "OK", "Content-Type: text/html; charset=utf-8");
                 };
@@ -199,56 +216,135 @@ setTimeout(function(){
                     "document.querySelector('#f1 input[name=password]').value");
                 Check(firstUntouched == tricky, "没抢着填第一个表单（值仍是之前的 " + firstUntouched.Length + " 字符）");
 
-                // ---------- 界面层：图标 / 弹层 / 填充 ----------
+                // ---------- 设置页：显式关联入口（不依赖 KeePassXC 是否已配好） ----------
+                // 用一个绝不存在的配置路径，强制页面走「未关联」分支；不碰真实配置。
+                var savedConfigPath = KeePassBridge.ConfigPath;
+                KeePassBridge.ConfigPath = Path.Combine(_root ?? Path.GetTempPath(), "out",
+                    "kpxc-none-" + Guid.NewGuid().ToString("N") + ".json");
+                var settingsPage = new SettingsPage(_w._settings);
+                var assocButton = settingsPage.AssociateButtonForTest;
+                Check(assocButton != null, "设置页未关联时提供「立即关联」按钮");
+                Check(assocButton != null && Convert.ToString(assocButton.Content) == L.T("立即关联"),
+                      "按钮文案 = " + L.T("立即关联"));
+                RenderElement(settingsPage,
+                    Path.Combine(_root ?? Path.GetTempPath(), "out", "login-settings-link.png"));
+
+                var savedLanguage = L.Language;
+                L.Apply("en-US");
+                var enPage = new SettingsPage(_w._settings);   // 换语言必须重新 new
+                var enButton = enPage.AssociateButtonForTest;
+                Check(enButton != null && Convert.ToString(enButton.Content) == "Link now",
+                      "英文界面按钮文案 = Link now");
+                RenderElement(enPage,
+                    Path.Combine(_root ?? Path.GetTempPath(), "out", "login-settings-link-en.png"));
+                L.Apply(savedLanguage);
+                KeePassBridge.ConfigPath = savedConfigPath;
+
+                // ---------- 页面内图标 + 切标签补扫 ----------
+                var icons0 = await LoginFill.IconCountAsync(core);
+                Check(icons0 == 5, "用户名输入框内装了 5 个图标（实际 " + icons0 + "）");
+                var iconInside = await EvalAsync(core,
+                    "(function(){var i=document.querySelector('.__neLoginIcon');" +
+                    "if(!i)return 'no-icon';var r=i.getBoundingClientRect();" +
+                    "var u=document.querySelector('#f1 input[name=username]').getBoundingClientRect();" +
+                    "return (r.right<=u.right+2 && r.right>=u.right-26 &&" +
+                    " Math.abs((r.top+r.bottom)/2-(u.top+u.bottom)/2)<12)?'yes':'no';})()");
+                Check(iconInside == "yes", "图标贴在用户名输入框内部右侧（不是地址栏）");
+                var iconSrc = await EvalAsync(core,
+                    "(function(){var i=document.querySelector('.__neLoginIcon');" +
+                    "return i?i.style.backgroundImage:'';})()");
+                Check(iconSrc.IndexOf("data:image/png;base64", StringComparison.Ordinal) >= 0,
+                      "图标用的是 KeePassXC 官方 logo（内联 data URI）");
+
+                await LoginFill.RemoveIconsAsync(core);
+                Check(await LoginFill.IconCountAsync(core) == 0, "前置：手动移除页面内图标");
+                _w.NewTab();          // 起始页没有 WebView2
+                _w.SelectTab(tab);    // 切回 fixture 页，SelectTab 里补扫一次
+                var restored = false;
+                for (var t = 0; t < 40; t++)
+                {
+                    if (await LoginFill.IconCountAsync(core) == 5) { restored = true; break; }
+                    await Task.Delay(100);
+                }
+                Check(restored, "切回标签时补扫，输入框内图标恢复");
+
+                // ---------- 界面层：单账号直填 / 多账号下拉 ----------
                 // 自测配置来自 --kpxctest=associate 的产物；没有就跳过界面断言，
                 // 免得在没配好 KeePassXC 的机器上卡在关联弹窗里。
                 var hasConfig = KeePassBridge.LoadConfig() != null;
                 if (!hasConfig)
                 {
-                    Line("跳过界面层断言：没有关联配置（先跑 --kpxctest=associate）");
+                    Line("跳过凭据相关断言：没有关联配置（先跑 --kpxctest=associate）");
                     return;
                 }
 
-                var iconShown = await WaitUntil(
-                    () => _w._loginButton != null && _w._loginButton.Visibility == Visibility.Visible, 8000);
-                Check(iconShown, "钥匙图标在检测到密码框后出现");
-
-                _w.OnLoginClick();
-                var popupOpen = await WaitUntil(
-                    () => _w._loginPopup != null && _w._loginPopup.IsOpen, 20000);
-                Check(popupOpen, "点击钥匙后账号弹层打开");
-                if (!popupOpen) return;
-
-                await CaptureWindowAsync("login-popup.png");
-
-                var popupText = CollectText((DependencyObject)_w._loginPopup.Child);
-                Line("弹层内容：" + popupText.Replace("\n", " | "));
-                Check(popupText.IndexOf("spike-test", StringComparison.Ordinal) >= 0, "弹层列出 KeePassXC 的条目名");
-                Check(popupText.IndexOf("testuser", StringComparison.Ordinal) >= 0, "弹层列出用户名");
-                Check(popupText.IndexOf("testpass123", StringComparison.Ordinal) < 0, "弹层不显示密码明文");
-
-                // fillActive 按焦点挑表单，先把焦点移到第一个表单，确保填的是它
+                // 真点 DOM 图标，走完整的 click -> postMessage -> 宿主取凭据链路。
                 await core.ExecuteScriptAsync(
-                    "document.querySelector('#f1 input[name=password]').focus()");
-                _w.FillCredential(new KeePassCredential
+                    "(function(){var a=document.querySelectorAll('.__neLoginIcon');if(a.length)a[0].click();})()");
+                var filledByIcon = false;
+                for (var t = 0; t < 120; t++)
                 {
-                    Name = "spike-test",
-                    Login = "testuser",
-                    Password = "testpass123"
-                });
-                await Task.Delay(300);
+                    var v = await EvalAsync(core, "document.querySelector('#f1 input[name=password]').value");
+                    if (v == "testpass123") { filledByIcon = true; break; }
+                    await Task.Delay(100);
+                }
+                Check(filledByIcon, "点输入框内图标：只有 1 个账号时直接填充");
+                Check(!await LoginFill.PickerVisibleAsync(core), "单账号不弹下拉（官方插件手感）");
                 var filledUser = await EvalAsync(core, "document.querySelector('#f1 input[name=username]').value");
                 var filledPass = await EvalAsync(core, "document.querySelector('#f1 input[name=password]').value");
-                Check(filledUser == "testuser", "界面填充：用户名落进页面（读回 " + filledUser + "）");
-                Check(filledPass == "testpass123", "界面填充：密码落进页面（长度 " + filledPass.Length + "）");
+                Check(filledUser == "testuser", "用户名落进页面（读回 " + filledUser + "）");
+                Check(filledPass == "testpass123", "密码落进页面（长度 " + filledPass.Length + "）");
+                await CapturePageAsync("login-icons.png");
+
+                // ---------- 多个账号：下拉贴在输入框下方 ----------
+                _w._loginEntries = new List<KeePassCredential>
+                {
+                    new KeePassCredential { Name = "spike-test", Login = "testuser", Password = "testpass123" },
+                    new KeePassCredential { Name = "second-account", Login = "bob", Password = "bob-secret" }
+                };
+                await LoginFill.ShowPickerAsync(core, 0, _w._loginEntries, true,
+                    L.T("选择要填充的账号"), L.T("重新加载"));
+                Check(await LoginFill.PickerVisibleAsync(core), "多个账号时弹出下拉");
+                await LoginFill.InstallIconsAsync(core);   // 模拟导航后 5 秒那次延迟扫描
+                Check(await LoginFill.PickerVisibleAsync(core),
+                      "延迟扫描重装图标时不会把下拉收起");
+                var pickerText = await EvalAsync(core,
+                    "(function(){var p=document.getElementById('__neLoginPicker');return p?p.textContent:'';})()");
+                Line("下拉内容：" + pickerText);
+                Check(pickerText.IndexOf("second-account", StringComparison.Ordinal) >= 0, "下拉列出条目名");
+                Check(pickerText.IndexOf("bob", StringComparison.Ordinal) >= 0, "下拉列出用户名");
+                Check(pickerText.IndexOf("testpass123", StringComparison.Ordinal) < 0 &&
+                      pickerText.IndexOf("bob-secret", StringComparison.Ordinal) < 0,
+                      "下拉里没有密码明文");
+                var pickerBelow = await EvalAsync(core,
+                    "(function(){var p=document.getElementById('__neLoginPicker');" +
+                    "if(!p)return 'no';var r=p.getBoundingClientRect();" +
+                    "var u=document.querySelector('#f1 input[name=username]').getBoundingClientRect();" +
+                    "return (r.top>=u.bottom-2 && Math.abs(r.left-u.left)<4)?'yes':'no';})()");
+                Check(pickerBelow == "yes", "下拉锚定在用户名输入框下方（不是地址栏）");
+                await CapturePageAsync("login-picker.png");
+
+                // 点第 2 条 -> WebMessage -> 宿主按索引把该账号填进表单
+                await core.ExecuteScriptAsync(
+                    "(function(){var a=document.querySelectorAll('.__neLoginRow');if(a.length>1)a[1].click();})()");
+                var picked = false;
+                for (var t = 0; t < 80; t++)
+                {
+                    var v = await EvalAsync(core, "document.querySelector('#f1 input[name=username]').value");
+                    if (v == "bob") { picked = true; break; }
+                    await Task.Delay(100);
+                }
+                Check(picked, "点下拉第 2 条：宿主按索引把选中账号填进表单");
+                var pickedPass = await EvalAsync(core, "document.querySelector('#f1 input[name=password]').value");
+                Check(pickedPass == "bob-secret", "填充的是选中账号的密码");
+                Check(!await LoginFill.PickerVisibleAsync(core), "选中后下拉收起");
 
                 // ---------- 设置开关 ----------
                 _w._settings.PasswordFill = false;
                 _w.OnSettingChanged("password");
                 await Task.Delay(400);
-                var hiddenAfterOff = _w._loginButton == null ||
-                                      _w._loginButton.Visibility != Visibility.Visible;
-                Check(hiddenAfterOff, "关掉「填充账号密码」后钥匙图标消失");
+                var iconsOff = await LoginFill.IconCountAsync(core);
+                Check(iconsOff == 0, "关掉「填充账号密码」后页面内图标被移除");
                 var scriptGone = await EvalAsync(core, "typeof window.__neLogin");
                 Line("关掉后页面里的 window.__neLogin = " + scriptGone +
                      "（已注入的文档不会回收，新导航才彻底清除）");
@@ -256,6 +352,30 @@ setTimeout(function(){
                 _w._settings.PasswordFill = true;
                 _w.OnSettingChanged("password");
                 await Task.Delay(300);
+            }
+
+            // 5 秒兜底扫描：表单在导航约 3 秒后才渲染，600/2000ms 两次必然落空，
+            // 只有新增的 5000ms 那次能把图标点亮。这是 Kibana 类 SPA 的复现场景。
+            private async Task RunLateScanTestAsync()
+            {
+                if (_core == null) { Line("跳过 5 秒扫描断言：没有 CoreWebView2"); return; }
+                _w.HideLoginIcons();
+                _core.Navigate("https://example.com/late");
+                await Task.Delay(2600);
+                var earlyIcons = await LoginFill.IconCountAsync(_core);
+                Check(earlyIcons == 0, "晚渲染页：2 秒扫描窗口过后还没有图标（表单尚未出现）");
+
+                var shown = false;
+                for (var t = 0; t < 90; t++)
+                {
+                    if (await LoginFill.IconCountAsync(_core) >= 1) { shown = true; break; }
+                    await Task.Delay(100);
+                }
+                Check(shown, "5 秒兜底扫描把 3 秒后才渲染的登录框扫出来，图标亮起");
+
+                var lateFields = await LoginFill.ScanAsync(_core);
+                Check(lateFields.Count >= 1, "晚渲染页确实有密码框（scan=" + lateFields.Count + "）");
+                await CapturePageAsync("login-late-icon.png");
             }
 
             private async Task<CoreWebView2> WaitForCoreAsync(TabModel tab)
@@ -298,22 +418,23 @@ setTimeout(function(){
                 catch { return ""; }
             }
 
-            // WebView2 是 HwndHost，屏幕截图在这个会话里拿不到有效句柄（"句柄无效"），
-            // 所以改成分别渲染 WPF 元素：要看的「钥匙图标」和「账号弹层」本来都是 WPF。
-            private async Task CaptureWindowAsync(string fileName)
+            // 图标和下拉都在网页里，抓 WebView2 自己的预览才看得见。
+            private async Task CapturePageAsync(string fileName)
             {
                 try
                 {
-                    await Task.Delay(300);
                     var dir = Path.Combine(_root ?? Path.GetTempPath(), "out");
                     Directory.CreateDirectory(dir);
-
-                    RenderElement(_w._loginPopup == null ? null : _w._loginPopup.Child as FrameworkElement,
-                        Path.Combine(dir, fileName));
-                    RenderElement(_w._toolbarHost as FrameworkElement,
-                        Path.Combine(dir, "login-toolbar.png"));
+                    using (var stream = new MemoryStream())
+                    {
+                        await _core.CapturePreviewAsync(
+                            CoreWebView2CapturePreviewImageFormat.Png, stream);
+                        var bytes = stream.ToArray();
+                        File.WriteAllBytes(Path.Combine(dir, fileName), bytes);
+                        Line("页面截图 " + fileName + " = " + bytes.Length + " 字节");
+                    }
                 }
-                catch (Exception ex) { Line("截图失败：" + ex.Message); }
+                catch (Exception ex) { Line("页面截图失败：" + ex.Message); }
             }
 
             private void RenderElement(FrameworkElement element, string path)

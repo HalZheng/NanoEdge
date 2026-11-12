@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -17,6 +18,7 @@ namespace NanoEdge
         public event Action SetDefaultBrowserRequested;
 
         private readonly AppSettings _settings;
+        private readonly Action<string> _notify;
         private readonly Grid _root;
         private readonly StackPanel _body;
         private readonly Canvas _dropdownLayer = new Canvas();
@@ -24,10 +26,14 @@ namespace NanoEdge
         private bool _capturing;
         private Button _hotkeyButton;
         private TextBlock _hotkeyHint;
+        private Button _associateButton;
+        private bool _associateBusy;
 
-        public SettingsPage(AppSettings settings)
+        // notify 是可选的：其它内部页都拿宿主 Toast 反馈，自测直接 new 页面时传 null。
+        public SettingsPage(AppSettings settings, Action<string> notify = null)
         {
             _settings = settings;
+            _notify = notify;
             this.SetResourceReference(BackgroundProperty, "CanvasBrush");
 
             _root = new Grid
@@ -224,6 +230,9 @@ namespace NanoEdge
                     TextButton(L.T("清除关联"), () =>
                     {
                         KeePassBridge.ForgetConfig();
+                        // 状态是构造时读的：立刻重建这一页，「立即关联」才会出现，
+                        // 不用等用户手动刷新设置页。
+                        Build();
                         Raise("password");
                     })));
             }
@@ -234,8 +243,11 @@ namespace NanoEdge
                     ? L.T("请先在 KeePassXC 设置里开启「浏览器集成」")
                     : (KeePassBridge.FindProxy() == null
                         ? L.T("未安装 KeePassXC")
-                        : L.T("尚未关联，下次填充时会让您允许一次"));
-                _body.Children.Add(Row(L.T("KeePassXC"), reason, null));
+                        : L.T("点右侧按钮关联，KeePassXC 会弹窗让您确认"));
+                // 关联不该依赖「先找到一个登录页、钥匙图标还恰好亮着」：
+                // SPA 晚渲染时这两个条件凑不齐，用户连确认弹窗都见不到。
+                _associateButton = (Button)TextButton(L.T("立即关联"), OnAssociateClicked);
+                _body.Children.Add(Row(L.T("KeePassXC"), reason, _associateButton));
             }
 
             var fillNote = new TextBlock
@@ -314,6 +326,50 @@ namespace NanoEdge
             var handler = Changed;
             if (handler != null) handler(kind);
         }
+
+        // ---------- KeePassXC 关联 ----------
+
+        // 只走已有的 KeePassBridge.AssociateAsync，不另起一套协议；
+        // 弹窗要用户填连接名并点「保存并允许访问」，所以给足 120 秒。
+        private async void OnAssociateClicked()
+        {
+            if (_associateBusy) return;
+            _associateBusy = true;
+            if (_associateButton != null)
+            {
+                _associateButton.Content = L.T("正在关联…");
+                _associateButton.IsEnabled = false;
+            }
+            Notify(L.T("请在 KeePassXC 弹窗里允许 NanoEdge 访问"));
+            try
+            {
+                var result = await KeePassBridge.AssociateAsync("NanoEdge", TimeSpan.FromSeconds(120));
+                if (result.Ok)
+                    Notify(L.T("已关联 KeePassXC") + "：" + result.Message);
+                else
+                    Notify(KeePassBridge.StatusText(result.Status) +
+                           (string.IsNullOrEmpty(result.Message) ? "" : "：" + result.Message));
+            }
+            catch (Exception ex)
+            {
+                Diagnostics.Log("associate from settings failed: " + ex.Message);
+                Notify(L.T("KeePassXC 操作失败"));
+            }
+            finally
+            {
+                _associateBusy = false;
+                // 成功/失败都要重建这一页：成功显示「已关联：xxx」，失败恢复按钮可点。
+                Build();
+            }
+        }
+
+        private void Notify(string message)
+        {
+            if (_notify != null) _notify(message);
+        }
+
+        // 自测用：不遍历可视化树就能拿到关联按钮。
+        internal Button AssociateButtonForTest { get { return _associateButton; } }
 
         // ---------- 密封标签切换键录入 ----------
 

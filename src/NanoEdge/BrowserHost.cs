@@ -126,6 +126,7 @@ namespace NanoEdge
         public event Action<TabModel, string, int> HttpResponse;    // tab, request uri, status code
         public event Action<TabModel, double> ZoomChanged;       // 供状态栏显示当前档位
         public event Action<TabModel, string, bool> ProcessFailed;  // tab, message, offerReload
+        public event Action<TabModel, string> LoginUiMessage;    // 页面内登录图标/下拉的消息（不是用户脚本）
         public event Action BrowserExited;                       // 整个浏览器进程没了
         public Func<TabModel, FrameworkElement> PlaceholderFactory;
 
@@ -474,7 +475,19 @@ namespace NanoEdge
             // 用户脚本的 GM_* 调用都从这里进来（7.3）。
             core.WebMessageReceived += (s, e) =>
             {
-                try { Scripts.Handle(core, e.WebMessageAsJson); }
+                try
+                {
+                    var json = e.WebMessageAsJson ?? "";
+                    // 页面内 KeePassXC 图标 / 账号下拉的消息归宿主 UI 层处理。
+                    // 它不走用户脚本的 @grant 判定，否则会被当成无权限脚本丢掉。
+                    if (json.IndexOf("\"neLogin\"", StringComparison.Ordinal) >= 0)
+                    {
+                        var ui = LoginUiMessage;
+                        if (ui != null) ui(tab, json);
+                        return;
+                    }
+                    Scripts.Handle(core, json);
+                }
                 catch (Exception ex) { Diagnostics.Log("script message failed: " + ex.Message); }
             };
 
@@ -710,7 +723,7 @@ namespace NanoEdge
             sources.Add(ScriptEngine.Bootstrap());
             // 登录表单识别：只暴露 scan / fill 两个方法，不常驻观察器（内存口径见 SPEC 2）。
             // 设置页关掉「填充账号密码」后连脚本都不注入，页面里不留痕迹。
-            if (_settings.PasswordFill) sources.Add(LoginFill.Script);
+            if (_settings.PasswordFill) sources.Add(LoginFill.ScriptFor(LoginFill.IconDataUri()));
             foreach (var script in scripts) sources.Add(ScriptEngine.Wrap(script));
             // 只有开了重登才注入这段引导器；它内部按站点 + 10 分钟标记双重判定，
             // 其它站点的页面即使被注入也不会有任何动作（F-12）。

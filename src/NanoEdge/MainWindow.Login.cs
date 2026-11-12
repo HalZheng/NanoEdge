@@ -1,147 +1,71 @@
 using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;
-using System.Windows;
-using System.Windows.Controls;
-using System.Windows.Controls.Primitives;
-using System.Windows.Input;
-using System.Windows.Media;
+using System.Web.Script.Serialization;
 
 namespace NanoEdge
 {
     public sealed partial class MainWindow
     {
         // =====================================================================
-        // 登录填充的界面层（SPEC 8.x）
-        // 地址栏右侧的钥匙图标 + 账号列表弹层。密码只在「填充」这一瞬间经过宿主，
-        // 弹层里只显示用户名和条目名，不显示密码。
-        // 颜色一律走 SetResourceReference：切主题时不重建 UI 也能跟着变。
+        // 登录填充的宿主层（SPEC 7.15）
+        // 图标和账号下拉都在页面里（LoginFill.cs 注入的 DOM），这里只负责：
+        // 收到图标/条目的消息 -> 向 KeePassXC 取凭据 -> 按表单索引填充。
+        // 密码只在「填充」这一瞬间经过宿主内存，不下发到页面脚本、不写日志。
         // =====================================================================
 
-        private Border _loginButton;
-        private Popup _loginPopup;
         private List<LoginField> _loginFields = new List<LoginField>();
+        private List<KeePassCredential> _loginEntries = new List<KeePassCredential>();
         private bool _loginBusy;
 
-        private FrameworkElement BuildLoginButton()
+        private void OnLoginUiMessage(TabModel tab, string json)
         {
-            var icon = MakeKeyIcon();
-            icon.HorizontalAlignment = HorizontalAlignment.Center;
-            icon.VerticalAlignment = VerticalAlignment.Center;
+            if (tab == null || !ReferenceEquals(tab, _active) || !_settings.PasswordFill) return;
+            Dictionary<string, object> msg;
+            try { msg = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(json); }
+            catch { return; }
+            if (msg == null) return;
 
-            _loginButton = new Border
+            var kind = Field(msg, "neLogin");
+            var index = IntField(msg, "index");
+            if (kind == "icon" || kind == "reload") { OnLoginClick(index); return; }
+            if (kind == "pick")
             {
-                Width = 20,
-                Height = 20,
-                CornerRadius = new CornerRadius(4),
-                VerticalAlignment = VerticalAlignment.Center,
-                HorizontalAlignment = HorizontalAlignment.Right,
-                Margin = new Thickness(0, 0, 4, 0),
-                Cursor = Cursors.Hand,
-                Visibility = Visibility.Collapsed,
-                ToolTip = L.T("填充账号密码"),
-                Tag = "interactive",
-                Background = Brushes.Transparent,
-                Child = icon
-            };
-            _loginButton.MouseEnter += (s, e) =>
-                _loginButton.SetResourceReference(Border.BackgroundProperty, "HoverBrush");
-            _loginButton.MouseLeave += (s, e) =>
-                _loginButton.Background = Brushes.Transparent;
-            _loginButton.MouseLeftButtonDown += (s, e) =>
-            {
-                e.Handled = true;
-                OnLoginClick();
-            };
-            return _loginButton;
-        }
-
-        // 用 KeePassXC 官方 logo（和 Chrome 的 KeePassXC-Browser 插件一致），
-        // 用户一眼就知道「这是 KeePassXC 在填」。资源缺失时退回手画矢量钥匙。
-        private static FrameworkElement MakeKeyIcon()
-        {
-            var source = LoadEmbeddedIcon("NanoEdge.Native.keepassxc.png");
-            if (source == null) return MakeFallbackKeyIcon();
-            return new Image
-            {
-                Width = 15,
-                Height = 15,
-                Stretch = Stretch.Uniform,
-                Source = source
-            };
-        }
-
-        private static System.Windows.Media.ImageSource LoadEmbeddedIcon(string resourceName)
-        {
-            try
-            {
-                using (var stream = System.Reflection.Assembly.GetExecutingAssembly()
-                           .GetManifestResourceStream(resourceName))
+                var entry = IntField(msg, "entry");
+                if (entry >= 0 && entry < _loginEntries.Count)
                 {
-                    if (stream == null) return null;
-                    var bitmap = new System.Windows.Media.Imaging.BitmapImage();
-                    bitmap.BeginInit();
-                    bitmap.CacheOption = System.Windows.Media.Imaging.BitmapCacheOption.OnLoad;
-                    bitmap.StreamSource = stream;
-                    bitmap.EndInit();
-                    bitmap.Freeze();     // 冻结后才能跨线程共享
-                    return bitmap;
+                    var unused = FillCredential(_loginEntries[entry], index);
                 }
             }
-            catch (Exception ex)
-            {
-                Diagnostics.Log("load keepassxc icon failed: " + ex.Message);
-                return null;
-            }
         }
 
-        private static FrameworkElement MakeFallbackKeyIcon()
-        {
-            var key = new System.Windows.Shapes.Path
-            {
-                // 钥匙柄（两个半圆弧成整圆）+ 横杆 + 两个不等长的齿
-                Data = Geometry.Parse(
-                    "M2,6 A3,3 0 1 1 8,6 A3,3 0 1 1 2,6 M8,6 L18,6 M13,6 L13,9.2 M18,6 L18,10.6"),
-                StrokeThickness = 1.6,
-                StrokeLineJoin = PenLineJoin.Round,
-                StrokeStartLineCap = PenLineCap.Round,
-                StrokeEndLineCap = PenLineCap.Round,
-                Stroke = Brushes.Gray,
-                Stretch = Stretch.Uniform,
-                Width = 14,
-                Height = 11
-            };
-            key.SetResourceReference(System.Windows.Shapes.Shape.StrokeProperty, "MutedBrush");
-            return key;
-        }
-
-        // 导航完成后调用：扫一次页面，有密码框才亮图标。
-        // 不常驻观察器 —— 慢渲染的 SPA 靠「点之前再扫一次」兜底。
+        // 导航完成后调用：扫一次页面，顺手把输入框内的图标装好/重定位。
         private async void RefreshLoginState(TabModel tab)
         {
-            // 开关关掉后，导航时排下的延迟扫描仍会跑到这里，必须在这里也挡一道，
-            // 否则图标会在关闭后闪回来。
-            if (!_settings.PasswordFill) { HideLoginButton(); return; }
-            if (tab == null || tab != _active || _loginButton == null) return;
+            if (!_settings.PasswordFill) { HideLoginIcons(); return; }
+            // SelectTab 在会话恢复/内核重启时也可能早于 _browser 初始化，挡一道。
+            if (tab == null || tab != _active || _browser == null) return;
             var core = _browser.Core(tab);
-            if (core == null) { HideLoginButton(); return; }
+            if (core == null) { HideLoginIcons(); return; }
             try
             {
                 var fields = await LoginFill.ScanAsync(core);
-                if (tab != _active) return;      // 扫描期间切走了
+                if (tab != _active) return;
                 _loginFields = fields;
-                _loginButton.Visibility = fields.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+                await LoginFill.InstallIconsAsync(core);
             }
             catch (Exception ex) { Diagnostics.Log("refresh login state failed: " + ex.Message); }
         }
 
-        private void HideLoginButton()
+        private void HideLoginIcons()
         {
             _loginFields.Clear();
-            if (_loginButton != null) _loginButton.Visibility = Visibility.Collapsed;
+            var core = _active == null || _browser == null ? null : _browser.Core(_active);
+            if (core != null) { var unused = LoginFill.RemoveIconsAsync(core); }
         }
 
-        private async void OnLoginClick()
+        // formIndex 是图标对应的表单原始索引（allPasswords 的顺序，含隐藏框）。
+        private async void OnLoginClick(int formIndex)
         {
             if (_loginBusy || !_settings.PasswordFill) return;
             var tab = _active;
@@ -152,13 +76,14 @@ namespace NanoEdge
             _loginBusy = true;
             try
             {
-                // 点之前重扫：页面可能是导航之后才把表单渲染出来的
+                // 点之前重扫：页面可能在导航之后才把表单渲染出来，
+                // 同时把图标位置刷新到最新布局。
                 var fields = await LoginFill.ScanAsync(core);
                 if (tab != _active) return;
                 _loginFields = fields;
+                await LoginFill.InstallIconsAsync(core);
                 if (fields.Count == 0)
                 {
-                    HideLoginButton();
                     _toast.Show(L.T("这个页面没有找到登录框"));
                     return;
                 }
@@ -185,11 +110,24 @@ namespace NanoEdge
 
                 if (!result.Ok)
                 {
-                    ShowLoginPopup(new List<KeePassCredential>(),
-                        KeePassBridge.StatusText(result.Status));
+                    _toast.Show(KeePassBridge.StatusText(result.Status));
                     return;
                 }
-                ShowLoginPopup(result.Entries, null);
+
+                _loginEntries = result.Entries;
+                if (result.Entries.Count == 0)
+                {
+                    _toast.Show(L.T("KeePassXC 里没有匹配这个站点的条目"));
+                    return;
+                }
+                // 官方插件的手感：只有一个账号时点了就填，不弹下拉。
+                if (result.Entries.Count == 1)
+                {
+                    await FillCredential(result.Entries[0], formIndex);
+                    return;
+                }
+                await LoginFill.ShowPickerAsync(core, formIndex, result.Entries, Theme.IsDark,
+                    L.T("选择要填充的账号"), L.T("重新加载"));
             }
             catch (Exception ex)
             {
@@ -199,144 +137,33 @@ namespace NanoEdge
             finally { _loginBusy = false; }
         }
 
-        private void ShowLoginPopup(List<KeePassCredential> entries, string notice)
+        private async Task FillCredential(KeePassCredential entry, int formIndex)
         {
-            if (_loginButton == null) return;
-            if (_loginPopup != null) { _loginPopup.IsOpen = false; _loginPopup = null; }
-
-            var content = new StackPanel { Orientation = Orientation.Vertical };
-
-            content.Children.Add(MakeText(_active == null ? "" : HostLabel(_active.Url), 12, "TextBrush",
-                FontWeights.Medium, new Thickness(10, 8, 10, 6)));
-
-            var separator = new Border { Height = 1, Margin = new Thickness(6, 0, 6, 4) };
-            separator.SetResourceReference(Border.BackgroundProperty, "LineBrush");
-            content.Children.Add(separator);
-
-            if (!string.IsNullOrEmpty(notice))
-            {
-                content.Children.Add(MakeText(notice, 12, "MutedBrush", null,
-                    new Thickness(10, 4, 10, 8), TextWrapping.Wrap, 260));
-            }
-            else if (entries.Count == 0)
-            {
-                content.Children.Add(MakeText(L.T("KeePassXC 里没有匹配这个站点的条目"), 12, "MutedBrush", null,
-                    new Thickness(10, 4, 10, 8), TextWrapping.Wrap, 260));
-            }
-            else
-            {
-                foreach (var entry in entries) content.Children.Add(MakeCredentialRow(entry));
-            }
-
-            // 底部动作：重新扫描 + 重新取密码（对应 KeePassXC 插件的 reload）
-            var footer = new Border
-            {
-                Padding = new Thickness(10, 6, 10, 8),
-                Child = MakePopupButton(L.T("重新加载"), () =>
-                {
-                    if (_loginPopup != null) _loginPopup.IsOpen = false;
-                    OnLoginClick();
-                })
-            };
-            content.Children.Add(footer);
-
-            var root = new Border
-            {
-                CornerRadius = new CornerRadius(8),
-                BorderThickness = new Thickness(1),
-                Padding = new Thickness(2),
-                Child = content
-            };
-            root.SetResourceReference(Border.BackgroundProperty, "SurfaceBrush");
-            root.SetResourceReference(Border.BorderBrushProperty, "LineBrush");
-
-            _loginPopup = new Popup
-            {
-                Placement = PlacementMode.Bottom,
-                PlacementTarget = _loginButton,
-                VerticalOffset = 6,
-                StaysOpen = false,
-                AllowsTransparency = true,
-                Child = root
-            };
-            _loginPopup.IsOpen = true;
-        }
-
-        private FrameworkElement MakeCredentialRow(KeePassCredential entry)
-        {
-            var panel = new StackPanel { Orientation = Orientation.Vertical };
-            panel.Children.Add(MakeText(
-                string.IsNullOrEmpty(entry.Name) ? entry.Login : entry.Name, 12, "TextBrush"));
-            if (!string.IsNullOrEmpty(entry.Login) &&
-                !string.Equals(entry.Name, entry.Login, StringComparison.Ordinal))
-                panel.Children.Add(MakeText(entry.Login, 11, "MutedBrush"));
-
-            var row = new Border
-            {
-                Padding = new Thickness(10, 6, 10, 6),
-                CornerRadius = new CornerRadius(5),
-                Background = Brushes.Transparent,
-                Cursor = Cursors.Hand,
-                MinWidth = 200,
-                Child = panel
-            };
-            row.MouseEnter += (s, e) => row.SetResourceReference(Border.BackgroundProperty, "HoverBrush");
-            row.MouseLeave += (s, e) => row.Background = Brushes.Transparent;
-            row.MouseLeftButtonDown += (s, e) =>
-            {
-                e.Handled = true;
-                FillCredential(entry);
-            };
-            return row;
-        }
-
-        private FrameworkElement MakePopupButton(string text, Action action)
-        {
-            var label = MakeText(text, 11, "AccentBrush");
-            label.HorizontalAlignment = HorizontalAlignment.Center;
-
-            var button = new Border
-            {
-                Padding = new Thickness(8, 4, 8, 4),
-                CornerRadius = new CornerRadius(4),
-                Background = Brushes.Transparent,
-                Cursor = Cursors.Hand,
-                Child = label
-            };
-            button.MouseEnter += (s, e) => button.SetResourceReference(Border.BackgroundProperty, "HoverBrush");
-            button.MouseLeave += (s, e) => button.Background = Brushes.Transparent;
-            button.MouseLeftButtonDown += (s, e) =>
-            {
-                e.Handled = true;
-                if (action != null) action();
-            };
-            return button;
-        }
-
-        private async void FillCredential(KeePassCredential entry)
-        {
-            if (_loginPopup != null) _loginPopup.IsOpen = false;
             var tab = _active;
-            if (tab == null || _loginFields.Count == 0) return;
+            if (tab == null) return;
             var core = _browser.Core(tab);
             if (core == null) return;
+            await LoginFill.HidePickerAsync(core);
 
-            var ok = await LoginFill.FillActiveAsync(core, entry.Login, entry.Password);
+            bool ok;
+            if (formIndex >= 0 && _loginFields.Exists(f => f.index == formIndex))
+                ok = await LoginFill.FillAsync(core, formIndex, entry.Login, entry.Password);
+            else
+                ok = await LoginFill.FillActiveAsync(core, entry.Login, entry.Password);
             _toast.Show(ok ? L.T("已填充账号密码") : L.T("填充失败，页面结构可能变了"));
             if (!ok) RefreshLoginState(tab);
         }
 
-        private static TextBlock MakeText(string text, double size, string brushKey,
-            FontWeight? weight = null, Thickness? margin = null,
-            TextWrapping wrap = TextWrapping.NoWrap, double maxWidth = 0)
+        private static string Field(Dictionary<string, object> map, string key)
         {
-            var block = new TextBlock { Text = text ?? "", FontSize = size };
-            if (weight.HasValue) block.FontWeight = weight.Value;
-            if (margin.HasValue) block.Margin = margin.Value;
-            if (wrap != TextWrapping.NoWrap) block.TextWrapping = wrap;
-            if (maxWidth > 0) block.MaxWidth = maxWidth;
-            block.SetResourceReference(TextBlock.ForegroundProperty, brushKey);
-            return block;
+            object v;
+            return map.TryGetValue(key, out v) && v != null ? Convert.ToString(v) : "";
+        }
+
+        private static int IntField(Dictionary<string, object> map, string key)
+        {
+            int n;
+            return int.TryParse(Field(map, key), out n) ? n : -1;
         }
     }
 }

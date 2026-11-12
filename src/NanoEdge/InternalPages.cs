@@ -65,7 +65,7 @@ namespace NanoEdge
                 case Bookmarks: return new BookmarksPage(open, notify);
                 case Downloads: return new DownloadsPage(notify);
                 case Scripts: return new ScriptsPage(notify, currentSite);
-                case Settings: return new SettingsPage(settings);
+                case Settings: return new SettingsPage(settings, notify);
                 default: return new StartPage(settings);
             }
         }
