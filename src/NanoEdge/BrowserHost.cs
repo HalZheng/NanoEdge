@@ -119,7 +119,9 @@ namespace NanoEdge
         public event Action<TabModel> TitleChanged;
         public event Action<TabModel> UrlChanged;
         public event Action<TabModel> FaviconChanged;             // 页面图标（仅内存）
-        public event Action<string> OpenInNewTab;
+        // (url, 发起标签是否密封)：页面里 target=_blank / window.open 派生出来的标签
+        // 必须继承密封状态，否则保密网址会写进历史、标题和图标也会上屏（SPEC 0.15）。
+        public event Action<string, bool> OpenInNewTab;
         public event Action<TabModel> FlagsChanged;              // audio / downloads / devtools
         public event Action<TabModel, bool> RestoreCompleted;    // snapshot applied?
         public event Action<TabModel, string, bool> NavigationDone; // tab, url, success
@@ -136,6 +138,10 @@ namespace NanoEdge
         // 每个 CoreWebView2 当前挂着的注入脚本 id，改动脚本后要先移除再重加。
         private readonly Dictionary<CoreWebView2, List<string>> _injected =
             new Dictionary<CoreWebView2, List<string>>();
+        // core -> tab：重新注册脚本时要按 tab.IsSecret 决定注不注入登录/重登引导。
+        // 存的是 TabModel 引用，就地密封/解封翻转 IsSecret 后无需重建这张表。
+        private readonly Dictionary<CoreWebView2, TabModel> _coreTabs =
+            new Dictionary<CoreWebView2, TabModel>();
         // 同一次导航只跑一条 favicon 重试链：FaviconChanged 可能连发多次。
         private readonly HashSet<string> _faviconBusy = new HashSet<string>();
         private bool _applyingScripts;
@@ -343,6 +349,9 @@ namespace NanoEdge
 
         private async Task ConfigureAsync(WebView2 view, CoreWebView2 core, TabModel tab)
         {
+            // 记下 core 属于哪个 tab：RefreshScripts() 重注册脚本时要按 tab.IsSecret 门控，
+            // 而 IsSecret 是可以在原标签上就地翻转的，不能缓存成 bool。
+            _coreTabs[core] = tab;
             core.Settings.AreDevToolsEnabled = true;
             core.Settings.AreDefaultContextMenusEnabled = true;
             core.Settings.IsStatusBarEnabled = false;
@@ -394,14 +403,17 @@ namespace NanoEdge
                 if (string.IsNullOrEmpty(core.Source)) return;
                 tab.Url = core.Source;
                 // 跨站导航先换成目标站已有的图标（没有就清空），避免沿用上一站。
-                tab.Favicon = Favicons.Get(tab.Url);
+                // 密封标签连内存缓存里的图标都不能回填：图标本身会暴露「这个站点来过」。
+                tab.Favicon = tab.IsSecret ? null : Favicons.Get(tab.Url);
                 ApplyZoomForSite(tab);
                 UrlChanged?.Invoke(tab);
             };
             core.NewWindowRequested += (s, e) =>
             {
                 e.Handled = true;
-                OpenInNewTab?.Invoke(e.Uri);
+                // 页面发起的新窗口（target=_blank / window.open / 右键新窗口）继承密封状态；
+                // 用户主动 Ctrl+T 不走这里，仍是普通标签。
+                OpenInNewTab?.Invoke(e.Uri, tab.IsSecret);
             };
             core.NavigationCompleted += async (s, e) =>
             {
@@ -716,6 +728,12 @@ namespace NanoEdge
 
             var scripts = ScriptStore.All().Where(s => s.Enabled).ToList();
             var sources = new List<string>();
+            // 密封标签不注入任何「会跟宿主 UI / 凭据打交道」的脚本：
+            // 密码图标与重登条都会在屏幕上带出账号名或站点名，戳破伪装。
+            // 用户脚本和网页语言脚本是用户自己装的，不受这条门控影响。
+            TabModel owner;
+            _coreTabs.TryGetValue(core, out owner);
+            var secret = owner != null && owner.IsSecret;
             // 语言脚本排在最前：页面自己的脚本、用户脚本读 navigator.language 时
             // 拿到的已经是设置值。system 档返回空串，不注入。
             var languageScript = WebLanguage.Script(_webLanguage);
@@ -723,11 +741,13 @@ namespace NanoEdge
             sources.Add(ScriptEngine.Bootstrap());
             // 登录表单识别：只暴露 scan / fill 两个方法，不常驻观察器（内存口径见 SPEC 2）。
             // 设置页关掉「填充账号密码」后连脚本都不注入，页面里不留痕迹。
-            if (_settings.PasswordFill) sources.Add(LoginFill.ScriptFor(LoginFill.IconDataUri()));
+            if (!secret && _settings.PasswordFill)
+                sources.Add(LoginFill.ScriptFor(LoginFill.IconDataUri()));
             foreach (var script in scripts) sources.Add(ScriptEngine.Wrap(script));
             // 只有开了重登才注入这段引导器；它内部按站点 + 10 分钟标记双重判定，
             // 其它站点的页面即使被注入也不会有任何动作（F-12）。
-            if (PgAdminReloginConfig.AnyEnabled()) sources.Add(PgAdminReloginScripts.Document());
+            if (!secret && PgAdminReloginConfig.AnyEnabled())
+                sources.Add(PgAdminReloginScripts.Document());
 
             var ids = new List<string>();
             foreach (var source in sources)
@@ -745,6 +765,7 @@ namespace NanoEdge
             if (core == null) return;
             _injected.Remove(core);
             _languageFilters.Remove(core);
+            _coreTabs.Remove(core);
         }
 
         // ---------- 崩溃恢复 ----------
@@ -796,6 +817,7 @@ namespace NanoEdge
         public void ResetAfterBrowserCrash(IEnumerable<TabModel> tabs)
         {
             _injected.Clear();
+            _coreTabs.Clear();
             _languageFilters.Clear();
             foreach (var tab in tabs.ToList())
             {
@@ -1076,6 +1098,7 @@ namespace NanoEdge
             _views.Clear();
             _webviews.Clear();
             _injected.Clear();
+            _coreTabs.Clear();
             _languageFilters.Clear();
         }
 

@@ -6,7 +6,7 @@
 |---|---|
 | 版本 | **v1.3（三态内存模型）** |
 | 日期 | 2026-11-04 |
-| 状态 | 决策已冻结；v1.3 三态内存模型；M1 / M2 / M3-a/b/c / **M4** / **M5（简化版）** / **M6-a（发布收尾）** / **M6-b（双语 + 设置）** / **M7（对照补齐）** / **M8（脚本能力）** / **C6（书签导入向导）已实现**（0.7 / 0.8+0.9 / 0.10 / 0.11 / 0.12 / 0.14 / 0.15 / 0.16 / 0.17 / 0.18 / 0.19 / 0.20 / 0.21）；**M3-d 因无测试环境跳过**（0.13）；**P0 17 项全部完成** |
+| 状态 | 决策已冻结；v1.3 三态内存模型；M1 / M2 / M3-a/b/c / **M4** / **M5（简化版）** / **M6-a（发布收尾）** / **M6-b（双语 + 设置）** / **M7（对照补齐）** / **M8（脚本能力）** / **C6（书签导入向导）已实现**（0.7 / 0.8+0.9 / 0.10 / 0.11 / 0.12 / 0.14 / 0.15 / 0.16 / 0.17 / 0.18 / 0.19 / 0.20 / 0.21 / 0.22）；**M3-d 因无测试环境跳过**（0.13）；**P0 17 项全部完成** |
 | 目标平台 | Windows 10 1809+ / Windows 11，x64 |
 | 代号 | NanoEdge |
 
@@ -448,6 +448,8 @@
 
 验证：`--m6btest` **34/34**（新增 zh / en 两条「说明里必须提到注册通知身份」断言，英文页依旧无中文泄漏）、`--fixtest` **298/298**（新增该说明必须有英文词条的断言）、`--m5test` 50/50。Release 0 警告 0 错误，`out/NanoEdge-latest.exe` 同步。
 
+**补记 5（2026-11-13）：派生标签与新老功能交叉的漏口，见 0.22**。0.15 定的「屏幕可见 + 磁盘留存都要堵」当时只覆盖了标签自己，没覆盖它派生出来的标签，也没覆盖后来 0.1.7 才加的密码填充 / 重登引导。本批把这两处补齐，**没有重开独立 Profile / 防截屏 / DPAPI 的决策**；验证 `--m5test` 61/61、`--logintest` 56/56。
+
 ### 0.16 M6-a：发布收尾（2026-11-04 22:55）
 
 **范围**：图标落地、默认浏览器注册、外部唤起、崩溃恢复、Release 打包。**不含双语与设置界面**（仍属 M6-b，见 12 章）。产物 **854,016 字节（约 834KB，较 M5 +69,632 字节）**，`dist/NanoEdge-0.1-win64.zip` **556,322 字节**，0 警告 0 错误。
@@ -677,6 +679,49 @@
 **实测（`--fixtest` 283/283 PASS）**：新增 8 条断言，覆盖源库含 4 层 Folder + 1 条未分组、导出 HTML 含 4 个 `<H3>` 层级、特殊字符转义、导出前后 `bookmarks.json` 字节完全一致、`ImportNetscapeHtml` 读回 5 条且 `Folder` / `Title` / `Url` 逐条一致、未分组仍为空。样例 HTML 785 字节。
 
 **明确不做**：导出时改写 / 去重 / 排序书签；导出其它格式（JSON / CSV）；`ADD_DATE`、图标等 Chrome 私有属性（导入正则不读，写了是净复杂度）；把「导入 HTML」也改成向导（那是另一个候选，本批不捎带）。
+
+---
+
+### 0.22 密封标签漏口修复 + 保存新密码（2026-11-13）
+
+**背景**：功能差距评审（对照 ZZZ / Edge）后，用户点名先做两件：① 密封标签派生标签与脚本注入的漏口；② 密码填充补「保存新密码」。两件都不引入新产品概念，P1/P2 一项未动，**没有重开 0.15 砍掉的独立 Profile / 防截屏 / DPAPI**。
+
+#### 1. 密封标签：派生标签与新老功能交叉
+
+| 漏口 | 修法 |
+|---|---|
+| `NewWindowRequested` 只把 `e.Uri` 传给宿主，`NewTab` 的 `secret` 默认 false —— 密封标签里点 `target=_blank` / `window.open` 会开普通标签，网址进历史、标题和图标上屏 | `OpenInNewTab` 事件改成 `(url, secret)`，`ConfigureAsync` 的闭包把 `tab.IsSecret` 一起带过去；`MainWindow` 订阅端 `NewTab(url, null, secret)`。用户主动 `Ctrl+T` 不走这条路径，仍是普通标签 |
+| `SourceChanged` 会从内存 favicon 缓存回填图标，就地密封清掉的图标导航后又回来 | 密封标签不回填，`Favicon = null` |
+| `ApplyScriptsAsync` 只看设置、不看 tab，密封标签里照样注入 KeePassXC 图标（点击弹账号名）与 pgAdmin 重登引导（条上带站点名） | `BrowserHost._coreTabs` 记 core→TabModel（存引用，就地翻转 `IsSecret` 立即生效）；重注册脚本时按 `tab.IsSecret` 跳过这两段。用户脚本、网页语言脚本、脚本引导器不受影响 |
+| 宿主侧单点门控，页面可伪造 `postMessage` | `OnLoginUiMessage` / `OnLoginClick` / `FillCredential` / `RefreshLoginState` 全部再加一道 `IsSecret`；`ReloginPageEligible` 不显示重登条；`Ctrl+D` 的提示改成中性的「当前页面不能收藏」，不再把「密封」显示在屏幕上 |
+
+**诚实边界不变**：Cookie / 缓存仍写共享 WebView2 用户目录，密封标签不是真无痕（7.4）。
+
+#### 2. 保存新密码（`set-login`）
+
+**决策变更**：7.15 的「明确不做：保存新密码回库」取消。凭据仍**只交给 KeePassXC**，NanoEdge 不存密码——`set-login` 是把新密码写进 KeePassXC 的数据库，不是浏览器自建密码库，不违背 1.4 与合规口径。
+
+| 层 | 落地 |
+|---|---|
+| 协议 | `KeePassBridge.SetLoginPayload`（纯函数，官方字段 `action/url/submitUrl/id/login/password/group/groupUuid/uuid/downloadFavicon`）+ `SetLoginAsync`。`id` 用 associate 返回的连接名；`downloadFavicon=false` 不额外发网络请求。前置链路（配置 / proxy 会话 / 握手 / `test-associate`）抽成 `TryOpenAssociatedSession`，与 `get-logins` 共用一份 |
+| 页面 | `LoginFill` 只挂**一个** document 级 `submit` 捕获监听：不 `preventDefault`、不自动提交、不常驻 MutationObserver。密码只在「页面 → 宿主」这个方向出现；库里的密码仍不会下发到页面脚本。刚从 KeePassXC 填充过（30s）或 5 秒内重复提交都不再问 |
+| 宿主 | `neLogin:"save"` 在 `WebMessageReceived` 里分流到 `OnLoginUiMessage`；宿主**不直接写库**，先弹 8 秒确认条「要把这个账号保存到 KeePassXC 吗？/ 保存」，点之前再判一次标签仍是当前且非密封。网址只取 `tab.Url`，不用页面给的 URL（防止把凭据存到伪造站点名下） |
+| 密封标签 | 不注入脚本 + 宿主拒绝消息，双端都不弹、不写 |
+| 文案 | `Locale.cs` 中英各 2 条；按钮「保存」复用已有词条 |
+
+**代价与影响**：内存 —— 不新增 WebView2 / 常驻进程，每个有登录框的文档多 1 个 submit 监听、每标签多 1 项 core→tab 映射，可忽略；体积 —— 无新依赖 / 资源，Release 单 exe **2,014,720 字节（约 1.92MB）**，仍在 ≤3MB 内；体验 —— 保密页点链接不再泄露，新站点注册不再需要切到 KeePassXC 手建条目。密码在确认条存续期间（最长 8 秒）留在宿主内存闭包里，不写日志、不落盘、不进快照；点掉即释放。
+
+**验证**：`--m5test` **61/61**（新增 11 条：反射触发真实事件订阅链，断言派生标签继承密封、标题伪装、不进历史/会话、无 favicon，普通标签派生仍普通）；`--logintest` **56/56**（新增 7 条：submit 只发一次、不拦截提交、重复提交去重、填充后不再问、密封标签拒绝伪造消息、`set-login` 请求体字段）；`--kpxctest=get` **7 PASS**（真机只读，证明重构前置链路没改坏 `get-logins`）；`--kpxctest=set` **6 PASS**（真机写入 `set-login -> Ok`，读回闭环见下）。全量回归 13 组自测全 PASS：`--memtest` 8、`--navtest` 30、`--m3ctest` 54、`--m4test` 133、`--m6test` 23、`--m6btest` 34、`--m7test` 31、`--m8test` 48、`--fixtest` 303、`--m9test` 94、`--m10test` 28、`--m5test` 61、`--logintest` 56。Release 0 警告 0 错误。截图 `out/login-save-toast.png`（确认条）、`out/login-icons.png`、`out/m5-window.png` 等。
+
+**真机写入已验证（2026-11-13 13:33）**：
+`NanoEdge.exe --kpxctest=set --url=https://ne-smoke-20261113.invalid/login --login=ne-smoke --password=<一次性>`
+→ `PASS set-login -> Ok`，合计 **6 PASS / 0 FAIL**，KeePassXC 没弹保存框、直接返回 success。写入用独立域名，不碰已有的 `spike-test` 条目。
+
+**写入→读回闭环没自动验成**：随后用 `--kpxctest=get --url=<同一独立域名>` 取回时，`get-logins` 20 秒超时——新建条目还没有访问授权，KeePassXC 会弹「确认访问」对话框等人点，自动化环境里没人点。这不否定写入成功，但闭环证据仍缺，需要在 KeePassXC 里目视确认。**这条一次性测试条目用完请删掉**。
+
+不带三个参数时 `set` 模式只打印说明、不写库（已验证）；`get` 模式的凭据断言已改为可用 `--login / --password` 指定，不再写死 example.com。该改动只影响 `--kpxctest` 自身，不涉及其余自测。
+
+**明确不做**：TOTP / passkey / 剪贴板兜底 / 自动提交 / 跨域 iframe 填充；主动指定 `uuid` 去更新已有条目（留空交给 KeePassXC 判重）；把凭据存进 NanoEdge 自己的文件；为保存功能新增设置开关（随「填充账号密码」一起启停）。
 
 ---
 
@@ -1396,6 +1441,7 @@ UI 主色 `#FF4D9D` 不变。**图标已验收通过，定稿。**
 | 切换 | **当前标签就地 toggle**：按 `Alt+\`` 翻转 `_active.IsSecret`，同步刷新标题（「文档」⇄ 真实标题）、地址栏（空 ⇄ 真实 URL）、清掉站点图标；**不新建标签、不跳到别的标签、页面内容与 WebView2 不动**。走应用内消息泵，**不是 `RegisterHotKey` 全局热键**：窗口不在前台时不生效。键位可在设置页「隐私 → 切换密封标签快捷键」重新录入（`AppSettings.SecretHotkey`，拒绝裸键与宿主已占用组合），主菜单按当前状态显示「密封当前标签 / 解除密封」。不弹 Toast（屏幕可见会露馅） |
 | 通知 | 设置项 `SecretNotifications`（默认关）：关闭时对密封标签的 `Notification` 权限请求直接 `Deny + Handled + 不写 profile`，打开时 `Allow`；`NotificationReceived` 再兜一层（开关关着就丢弃）。**「关」实测有效，「开」在本机弹不出 toast，见 0.15 补记 4** |
 | 不留痕 | 缩放不写 `zoom.json`、丢弃快照不落盘、下载记录不写站点 host、导航日志写 `(secret)` 而不是 URL、导航失败 Toast 不显示 host |
+| 派生标签 / 交叉门控（0.22） | 页面里 `target=_blank` / `window.open` / 右键新窗口触发的 `NewWindowRequested` 把 `IsSecret` 一起带给宿主，新标签继承密封；`SourceChanged` 不再回填缓存 favicon。密封标签不注入密码填充脚本与 pgAdmin 重登引导，宿主也拒绝页面伪造的 `neLogin` 消息；重登条不显示，收藏提示改用中性文案（不出现「密封」二字）。用户脚本与网页语言脚本不受这条门控影响 |
 | 多标签 | 每个标签各自独立密封/解封；快捷键只作用于当前标签，不轮换、不跳转。主菜单「新建密封标签」仍可开空白密封页 |
 | 边界 | 不做独立 Profile（Cookie / 缓存与主浏览器共享）、不做防截屏（录屏和截图能看到页面）、不做静态加密。同机同账户的其他程序能看到浏览数据，不夸大 |
 
@@ -1672,8 +1718,10 @@ KeePassXC 里填连接名并点「保存并允许访问」（不能静默完成�
 页面截图用 `CapturePreviewAsync` 抓真实 WebView2 内容。
 协议层另有 `--kpxctest`（6 checks，真取回明文并比对）。
 
-**明确不做**：保存新密码回库（`set-login`）、TOTP（`get-totp`）、passkey、剪贴板兜底、
-自动提交、跨域 iframe。
+**保存新账号（0.22）**：`set-login` 已实现，凭据仍只交给 KeePassXC，NanoEdge 不存；
+交互、门控与验证口径见 0.22。
+
+**明确不做**：TOTP（`get-totp`）、passkey、剪贴板兜底、自动提交、跨域 iframe。
 
 **图标许可**：输入框内图标用的是 KeePassXC 官方 logo（取自其安装目录 `share/icons`），
 许可跟随 KeePassXC 的 GPL-3.0；正式对外发版前需要在 README 注明来源。
@@ -1998,3 +2046,4 @@ v1.1 属于 Phase 0 实测驱动的数据修订（0.3），只改内存模型与
 9. **遗留验收债**：2 章 900MB 目标与 2.1 真实 dev 站点内存阶梯未验证，有 pgAdmin / eck 环境时单独补测回填；
 10. **下一批候选**：起始页历史推荐与拖拽排序（7.8 剩余部分）；跨断点布局提示与 `<900px` 标签条折叠（5.1/5.2）；脚本侧 `GM_download` / `@resource` / `GM_registerMenuCommand`（对照报告判收益低，未排）。等用户点名再做；
 11. **发布收尾**：`dist/NanoEdge-0.1-win64.zip` 仍是 M6-a 的旧包，需要发布时重新打包。
+12. **0.22（2026-11-13）已完成**：密封标签派生标签继承与脚本门控、密码填充补 `set-login`；P1/P2 一项未动。真机 `set-login` 写入已验证返回 Ok；写入→读回闭环因 KeePassXC 访问确认弹框未自动验成，需在 KeePassXC 里目视确认并删除测试条目，见 0.22。

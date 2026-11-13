@@ -155,6 +155,8 @@ function fillAt(index, user, pass){
   if (u && user) setValue(u, user);
   setValue(pw, pass);
   try { pw.focus(); } catch(e){}
+  // 刚从库里填过的账号，提交时不要再弹一次「是否保存」。
+  justFilledUntil = Date.now() + 30000;
   return { ok: true, userFilled: !!u };
 }
 
@@ -205,12 +207,51 @@ function placeAll(){
   }
 }
 
+// ---------- 提交时把「自己敲的新账号」交给宿主 ----------
+// 只挂一个 document 级捕获监听：不常驻 MutationObserver、不阻止提交、不自动提交。
+// 密码只在「页面 -> 宿主」这个方向出现；库里的密码永远不会下发到页面脚本。
+var savePosts = 0;
+var justFilledUntil = 0;
+var lastSaveAt = 0;
+
+function credentialsFrom(form){
+  var doc = form ? (form.ownerDocument || document) : document;
+  var scope = form || doc;
+  var pws;
+  try { pws = scope.querySelectorAll('input[type=password]'); } catch(e){ return null; }
+  var pw = null, i;
+  for (i = 0; i < pws.length; i++) if (pws[i].value) { pw = pws[i]; break; }
+  if (!pw) return null;
+  var user = findUser(pw);
+  return {
+    login: user ? String(user.value || '') : '',
+    password: String(pw.value || ''),
+    url: String((doc.location && doc.location.href) || location.href || ''),
+    submitUrl: String((form && form.action) || '')
+  };
+}
+
+function onSubmit(ev){
+  // 不 preventDefault、不 stopPropagation：提交还是页面自己的事。
+  if (window.top !== window) return;
+  var now = Date.now();
+  if (now < justFilledUntil) return;        // 刚从 KeePassXC 填过的，别再问一遍
+  if (now - lastSaveAt < 5000) return;      // 连点 / 重复提交只问一次
+  var c = credentialsFrom(ev.target);
+  if (!c || !c.password) return;
+  lastSaveAt = now;
+  savePosts++;
+  c.neLogin = 'save';
+  post(c);
+}
+
 function listen(){
   if (listening) return;
   listening = true;
   try {
     window.addEventListener('scroll', placeAll, true);
     window.addEventListener('resize', placeAll, true);
+    document.addEventListener('submit', onSubmit, true);
   } catch(e){}
 }
 
@@ -362,7 +403,9 @@ window.__neLogin = {
   installIcons: installIcons, removeIcons: clearIcons,
   iconCount: function(){ return icons.length; },
   showPicker: showPicker, hidePicker: hidePicker,
-  pickerVisible: function(){ return !!picker; }
+  pickerVisible: function(){ return !!picker; },
+  savePosts: function(){ return savePosts; },
+  resetSaveForTest: function(){ justFilledUntil = 0; lastSaveAt = 0; return 0; }
 };
 return 'installed';
 })()";
@@ -430,6 +473,21 @@ return 'installed';
                 "(function(){ return window.__neLogin ? window.__neLogin.iconCount() : -1; })()");
             int n;
             return int.TryParse(raw, out n) ? n : 0;
+        }
+
+        // 自测观测点：页面提交时到底往宿主发了几次「保存」消息（不 mock DOM）。
+        internal static async Task<int> SavePostsAsync(CoreWebView2 core)
+        {
+            var raw = await EvalAsync(core,
+                "(function(){ return window.__neLogin ? window.__neLogin.savePosts() : -1; })()");
+            int n;
+            return int.TryParse(raw, out n) ? n : -1;
+        }
+
+        internal static Task ResetSaveForTestAsync(CoreWebView2 core)
+        {
+            return EvalAsync(core,
+                "(function(){ return window.__neLogin ? window.__neLogin.resetSaveForTest() : -1; })()");
         }
 
         // 只把条目名和用户名送进页面，密码留在宿主内存里。

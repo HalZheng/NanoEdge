@@ -10,8 +10,14 @@ namespace NanoEdge
         // =====================================================================
         // 登录填充的宿主层（SPEC 7.15）
         // 图标和账号下拉都在页面里（LoginFill.cs 注入的 DOM），这里只负责：
-        // 收到图标/条目的消息 -> 向 KeePassXC 取凭据 -> 按表单索引填充。
-        // 密码只在「填充」这一瞬间经过宿主内存，不下发到页面脚本、不写日志。
+        // 收到图标/条目的消息 -> 向 KeePassXC 取凭据 -> 按表单索引填充；
+        // 以及用户自己提交新账号时 -> 先问一句 -> 交给 KeePassXC 保存。
+        //
+        // 两个方向的口令不同：
+        //   填充：库里的密码只在 fill() 调用那一瞬间经过宿主内存，下拉只收 {name, login}。
+        //   保存：密码由页面读出来经 postMessage 送到宿主，宿主立刻加密发给 KeePassXC，
+        //         确认条存续期间只在宿主内存里，绝不写日志、不落盘、不进快照。
+        // NanoEdge 自己从不保存密码。
         // =====================================================================
 
         private List<LoginField> _loginFields = new List<LoginField>();
@@ -20,7 +26,9 @@ namespace NanoEdge
 
         private void OnLoginUiMessage(TabModel tab, string json)
         {
-            if (tab == null || !ReferenceEquals(tab, _active) || !_settings.PasswordFill) return;
+            // 双端拒绝：密封标签里既不注入登录脚本，宿主也不接受页面伪造的消息。
+            if (tab == null || tab.IsSecret || !ReferenceEquals(tab, _active) ||
+                !_settings.PasswordFill) return;
             Dictionary<string, object> msg;
             try { msg = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(json); }
             catch { return; }
@@ -37,12 +45,17 @@ namespace NanoEdge
                     var unused = FillCredential(_loginEntries[entry], index);
                 }
             }
+            if (kind == "save") { OfferSaveLogin(tab, msg); return; }
         }
 
         // 导航完成后调用：扫一次页面，顺手把输入框内的图标装好/重定位。
         private async void RefreshLoginState(TabModel tab)
         {
-            if (!_settings.PasswordFill) { HideLoginIcons(); return; }
+            if (!_settings.PasswordFill || (tab != null && tab.IsSecret))
+            {
+                HideLoginIcons();
+                return;
+            }
             // SelectTab 在会话恢复/内核重启时也可能早于 _browser 初始化，挡一道。
             if (tab == null || tab != _active || _browser == null) return;
             var core = _browser.Core(tab);
@@ -50,7 +63,7 @@ namespace NanoEdge
             try
             {
                 var fields = await LoginFill.ScanAsync(core);
-                if (tab != _active) return;
+                if (tab != _active || tab.IsSecret) return;
                 _loginFields = fields;
                 await LoginFill.InstallIconsAsync(core);
             }
@@ -69,7 +82,7 @@ namespace NanoEdge
         {
             if (_loginBusy || !_settings.PasswordFill) return;
             var tab = _active;
-            if (tab == null) return;
+            if (tab == null || tab.IsSecret) return;
             var core = _browser.Core(tab);
             if (core == null) return;
 
@@ -79,7 +92,7 @@ namespace NanoEdge
                 // 点之前重扫：页面可能在导航之后才把表单渲染出来，
                 // 同时把图标位置刷新到最新布局。
                 var fields = await LoginFill.ScanAsync(core);
-                if (tab != _active) return;
+                if (tab != _active || tab.IsSecret) return;
                 _loginFields = fields;
                 await LoginFill.InstallIconsAsync(core);
                 if (fields.Count == 0)
@@ -90,14 +103,14 @@ namespace NanoEdge
 
                 var url = tab.Url ?? "";
                 var result = await KeePassBridge.GetLoginsAsync(url);
-                if (tab != _active) return;
+                if (tab != _active || tab.IsSecret) return;
 
                 if (result.Status == KeePassStatus.NotAssociated)
                 {
                     // 首次使用：走一次关联，KeePassXC 会弹窗要用户点允许
                     _toast.Show(L.T("请在 KeePassXC 弹窗里允许 NanoEdge 访问"));
                     var assoc = await KeePassBridge.AssociateAsync("NanoEdge", TimeSpan.FromSeconds(120));
-                    if (tab != _active) return;
+                    if (tab != _active || tab.IsSecret) return;
                     if (assoc.Status != KeePassStatus.Ok)
                     {
                         _toast.Show(KeePassBridge.StatusText(assoc.Status) +
@@ -105,7 +118,7 @@ namespace NanoEdge
                         return;
                     }
                     result = await KeePassBridge.GetLoginsAsync(url);
-                    if (tab != _active) return;
+                    if (tab != _active || tab.IsSecret) return;
                 }
 
                 if (!result.Ok)
@@ -140,7 +153,7 @@ namespace NanoEdge
         private async Task FillCredential(KeePassCredential entry, int formIndex)
         {
             var tab = _active;
-            if (tab == null) return;
+            if (tab == null || tab.IsSecret) return;
             var core = _browser.Core(tab);
             if (core == null) return;
             await LoginFill.HidePickerAsync(core);
@@ -152,6 +165,44 @@ namespace NanoEdge
                 ok = await LoginFill.FillActiveAsync(core, entry.Login, entry.Password);
             _toast.Show(ok ? L.T("已填充账号密码") : L.T("填充失败，页面结构可能变了"));
             if (!ok) RefreshLoginState(tab);
+        }
+
+        // ---------- 保存新账号（set-login） ----------
+
+        // 页面提交登录表单时把这次自己敲的账号密码送上来。宿主不直接写库：
+        // 先弹确认条，用户点了「保存」才发给 KeePassXC。
+        private void OfferSaveLogin(TabModel tab, Dictionary<string, object> msg)
+        {
+            var login = Field(msg, "login");
+            var password = Field(msg, "password");
+            var submitUrl = Field(msg, "submitUrl");
+            if (string.IsNullOrEmpty(password) || password.Length > 4096) return;
+            if (login.Length > 512 || submitUrl.Length > 2048) return;
+            // 页面给的 url 不可信：只用当前标签的 URL，避免把凭据存到伪造的站点名下。
+            var siteUrl = tab.Url ?? "";
+            if (string.IsNullOrEmpty(siteUrl) || siteUrl.Length > 2048) return;
+
+            _toast.Show(L.T("要把这个账号保存到 KeePassXC 吗？"), L.T("保存"),
+                () => SaveLoginAsync(tab, siteUrl, login, password, submitUrl), 8000);
+        }
+
+        private async void SaveLoginAsync(TabModel tab, string url, string login,
+            string password, string submitUrl)
+        {
+            // 确认条可能 8 秒后才被点到，点之前再判一次：切走了 / 就地密封了就不写库。
+            if (tab == null || !ReferenceEquals(tab, _active) || tab.IsSecret ||
+                !_settings.PasswordFill) return;
+            try
+            {
+                var result = await KeePassBridge.SetLoginAsync(url, login, password, submitUrl);
+                // 迟到的结果不落在密封页上，也不带站点名。
+                if (_active != null && _active.IsSecret) return;
+                _toast.Show(result.Ok
+                    ? L.T("已保存到 KeePassXC")
+                    : KeePassBridge.StatusText(result.Status) +
+                      (string.IsNullOrEmpty(result.Message) ? "" : "：" + result.Message));
+            }
+            catch (Exception ex) { Diagnostics.Log("save login failed: " + ex.Message); }
         }
 
         private static string Field(Dictionary<string, object> map, string key)

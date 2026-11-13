@@ -354,6 +354,87 @@ setTimeout(function(){
                 _w._settings.PasswordFill = true;
                 _w.OnSettingChanged("password");
                 await Task.Delay(300);
+
+                // ---------- 保存新账号（set-login 的页面侧 / 宿主门控） ----------
+                // 只有「自己敲的密码 + 提交」才发一次保存请求；刚从库里填充的不重复问。
+                await LoginFill.InstallIconsAsync(core);       // 确保 submit 监听已挂
+                await LoginFill.ResetSaveForTestAsync(core);   // 清掉前面填充留下的 30s 抑制
+                Check(await LoginFill.SavePostsAsync(core) == 0, "初始没有保存请求");
+
+                var dispatch =
+                    "(function(){var f=document.getElementById('f1');" +
+                    "var e=new Event('submit',{bubbles:true,cancelable:true});" +
+                    "f.dispatchEvent(e);return e.defaultPrevented?'yes':'no';})()";
+                await core.ExecuteScriptAsync(
+                    "(function(){document.querySelector('#f1 input[name=username]').value='new-user';" +
+                    "document.querySelector('#f1 input[name=password]').value='new-pass-123';})()");
+                Check(await EvalAsync(core, dispatch) == "no",
+                      "保存监听不拦截页面提交（不 preventDefault、不自动提交）");
+                await Task.Delay(200);
+                Check(await LoginFill.SavePostsAsync(core) == 1,
+                      "提交自己填的账号时发出一次保存请求");
+
+                await EvalAsync(core, dispatch);
+                await Task.Delay(150);
+                Check(await LoginFill.SavePostsAsync(core) == 1, "5 秒内重复提交不重复询问");
+
+                await LoginFill.ResetSaveForTestAsync(core);
+                await LoginFill.FillAsync(core, 0, "from-kpxc", "kpxc-pass");
+                await EvalAsync(core, dispatch);
+                await Task.Delay(150);
+                Check(await LoginFill.SavePostsAsync(core) == 1,
+                      "刚从 KeePassXC 填充后提交不再问保存");
+
+                // 双端拒绝：密封标签里连页面伪造的 save 消息都不接（Toast 文本必须不变）。
+                _w._toast.Hide();
+                var toastBefore = CollectText(_w._toast.Visual);
+                var activeTab = _w._active;
+                activeTab.IsSecret = true;
+                _w.OnLoginUiMessage(activeTab,
+                    "{\"neLogin\":\"save\",\"login\":\"fake\",\"password\":\"fake-pass\"}");
+                var toastAfter = CollectText(_w._toast.Visual);
+                activeTab.IsSecret = false;
+                Check(toastBefore == toastAfter, "密封标签里宿主拒绝伪造的保存消息");
+
+                // 请求体字段：纯函数，不连 KeePassXC、不写密码库。
+                var payload = KeePassBridge.SetLoginPayload("https://example.com/",
+                    "alice", "s3cret", "https://example.com/login", "NanoEdge-Test");
+                Check((string)payload["action"] == "set-login" &&
+                      (string)payload["id"] == "NanoEdge-Test" &&
+                      (string)payload["url"] == "https://example.com/" &&
+                      (string)payload["login"] == "alice" &&
+                      (string)payload["password"] == "s3cret" &&
+                      (string)payload["downloadFavicon"] == "false" &&
+                      !payload.ContainsKey("keys"),
+                      "set-login 请求体字段与官方协议一致（id 用 associate 返回的连接名）");
+
+                // 确认条截图：渲染真实的 Toast 控件，不是 mock；点击动作留空，绝不写库。
+                _w._toast.Show(L.T("要把这个账号保存到 KeePassXC 吗？"), L.T("保存"),
+                    () => { }, 8000);
+                await Task.Delay(150);
+                CaptureToast("login-save-toast.png");
+                _w._toast.Hide();
+            }
+
+            private void CaptureToast(string fileName)
+            {
+                try
+                {
+                    var el = _w._toast.Visual;
+                    el.Measure(new Size(360, 60));
+                    el.Arrange(new Rect(0, 0, 360, 60));
+                    el.UpdateLayout();
+                    var bmp = new RenderTargetBitmap(720, 120, 192, 192, PixelFormats.Pbgra32);
+                    bmp.Render(el);
+                    var encoder = new PngBitmapEncoder();
+                    encoder.Frames.Add(BitmapFrame.Create(bmp));
+                    var dir = Path.Combine(_root ?? Path.GetTempPath(), "out");
+                    Directory.CreateDirectory(dir);
+                    var path = Path.Combine(dir, fileName);
+                    using (var stream = File.Create(path)) encoder.Save(stream);
+                    Line("确认条截图 " + fileName + " = " + new FileInfo(path).Length + " 字节");
+                }
+                catch (Exception ex) { Line("确认条截图失败：" + ex.Message); }
             }
 
             // 5 秒兜底扫描：表单在导航约 3 秒后才渲染，600/2000ms 两次必然落空，

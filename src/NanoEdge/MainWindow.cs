@@ -424,7 +424,9 @@ namespace NanoEdge
                 // SPA 里地址变了但不一定有 NavigationCompleted，站点门控必须跟着重算。
                 if (isActive && _reloginBar != null) _reloginBar.RefreshVisibility();
             };
-            _browser.OpenInNewTab += url => NewTab(url);
+            // 页面发起的新窗口继承发起标签的密封状态；用户主动 Ctrl+T 仍是普通标签。
+            // 只传 URL 会让密封标签里点开的链接变成普通标签，网址立刻进历史、标题上屏。
+            _browser.OpenInNewTab += (url, secret) => NewTab(url, null, secret);
             _browser.PlaceholderFactory = MakePlaceholder;
             _browser.NavigationDone += OnNavigationDone;
             _browser.LoginUiMessage += OnLoginUiMessage;
@@ -3989,7 +3991,8 @@ namespace NanoEdge
             if (tab == null) return;
             if (tab.IsSecret)
             {
-                _toast.Show(L.T("密封标签不能收藏"));
+                // 提示里不能出现「密封」两个字：Toast 是屏幕可见的，等于把状态说出去。
+                _toast.Show(L.T("当前页面不能收藏"));
                 return;
             }
             if (tab.IsStartPage || !string.IsNullOrEmpty(tab.InternalPage) ||

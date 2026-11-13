@@ -548,6 +548,136 @@ namespace NanoEdge
             });
         }
 
+        // ---------------- 保存新账号（KeePassXC-Browser 的 set-login） ----------------
+
+        // 纯函数：自测直接断言字段，不碰 proxy、不写任何文件。
+        // 字段与 keepassxc-browser 的 keepassxc-protocol.md 一致；请求体里不需要 nonce
+        // ——KeePassXC 用外层 frame 的 nonce 解密（get-logins 已在本机实测）。
+        internal static Dictionary<string, object> SetLoginPayload(string url, string login,
+            string password, string submitUrl, string connectionId)
+        {
+            return new Dictionary<string, object>
+            {
+                { "action", "set-login" },
+                { "url", url ?? "" },
+                { "submitUrl", submitUrl ?? "" },
+                // 必须是 associate 返回的连接名，不能用 clientID（errorCode 15 的坑见 SPIKE）。
+                { "id", connectionId ?? "" },
+                { "login", login ?? "" },
+                { "password", password ?? "" },
+                { "group", "" }, { "groupUuid", "" }, { "uuid", "" },
+                // 不让 KeePassXC 为了图标再发一次网络请求（SPEC 7.8 零额外请求口径）。
+                { "downloadFavicon", "false" }
+            };
+        }
+
+        internal static Task<KeePassResult> SetLoginAsync(string url, string login,
+            string password, string submitUrl)
+        {
+            return Task.Run(() => SetLoginCore(url, login, password, submitUrl));
+        }
+
+        private static KeePassResult SetLoginCore(string url, string login,
+            string password, string submitUrl)
+        {
+            var result = new KeePassResult();
+            if (string.IsNullOrWhiteSpace(url) || string.IsNullOrEmpty(password))
+            {
+                result.Status = KeePassStatus.Error;
+                result.Message = "网址或密码为空";
+                return result;
+            }
+
+            KeePassConfig config;
+            KeePassResult failure;
+            Session session;
+            if (!TryOpenAssociatedSession(out session, out config, out failure)) return failure;
+            using (session)
+            {
+                string error;
+                // 这里不写日志、不落盘：明文只在本方法栈里，加密后交给 proxy。
+                var response = SendEncrypted(session, "set-login",
+                    SetLoginPayload(url, login, password, submitUrl, config.ConnectionId),
+                    TimeSpan.FromSeconds(25), out error);
+                if (response == null)
+                {
+                    result.Status = string.Equals(error, "timeout", StringComparison.Ordinal)
+                        ? KeePassStatus.Timeout : KeePassStatus.Error;
+                    result.Message = error ?? "";
+                    return result;
+                }
+                if (!IsSuccess(response))
+                {
+                    result.Status = KeePassStatus.Error;
+                    result.Message = string.IsNullOrEmpty(error) ? ResponseError(response) : error;
+                    return result;
+                }
+                result.Status = KeePassStatus.Ok;
+                return result;
+            }
+        }
+
+        // get-logins / set-login 共用的前置链路：关联配置 -> proxy 会话 -> 握手
+        // -> 本次会话里 test-associate。失败时把 session 收干净，不让子进程挂着。
+        private static bool TryOpenAssociatedSession(out Session session,
+            out KeePassConfig config, out KeePassResult failure)
+        {
+            session = null;
+            config = null;
+            failure = new KeePassResult();
+
+            var cfg = LoadConfig();
+            if (cfg == null)
+            {
+                failure.Status = KeePassStatus.NotAssociated;
+                failure.Message = "尚未与 KeePassXC 建立关联";
+                return false;
+            }
+            if (string.IsNullOrEmpty(DecodeSecret(cfg)))
+            {
+                failure.Status = KeePassStatus.NotAssociated;
+                failure.Message = "关联密钥无法解密，需要重新关联";
+                return false;
+            }
+
+            KeePassStatus status;
+            string message;
+            var s = StartSession(out status, out message);
+            if (s == null)
+            {
+                failure.Status = status;
+                failure.Message = message;
+                return false;
+            }
+            if (!Handshake(s, TimeSpan.FromSeconds(10)))
+            {
+                s.Dispose();
+                failure.Status = KeePassStatus.NotRunning;
+                failure.Message = "与 KeePassXC 握手失败";
+                return false;
+            }
+
+            // 必须先 test-associate，否则 KeePassXC 会回 errorCode 8（SPIKE 实测）。
+            string error;
+            var probe = SendEncrypted(s, "test-associate", new Dictionary<string, object>
+            {
+                { "action", "test-associate" },
+                { "id", cfg.ConnectionId },
+                { "key", cfg.IdPublic }
+            }, TimeSpan.FromSeconds(15), out error);
+            if (!IsSuccess(probe))
+            {
+                s.Dispose();
+                failure.Status = KeePassStatus.NotAssociated;
+                failure.Message = string.IsNullOrEmpty(error) ? ResponseError(probe) : error;
+                return false;
+            }
+
+            session = s;
+            config = cfg;
+            return true;
+        }
+
         internal static Task<KeePassResult> GetLoginsAsync(string url)
         {
             return Task.Run(() => GetLoginsCore(url));
@@ -555,121 +685,76 @@ namespace NanoEdge
 
         private static KeePassResult GetLoginsCore(string url)
         {
+            // 前置链路（关联 / 握手 / test-associate）与 set-login 共用一份，
+            // 别在两个地方各写一遍；get-logins 的请求与解析保持原样。
+            KeePassConfig config;
+            KeePassResult failure;
+            Session session;
+            if (!TryOpenAssociatedSession(out session, out config, out failure)) return failure;
+
             var result = new KeePassResult();
-
-            var config = LoadConfig();
-            if (config == null)
+            using (session)
             {
-                result.Status = KeePassStatus.NotAssociated;
-                result.Message = "尚未与 KeePassXC 建立关联";
-                return result;
-            }
-            var secret = DecodeSecret(config);
-            if (string.IsNullOrEmpty(secret))
-            {
-                result.Status = KeePassStatus.NotAssociated;
-                result.Message = "关联密钥无法解密，需要重新关联";
-                return result;
-            }
-
-            KeePassStatus status;
-            string message;
-            using (var session = StartSession(out status, out message))
-            {
-                if (session == null)
+                string error;
+                var response = SendEncrypted(session, "get-logins", new Dictionary<string, object>
                 {
-                    result.Status = status;
-                    result.Message = message;
-                    return result;
-                }
-                try
-                {
-                    if (!Handshake(session, TimeSpan.FromSeconds(10)))
-                    {
-                        result.Status = KeePassStatus.NotRunning;
-                        result.Message = "与 KeePassXC 握手失败";
-                        return result;
-                    }
-
-                    string error;
-
-                    // 必须先在本次会话里 test-associate 确认身份，否则直接 get-logins
-                    // 会被 KeePassXC 判成「未关联」回 errorCode 8（实测）。
-                    var probe = SendEncrypted(session, "test-associate", new Dictionary<string, object>
-                    {
-                        { "action", "test-associate" },
-                        { "id", config.ConnectionId },
-                        { "key", config.IdPublic }
-                    }, TimeSpan.FromSeconds(15), out error);
-
-                    if (!IsSuccess(probe))
-                    {
-                        result.Status = KeePassStatus.NotAssociated;
-                        result.Message = string.IsNullOrEmpty(error) ? ResponseError(probe) : error;
-                        return result;
-                    }
-
-                    var response = SendEncrypted(session, "get-logins", new Dictionary<string, object>
-                    {
-                        { "action", "get-logins" },
-                        { "url", url },
-                        { "submitUrl", "" },
-                        { "httpAuth", "" },
-                        { "keys", new object[]
-                            {
-                                new Dictionary<string, object>
-                                {
-                                    // 必须是 associate 返回的 id，不能是 clientID。
-                                    { "id", config.ConnectionId },
-                                    { "key", config.IdPublic }
-                                }
-                            }
-                        }
-                    }, TimeSpan.FromSeconds(20), out error);
-
-                    if (response == null)
-                    {
-                        result.Status = string.Equals(error, "timeout", StringComparison.Ordinal)
-                            ? KeePassStatus.Timeout : KeePassStatus.Error;
-                        result.Message = error ?? "";
-                        return result;
-                    }
-                    if (!IsSuccess(response))
-                    {
-                        var code = ErrorCode(response);
-                        result.Message = ResponseError(response);
-                        // 15 = 没有匹配这个网址的条目，属于正常结果而不是故障。
-                        result.Status = code == 15 ? KeePassStatus.Ok : KeePassStatus.NotAssociated;
-                        return result;
-                    }
-
-                    object entriesField;
-                    if (response.TryGetValue("entries", out entriesField))
-                    {
-                        // JavaScriptSerializer 把 JSON 数组给成 ArrayList，不是 object[]；
-                        // 按 IEnumerable 取才不会静默拿到 0 条。
-                        var list = entriesField as System.Collections.IEnumerable;
-                        if (list != null)
+                    { "action", "get-logins" },
+                    { "url", url },
+                    { "submitUrl", "" },
+                    { "httpAuth", "" },
+                    { "keys", new object[]
                         {
-                            foreach (var item in list)
+                            new Dictionary<string, object>
                             {
-                                var map = item as Dictionary<string, object>;
-                                if (map == null) continue;
-                                result.Entries.Add(new KeePassCredential
-                                {
-                                    Name = Field(map, "name"),
-                                    Login = Field(map, "login"),
-                                    Password = Field(map, "password"),
-                                    Uuid = Field(map, "uuid"),
-                                    Group = Field(map, "group")
-                                });
+                                // 必须是 associate 返回的 id，不能是 clientID。
+                                { "id", config.ConnectionId },
+                                { "key", config.IdPublic }
                             }
                         }
                     }
-                    result.Status = KeePassStatus.Ok;
+                }, TimeSpan.FromSeconds(20), out error);
+
+                if (response == null)
+                {
+                    result.Status = string.Equals(error, "timeout", StringComparison.Ordinal)
+                        ? KeePassStatus.Timeout : KeePassStatus.Error;
+                    result.Message = error ?? "";
                     return result;
                 }
-                finally { session.Dispose(); }
+                if (!IsSuccess(response))
+                {
+                    var code = ErrorCode(response);
+                    result.Message = ResponseError(response);
+                    // 15 = 没有匹配这个网址的条目，属于正常结果而不是故障。
+                    result.Status = code == 15 ? KeePassStatus.Ok : KeePassStatus.NotAssociated;
+                    return result;
+                }
+
+                object entriesField;
+                if (response.TryGetValue("entries", out entriesField))
+                {
+                    // JavaScriptSerializer 把 JSON 数组给成 ArrayList，不是 object[]；
+                    // 按 IEnumerable 取才不会静默拿到 0 条。
+                    var list = entriesField as System.Collections.IEnumerable;
+                    if (list != null)
+                    {
+                        foreach (var item in list)
+                        {
+                            var map = item as Dictionary<string, object>;
+                            if (map == null) continue;
+                            result.Entries.Add(new KeePassCredential
+                            {
+                                Name = Field(map, "name"),
+                                Login = Field(map, "login"),
+                                Password = Field(map, "password"),
+                                Uuid = Field(map, "uuid"),
+                                Group = Field(map, "group")
+                            });
+                        }
+                    }
+                }
+                result.Status = KeePassStatus.Ok;
+                return result;
             }
         }
 

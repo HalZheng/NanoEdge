@@ -148,7 +148,7 @@ var list = entriesField as object[];   // 永远是 null
 
 ## 待验证（本 spike 未覆盖）
 
-- `set-login`（把页面新密码写回库）
+- ~~`set-login`（把页面新密码写回库）~~：**SPEC 0.22 已实现协议层与宿主确认链路**（`KeePassBridge.SetLoginAsync` / `SetLoginPayload`，与 `get-logins` 共用前置会话）。请求体字段、`get-logins` 回归、页面→宿主链路、以及**真机写入**（`--kpxctest=set` → `PASS set-login -> Ok`，6 PASS / 0 FAIL）均已验证；用独立域名读回时 KeePassXC 会弹「确认访问」对话框导致 20s 超时，闭环需在 KeePassXC 里目视确认。
 - `get-totp`（两段验证码）
 - Linux/macOS 路径差异（当前只验证 Windows）
 - 密码库非活动 / 锁定状态下的错误码与提示文案

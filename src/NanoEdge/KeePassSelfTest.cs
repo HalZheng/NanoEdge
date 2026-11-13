@@ -55,7 +55,20 @@ namespace NanoEdge
                 ? "(无，尚未关联)"
                 : (config.ConnectionId + " / idPublic=" + config.IdPublic.Length + "B")));
 
-            // ---- 5. 模式 ----
+            // ---- 5. set-login 请求构造（纯函数，不连 proxy、不写密码库） ----
+            var setPayload = KeePassBridge.SetLoginPayload("https://example.com/",
+                "alice", "s3cret", "https://example.com/login", "NanoEdge-Test");
+            check((string)setPayload["action"] == "set-login" &&
+                  (string)setPayload["id"] == "NanoEdge-Test" &&
+                  (string)setPayload["url"] == "https://example.com/" &&
+                  (string)setPayload["login"] == "alice" &&
+                  (string)setPayload["password"] == "s3cret" &&
+                  (string)setPayload["submitUrl"] == "https://example.com/login" &&
+                  (string)setPayload["downloadFavicon"] == "false" &&
+                  !setPayload.ContainsKey("keys"),
+                  "set-login payload: 官方字段齐全，id 用 associate 连接名，不发图标请求");
+
+            // ---- 6. 模式 ----
             if (mode.StartsWith("associate", StringComparison.OrdinalIgnoreCase))
             {
                 var name = ArgValue(args, "--name") ?? "NanoEdge";
@@ -64,6 +77,29 @@ namespace NanoEdge
                 var result = KeePassBridge.AssociateAsync(name, TimeSpan.FromSeconds(120)).Result;
                 check(result.Status == KeePassStatus.Ok,
                     "associate -> " + result.Status + " " + result.Message);
+            }
+            else if (mode.StartsWith("set", StringComparison.OrdinalIgnoreCase))
+            {
+                // 手动 smoke test：这一步会真的往当前解锁的 KeePassXC 数据库写一条条目。
+                // 因此默认绝不触发，且必须把三个参数都给齐；跑完请自行在 KeePassXC 里删掉。
+                var url = ArgValue(args, "--url");
+                var login = ArgValue(args, "--login");
+                var password = ArgValue(args, "--password");
+                if (string.IsNullOrEmpty(url) || string.IsNullOrEmpty(login) ||
+                    string.IsNullOrEmpty(password))
+                {
+                    report.Add("跳过 set-login：需要 --url / --login / --password 三个参数。");
+                    report.Add("注意：执行时会真的写入 KeePassXC 数据库，且可能弹出保存确认框。");
+                }
+                else
+                {
+                    report.Add("set-login（真机写入）url = " + url + " login = " + login);
+                    var result = KeePassBridge.SetLoginAsync(url, login, password, "").Result;
+                    check(result.Status == KeePassStatus.Ok,
+                        "set-login -> " + result.Status + " " + result.Message);
+                    report.Add("KeePassXC 若弹出「保存/更新条目」确认框，需要手动点一次；" +
+                               "测试条目请在 KeePassXC 里删除。");
+                }
             }
             else if (mode.StartsWith("get", StringComparison.OrdinalIgnoreCase))
             {
@@ -80,9 +116,15 @@ namespace NanoEdge
                                " password=" + (string.IsNullOrEmpty(entry.Password) ? "(空)" : new string('*', entry.Password.Length)) +
                                " uuid=" + entry.Uuid);
                 }
-                // 明文只在内存里比对，不落报告
-                var hit = result.Entries.Find(e => e.Login == "testuser" && e.Password == "testpass123");
-                check(hit != null, "取回的凭据与预期一致（testuser / testpass123）");
+                // 明文只在内存里比对，不落报告。默认 URL 沿用 spike 的固定凭据；
+                // 自定义 URL 时用 --login / --password 比对，方便验证 set-login 的写入→读回闭环。
+                var expectLogin = url == "https://example.com/"
+                    ? "testuser" : (ArgValue(args, "--login") ?? "");
+                var expectPassword = url == "https://example.com/"
+                    ? "testpass123" : (ArgValue(args, "--password") ?? "");
+                var hit = result.Entries.Find(e =>
+                    e.Login == expectLogin && e.Password == expectPassword);
+                check(hit != null, "取回的凭据与预期一致（" + expectLogin + "）");
             }
 
             report.Add("");

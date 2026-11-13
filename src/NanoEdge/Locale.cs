@@ -593,6 +593,8 @@ namespace NanoEdge
                 { "KeePassXC 里没有匹配这个站点的条目",
                   "No entry in KeePassXC matches this site" },
                 { "已填充账号密码", "Credentials filled" },
+                { "要把这个账号保存到 KeePassXC 吗？", "Save this account to KeePassXC?" },
+                { "已保存到 KeePassXC", "Saved to KeePassXC" },
                 { "填充失败，页面结构可能变了", "Fill failed; the page layout may have changed" },
                 { "需要 Ctrl / Shift / Alt 中的至少一个，Esc 取消",
                   "Include at least one of Ctrl / Shift / Alt; Esc cancels" },

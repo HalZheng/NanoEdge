@@ -12,7 +12,7 @@
 - **纯 WPF 内部页**：起始页、历史、书签、下载、设置、用户脚本管理；打开内部页不创建 WebView2
 - **用户脚本**：Tampermonkey 子集（`@require`、`@match/@include/@exclude`、`GM_*` 子集、`@grant` 双端校验、按站点临时禁用）
 - **浏览基础**：地址栏本地联想、历史/书签、按站点缩放、下载管理；Chrome/Edge 书签按 profile 选来源、看预览、确认后才导入；导出 HTML 保留文件夹层级；页内查找交给 WebView2 内置
-- **密码自动填充**：直连 KeePassXC（宿主自己扮演浏览器端起 `keepassxc-proxy`，crypto_box 加密），地址栏出现钥匙图标 → 选账号 → 填进页面；**密码只在填充那一瞬间经过内存**，NanoEdge 不存密码、不写日志、不进快照
+- **密码自动填充 / 保存**：直连 KeePassXC（宿主自己扮演浏览器端起 `keepassxc-proxy`，crypto_box 加密），图标画在用户名输入框内 → 选账号 → 填进页面；提交自己新填的账号时会问一句「保存到 KeePassXC 吗？」，确认后才把凭据交给 KeePassXC 存。**NanoEdge 自己从不存密码**：不落盘、不写日志、不进快照
 - **其他**：暗/亮主题、中/英双语、单实例 + 命名管道唤起、默认浏览器注册、崩溃恢复、最近关闭、favicon
 
 ## 系统要求
@@ -66,7 +66,7 @@ dotnet build src/NanoEdge/NanoEdge.csproj -c Release
 - 用户脚本的增删改与启停只在下次导航/刷新后生效
 - 「8 个真实 dev 站点 ≤900MB」的内存目标尚未验收；本地轻量页基线见 SPEC 2.1
 - 不带自动更新；需要系统已安装 WebView2 Runtime
-- 密码填充只做「取出来填进去」：不保存新密码回库、不做 TOTP / passkey、不自动提交；**跨域 iframe 里的登录框不填**（避免把本站密码喂给第三方框架）；未开启 KeePassXC 的「浏览器集成」时整个功能不可用
+- 密码填充现在也能**保存新账号**：提交自己敲的账号后弹一条确认，点「保存」才由宿主把凭据交给 KeePassXC（NanoEdge 仍不存密码）。不做 TOTP / passkey、不自动提交；**跨域 iframe 里的登录框不填**（避免把本站密码喂给第三方框架）；未开启 KeePassXC 的「浏览器集成」时整个功能不可用。真机 `set-login` 写入已验证返回成功；写入→读回的闭环仍建议在 KeePassXC 里目视确认，见 SPEC 0.22
 
 ## 第三方组件与许可
 

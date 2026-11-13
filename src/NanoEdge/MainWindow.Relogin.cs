@@ -20,7 +20,8 @@ namespace NanoEdge
         private bool ReloginPageEligible()
         {
             var tab = _active;
-            return tab != null && PgAdminReloginConfig.ForUrl(tab.Url) != null;
+            // 密封标签里不显示重登条：条上带站点名，会把伪装戳破。
+            return tab != null && !tab.IsSecret && PgAdminReloginConfig.ForUrl(tab.Url) != null;
         }
 
         internal bool ReloginForegroundForTest() { return ReloginForeground(); }

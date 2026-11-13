@@ -51,6 +51,7 @@ namespace NanoEdge
                 {
                     Setup();
                     await RunCoreAsync();
+                    await RunDerivedTabTestAsync();
                 }
                 catch (Exception ex) { Fail("unhandled", ex.ToString()); }
                 finally
@@ -465,6 +466,60 @@ namespace NanoEdge
                 Line("");
                 Line("history file = " + HistoryStore.FilePath + " (" + HistoryStore.All().Count + " entries)");
                 Line("bookmarks file = " + BookmarkStore.FilePath + " (" + BookmarkStore.All().Count + " items)");
+            }
+
+            // ---------- 9. 页面里点「在新窗口打开」派生出来的标签继承密封状态 ----------
+            // 用反射触发 BrowserHost 的真实事件订阅链（不是直接调 NewTab）：
+            // 事件参数里漏掉 secret、或订阅端没把它传下去，这里都会当场 FAIL。
+            private async Task RunDerivedTabTestAsync()
+            {
+                HistoryStore.Clear();
+                var before = _w._tabs.Count;
+                var urlSecret = "http://127.0.0.1:" + _portAllowed + "/derived-secret";
+                var urlNormal = "http://127.0.0.1:" + _portAllowed + "/derived-normal";
+
+                RaiseOpenInNewTab(urlSecret, true);
+                var derived = _w._active;
+                Check("derived tab from a secret tab inherits IsSecret",
+                    derived != null && derived.IsSecret,
+                    derived == null ? "no active tab" : "IsSecret=" + derived.IsSecret);
+                Check("derived secret tab is disguised as 文档",
+                    derived != null && derived.DisplayTitle == "文档",
+                    derived == null ? "-" : derived.DisplayTitle);
+                var session = _w.BuildSession();
+                Check("derived secret tab is excluded from the session",
+                    session.Tabs.All(t => !t.IsSecret), "tabs=" + session.Tabs.Count);
+                await Task.Delay(900);
+                Check("derived secret url never reaches history",
+                    HistoryStore.All().All(e =>
+                        e.Url.IndexOf("derived-secret", StringComparison.Ordinal) < 0),
+                    string.Join(",", HistoryStore.All().Select(e => e.Url)));
+                Check("derived secret tab keeps no favicon",
+                    derived != null && derived.Favicon == null,
+                    derived == null ? "-" : (derived.Favicon == null ? "none" : "has icon"));
+
+                RaiseOpenInNewTab(urlNormal, false);
+                Check("derived tab from a normal tab stays normal",
+                    _w._active != null && !_w._active.IsSecret,
+                    _w._active == null ? "-" : "IsSecret=" + _w._active.IsSecret);
+                Check("both popups created exactly one tab each",
+                    _w._tabs.Count == before + 2,
+                    "before=" + before + " now=" + _w._tabs.Count);
+            }
+
+            private void RaiseOpenInNewTab(string url, bool secret)
+            {
+                var field = typeof(BrowserHost).GetField("OpenInNewTab",
+                    System.Reflection.BindingFlags.Instance |
+                    System.Reflection.BindingFlags.NonPublic);
+                Check("BrowserHost.OpenInNewTab event exists", field != null,
+                    field == null ? "null" : "ok");
+                if (field == null) return;
+                var handler = field.GetValue(_w._browser) as Delegate;
+                Check("OpenInNewTab has a subscriber", handler != null,
+                    handler == null ? "null" : "ok");
+                if (handler == null) return;
+                handler.DynamicInvoke(url, secret);
             }
 
             private async Task<bool> WaitForAsync(Func<bool> condition, int timeoutMs)
