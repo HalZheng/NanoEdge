@@ -475,6 +475,25 @@ namespace NanoEdge
 
             private async Task RunCoreAsync()
             {
+                // ---- 2026-11-16：网页底色固定白，外壳主题不干预网页配色 ----
+                // DefaultBackgroundColor 是网页透明区域透出来的那张画布；按 Theme.IsDark
+                // 染色会让「写死 #fff 的卡片仍白、没写背景的区块变黑」，而网站拿到的
+                // 仍是浅色偏好，深色文字落在暗底上会看不清。防回退断言，别再改回去。
+                try
+                {
+                    var hostSrc = File.ReadAllText(
+                        Path.Combine(Root(), "src", "NanoEdge", "BrowserHost.cs"));
+                    Check("webview canvas is not tinted by the shell theme",
+                        !hostSrc.Contains("Theme.IsDark ? \"#0E1116\"") &&
+                        hostSrc.Contains("DefaultBackgroundColor = System.Drawing.Color.White"),
+                        "BrowserHost.cs keeps a fixed white canvas");
+                }
+                catch (Exception ex) { Fail("webview canvas source check", ex.Message); }
+                var canvasProbe = new Microsoft.Web.WebView2.Wpf.WebView2();
+                Check("browser default canvas stays white",
+                    canvasProbe.DefaultBackgroundColor == System.Drawing.Color.White,
+                    "color=" + canvasProbe.DefaultBackgroundColor);
+
                 // ---- P0：用户配置残留 -32000（最小化坐标）时，窗口仍须在屏幕内 ----
                 // 放在最前面，后面 A3 / 第九轮的窗口状态断言会改 Left/Top。
                 Check("startup window position is on screen",

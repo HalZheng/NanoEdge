@@ -223,8 +223,11 @@ namespace NanoEdge
 
             // ZoomFactor 是 DP，控制器还没建也能先写，初始化后会自动套上去。
             var view = new WebView2 { Tag = tab.Id, ZoomFactor = tab.Zoom };
-            view.DefaultBackgroundColor = System.Drawing.ColorTranslator.FromHtml(
-                Theme.IsDark ? "#0E1116" : "#F3F5F9");
+            // 网页底色固定白：DefaultBackgroundColor 是网页透明区域透出来的那张画布，
+            // 跟着外壳主题染色会让「写死 #fff 的卡片仍白、没写背景的区块变黑」，
+            // 而且网站拿到的仍是浅色偏好，深色文字落在暗底上会看不清。
+            // 外壳暗色/亮色只管窗口 chrome，不干预网页自己的配色。
+            view.DefaultBackgroundColor = System.Drawing.Color.White;
             view.Visibility = Visibility.Collapsed;
             _host.Children.Add(view);
             _views[tab.Id] = view;
@@ -1154,9 +1157,9 @@ namespace NanoEdge
 
         public void RefreshBackground()
         {
-            var color = System.Drawing.ColorTranslator.FromHtml(Theme.IsDark ? "#0E1116" : "#F3F5F9");
+            // 底色不再随主题变化；切主题时仍被调用只是保证所有视图口径一致。
             foreach (var view in _webviews.Values)
-                view.DefaultBackgroundColor = color;
+                view.DefaultBackgroundColor = System.Drawing.Color.White;
         }
 
         public bool HasWebView(TabModel tab) { return _webviews.ContainsKey(tab.Id); }
